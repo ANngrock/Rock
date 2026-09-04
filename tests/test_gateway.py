@@ -168,7 +168,9 @@ async def test_permanent_error_switches_provider_immediately() -> None:
 
     assert result.content == "через fallback"
     assert len(primary.requests) == 1, "400 повторять бессмысленно"
-    assert meta["fallback"].requests[0]["model"] == "glm-4.6"
+    # имя берётся из роли (у этого конфига FALLBACK_MODEL не задан) — сверяем с каталогом,
+    # чтобы тест не протухал при смене дефолтной модели
+    assert meta["fallback"].requests[0]["model"] == CATALOG["brain"].name
     assert [r.provider for r in records] == ["primary", "fallback"]
 
 
@@ -196,8 +198,10 @@ async def test_all_providers_down_raises_typed_error() -> None:
 
 
 async def test_budget_gate_blocks_before_request() -> None:
+    # модель с ненулевым прайсом: на бесплатном дефолте оценка стоит $0, и гейт проверять нечего
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k", model_brain="glm-4.6")
     gateway, _kv, primary, _records, _meta = make_gateway(
-        [response("не должно случиться")], budget=1.0
+        [response("не должно случиться")], cfg=cfg, budget=1.0
     )
     await gateway.cost.record(0.999)
     with pytest.raises(BudgetExceeded):
@@ -399,3 +403,51 @@ async def test_auth_hint_quiet_when_key_matches_endpoint() -> None:
     gateway = ModelGateway(cfg, None)  # type: ignore[arg-type]
     assert gateway.auth_hint() == ""
     await gateway.aclose()
+
+
+# --------------------------------------------------------------- резерв: цена по имени модели
+
+
+async def test_fallback_enabled_by_model_name_alone() -> None:
+    """FALLBACK_MODEL без ключа/адреса = резерв на том же провайдере: дублировать секрет незачем."""
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="sk-ai-v1-x",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+        fallback_model="glm-4.7-flashx",
+        llm_backoff_s=0.05,
+    )
+    gateway, _kv, _primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
+    assert gateway.fallback is not None
+    describe = gateway.describe()
+    assert describe["fallback_enabled"] is True
+    assert describe["fallback_model"] == "glm-4.7-flashx"
+
+
+async def test_fallback_call_is_costed_by_fallback_model() -> None:
+    """429 на бесплатной основной модели -> платный резерв, и его стоимость учтена, а не 0.
+
+    Учёт «по цене роли» на бесплатной основной модели давал бы $0.000000 на каждом резервном
+    запросе: дневной бюджет выглядел бы соблюдённым, пока провайдер режет частоту.
+    """
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        model_brain="glm-4.7-flash",  # free-тиер: 0/0
+        fallback_model="glm-4.7-flashx",  # 0.07/0.4
+        llm_backoff_s=0.05,
+    )
+    gateway, _kv, _primary, records, meta = make_gateway(
+        [api_error(429)],
+        fallback_script=[response("ок", prompt_tokens=1000, completion_tokens=500)],
+        cfg=cfg,
+    )
+    result = await gateway.chat("brain", [{"role": "user", "content": "сводка"}])
+    expected = (1000 * 0.07 + 500 * 0.4) / 1_000_000
+    assert result.cost_usd == pytest.approx(expected, abs=1e-12)
+    assert await gateway.cost.spent() == pytest.approx(expected, abs=1e-12)
+    assert meta["fallback"].requests[0]["model"] == "glm-4.7-flashx"
+    ok = [r for r in records if r.ok]
+    assert len(ok) == 1 and ok[0].provider == "fallback" and ok[0].cost_usd > 0

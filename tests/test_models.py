@@ -19,13 +19,14 @@ def test_unknown_price_falls_back_to_role_price_without_crash() -> None:
     """Незнакомое имя не должно обнулять бюджет: считаем по прайсу роли и предупреждаем."""
     from aegis.platform.gateway.models import CATALOG
 
-    cfg = Settings(_env_file=None, _env_prefix="T_", model_fast="мой-хостed-glm", glm_api_key="k")
-    spec = resolve_spec("fast", cfg)
+    cfg = Settings(_env_file=None, _env_prefix="T_", model_embed="мой-хостed-glm", glm_api_key="k")
+    spec = resolve_spec("embed", cfg)
     assert spec.name == "мой-хостed-glm"
     assert (spec.in_usd_per_m, spec.out_usd_per_m) == (
-        CATALOG["fast"].in_usd_per_m,
-        CATALOG["fast"].out_usd_per_m,
+        CATALOG["embed"].in_usd_per_m,
+        CATALOG["embed"].out_usd_per_m,
     )
+    assert spec.in_usd_per_m > 0, "иначе проверка «не обнуляем бюджет» ничего не проверяет"
 
 
 def test_default_role_prices_are_catalog_values() -> None:
@@ -87,3 +88,39 @@ def test_every_price_key_is_a_real_model_name() -> None:
     for role, spec in CATALOG.items():
         assert spec.name in PRICES, f"{role}: у имени каталога нет цены"
         assert " " not in spec.name and spec.name == spec.name.strip()
+
+
+# ------------------------------------------------------------------ z.ai, GLM-4.7-Flash
+
+
+def test_free_flash_is_priced_zero_but_still_thinks_on_demand() -> None:
+    """GLM-4.7-Flash бесплатен, и reasoning у него ВЫКЛЮЧАЕТСЯ (в отличие от 5.3-серии).
+
+    Это не мелочь: уровень деградации бюджета «выключить thinking» снова работает, и роль fast
+    остаётся экономной, а не «вечно думающей».
+    """
+    cfg = Settings(_env_file=None, _env_prefix="T_", model_brain="glm-4.7-flash", glm_api_key="k")
+    spec = resolve_spec("brain", cfg)
+    assert (spec.in_usd_per_m, spec.out_usd_per_m) == (0.0, 0.0)
+    assert spec.supports_thinking is True
+    assert spec.thinking_always_on is False, "4.7-серия принимает thinking.type=disabled"
+
+
+def test_paid_flashx_price_is_used_for_the_fallback_name() -> None:
+    """Резерв может быть платным, пока основная модель бесплатна: цена — по фактическому имени."""
+    from aegis.platform.gateway.models import CATALOG, spec_for_name
+
+    base = CATALOG["brain"]
+    assert base.in_usd_per_m == 0.0
+    spec = spec_for_name("glm-4.7-flashx", base)
+    assert spec.role == "brain"
+    assert (spec.in_usd_per_m, spec.out_usd_per_m) == (0.07, 0.4)
+
+
+def test_vision_role_stays_on_a_vision_model() -> None:
+    """У GLM-4.7-Flash нет мультимодальности: роль vision обязана быть V-серией."""
+    from aegis.platform.gateway.models import CATALOG
+
+    assert CATALOG["brain"].supports_vision is False
+    assert "v" in CATALOG["vision"].name, CATALOG["vision"].name
+    assert CATALOG["vision"].supports_vision is True

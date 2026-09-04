@@ -29,7 +29,12 @@ from pydantic import SecretStr
 from aegis.platform.config import Settings
 from aegis.platform.gateway.cost import CostGovernor
 from aegis.platform.gateway.dlp import DLP
-from aegis.platform.gateway.models import ChatRole, ModelSpec, resolve_spec
+from aegis.platform.gateway.models import (
+    ChatRole,
+    ModelSpec,
+    resolve_spec,
+    spec_for_name,
+)
 
 __all__ = ["ChatResult", "LLMCallRecord", "ModelGateway", "ModelUnavailable", "ToolCall"]
 
@@ -108,9 +113,18 @@ class ModelGateway:
         self.recorder = recorder or _null_recorder
         self.dlp = dlp or DLP()
         self.primary = self._client(cfg.glm_api_key, cfg.glm_base_url)
+        #: Резерв включается и одним FALLBACK_MODEL: ключ и адрес по умолчанию основные.
+        #  Просить дублировать секрет в .env ради «платной запасной модели» — значит собирать
+        #  лишнюю копию ключа там, где он не нужен.
+        fallback_on = bool(cfg.fallback_model) or bool(
+            cfg.fallback_api_key and cfg.fallback_base_url
+        )
         self.fallback: AsyncOpenAI | None = (
-            self._client(cfg.fallback_api_key, cfg.fallback_base_url)
-            if cfg.fallback_api_key and cfg.fallback_base_url
+            self._client(
+                cfg.fallback_api_key or cfg.glm_api_key,
+                cfg.fallback_base_url or cfg.glm_base_url,
+            )
+            if fallback_on
             else None
         )
         #: Отдельный клиент для эмбеддингов, когда чат-роутер их не проксирует. None = основной
@@ -162,11 +176,14 @@ class ModelGateway:
         attempt = 0
         last_error: str | None = None
         for provider, client in self._providers():
-            # у fallback может быть своё имя модели; цена считается по спеке роли (аппроксимация —
-            # уточняется в docs/ADR/0002 при смене провайдера)
+            # у fallback своё имя модели — и свой ценник: primary может быть бесплатным, а
+            # резерв платным, и учёт «по цене роли» занижал бы расходы до нуля (SLO по
+            # стоимости при этом выглядел бы соблюдённым)
+            spec_used = spec
             model_name = spec.name
             if provider == "fallback" and self.cfg.fallback_model:
                 model_name = self.cfg.fallback_model
+                spec_used = spec_for_name(model_name, spec)
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
             # нестандартные параметры (thinking) провайдер fallback может не понимать
             if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
@@ -209,7 +226,7 @@ class ModelGateway:
                 return await self._on_success(
                     resp,
                     role=role,
-                    spec=spec,
+                    spec=spec_used,
                     provider=provider,
                     attempt=attempt,
                     trace=trace,

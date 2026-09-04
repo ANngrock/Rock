@@ -46,9 +46,10 @@ docker compose -f deploy/docker-compose.yml logs -f bot
 | `GLM_API_KEY` | — | ключ OpenAI-совместимого провайдера: z.ai **или** роутера (ZenMux и т. п.) |
 | `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4/` | базовый URL **без** `/chat/completions` (хвост эндпоинта срезается автоматически, OpenAI-клиент дописывает сам) |
 | `LLM_THINKING_PARAM` | `true` | `false` — не слать нестандартный `thinking` в теле: роутеры, которые его не знают, отвечают 400 |
-| `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | имена моделей; цена **и возможности** берутся по имени (`PRICES`, `THINKING_ALWAYS_ON`) |
+| `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | имена моделей; цена **и возможности** берутся по имени (`PRICES`, `THINKING_ALWAYS_ON`). В `MODEL_VISION` обязана быть модель из V-серии: `glm-4.7-flash` картинки не видит |
 | `EMBED_BASE_URL` / `EMBED_API_KEY` | пусто = основной провайдер | куда ходить за векторами: чат-роутеры часто эмбеддинги не проксируют |
-| `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | пусто | резервный провайдер при 5xx/лимите |
+| `FALLBACK_MODEL` | пусто | резервная модель при 5xx/лимите; ключ и URL по умолчанию основные, дублировать секрет не нужно |
+| `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` | пусто | если резерв — другой провайдер, здесь его ключ и адрес |
 | `KV_BACKEND` | `redis` | `memory` — запуск вообще без Redis: демо/CI/первое «пощупать». Состояние живёт только в процессе, в `ENV=prod` запрещено |
 | `DATABASE_URL` | `postgresql+asyncpg://aegis:aegis@postgres:5432/aegis` | хост = `postgres` (имя сервиса) вне контейнера заменить на `localhost` |
 | `REDIS_URL` | `redis://redis:6379/0` | история, pending_actions, счётчик бюджета |
@@ -176,20 +177,44 @@ SearXNG требует явного включения JSON-ответов: `dep
 сообщении. Поэтому у имён из `THINKING_ALWAYS_ON` мы никогда не просим выключить reasoning, а
 экономим сменой роли на `fast`.
 
-Смена провайдера целиком:
+Две рабочие конфигурации (выбираются только `.env`, код не меняется):
 
 ```ini
+# A. z.ai напрямую — дефолт каталога, бесплатно и без роутера
+GLM_BASE_URL=https://api.z.ai/api/paas/v4/
+MODEL_BRAIN=glm-4.7-flash       # free-тиер z.ai; thinking включён по умолчанию, отключается
+MODEL_FAST=glm-4.7-flash
+MODEL_VISION=glm-4.6v-flash     # обязательно V-серия: у 4.7-Flash нет мультимодальности
+MODEL_EMBED=embedding-3         # 2048 измерений — ровно под колонку vector(2048)
+FALLBACK_MODEL=glm-4.7-flashx   # $0.07/$0.40 — резерв на 429 бесплатной модели
+
+# B. через роутер ZenMux — имена с префиксом, свои цены, своя ловушка thinking
 GLM_BASE_URL=https://zenmux.ai/api/v1/
-MODEL_BRAIN=z-ai/glm-5.3-flash
-MODEL_VISION=z-ai/glm-5.3-flash   # 5.3-flash нативно мультимодальный: одна модель на обе роли
+MODEL_BRAIN=z-ai/glm-5.3-flash  # 5.3-серия: thinking.type=disabled отвечает 400 (THINKING_ALWAYS_ON)
+MODEL_VISION=z-ai/glm-5.3-flash # нативно мультимодальный: одна модель на обе роли
 MODEL_FAST=z-ai/glm-4.7-flashx
-LLM_THINKING_PARAM=false   # только если роутер отвечает 400 на thinking
-EMBED_BASE_URL=            # пусто = векторы через тот же роутер; при 404 — https://api.z.ai/api/paas/v4/
-EMBED_API_KEY=             # и тогда же — ключ z.ai отдельно
+LLM_THINKING_PARAM=false        # только если роутер отвечает 400 на thinking
+EMBED_BASE_URL=                 # пусто = векторы через тот же роутер; при 404 — https://api.z.ai/api/paas/v4/
+EMBED_API_KEY=                  # и тогда же — ключ z.ai отдельно
 ```
 
-Префикс `z-ai/` обязателен: без него роутер не знает модель. Проверка после правки —
-`aegis doctor --models` (по одному запросу на роль + размерность эмбеддинга).
+Три вещи, на которых они отличаются, а каталог — нет:
+
+1. **Префикс `z-ai/` обязателен у роутера** и недопустим у z.ai. Имя модели — это строка,
+   которую провайдер сверяет со своим списком, поэтому `PRICES` ключуется именем целиком.
+2. **`thinking`**: у 4.7-серии его можно выключить (экономия на уровнях деградации), у 5.3-серии
+   нет — там экономия только сменой роли на `fast`.
+3. **Бесплатно ≠ безлимит.** Free-тиер z.ai (`glm-4.7-flash`, `glm-4.6v-flash`) режут по частоте:
+   по сторонним наблюдениям порядка 1 запроса/с и ~1000/день, это не контракт. Поэтому
+   `FALLBACK_MODEL` с платным `glm-4.7-flashx` — часть конфигурации по умолчанию, а резерв
+   включается и одним `FALLBACK_MODEL` (ключ и адрес берутся основные, см. §3).
+
+Стоимость резерва считается по имени резервной модели (`spec_for_name`), а не по цене роли:
+иначе бесплатная основная модель + платный резерв давали бы $0.000000 в трассе при реальном
+расходе — и `DAILY_BUDGET_USD` переставал бы что-либо ограничивать.
+
+Проверка после любой правки — `aegis doctor --models` (по одному запросу на роль + размерность
+эмбеддинга), быстрая офлайн-проверка — `aegis doctor --quick`.
 
 ## 9. Локальная разработка без Docker
 
@@ -265,7 +290,7 @@ docker compose -f deploy/docker-compose.yml exec postgres psql -U aegis -d aegis
 | ----------------- | ---------- |
 | `401 — ключ не принят именно этим адресом` | ключ и адрес должны принадлежать **одному** сервису: `GLM_API_KEY` от z.ai (`sk-ai-v1-…`) не работает на ZenMux и наоборот. Бот сам сравнивает префикс ключа с хостом и дописывает вывод; после правки `.env` — `up -d --force-recreate bot` |
 | `404 — неверный путь` | `GLM_BASE_URL` обязан быть `https://api.z.ai/api/paas/v4/` (OpenAI-клиент сам дописывает `/chat/completions`) |
-| `429` | квота/частота: пауза, либо перевести роль на `glm-4.5-flash` |
+| `429` | лимит частоты: на бесплатном `glm-4.7-flash` это ожидаемо и переживает резерв `FALLBACK_MODEL` (платный `glm-4.7-flashx`); если резерва нет — пауза или другая роль |
 | `соединение ... TLS` | антивирус/корпоративный прокси перехватывает сертификат; из контейнера — `docker compose exec bot python -c "import httpx;print(httpx.get('https://api.z.ai', timeout=10).status_code)"` |
 | `таймаут` | поднять `LLM_TIMEOUT_S` или проверить VPN |
 | `5xx` | живёт и проходит само; fallback-модель уже была перепробована |

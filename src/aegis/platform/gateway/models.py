@@ -24,6 +24,7 @@ __all__ = [
     "PRICES",
     "THINKING_ALWAYS_ON",
     "resolve_spec",
+    "spec_for_name",
 ]
 
 ChatRole = Literal["brain", "vision", "fast", "embed"]
@@ -43,10 +44,15 @@ class ModelSpec:
     max_output_tokens: int | None = None
 
 
+#: Дефолт = то, на чём личный бот работает постоянно: z.ai, бесплатные Flash-модели.
+#: Важно: GLM-4.7-Flash — только текст (мультимодальности у него нет), поэтому vision обязан
+#: остаться моделью из V-серии. А «цена 0» — не «безлимит»: free-тиер ограничен по частоте
+#: (~1 запрос/с и порядка тысячи запросов в день по сторонним наблюдениям), так что платный
+#: резерв через FALLBACK_MODEL — часть контракта, а не украшение (RUNBOOK §8).
 CATALOG: dict[ChatRole, ModelSpec] = {
-    "brain": ModelSpec("glm-4.6", "brain", 0.6, 2.2, supports_thinking=True),
-    "vision": ModelSpec("glm-4.6v", "vision", 0.6, 1.8, supports_vision=True),
-    "fast": ModelSpec("glm-4.5-air", "fast", 0.2, 1.1),
+    "brain": ModelSpec("glm-4.7-flash", "brain", 0.0, 0.0, supports_thinking=True),
+    "vision": ModelSpec("glm-4.6v-flash", "vision", 0.0, 0.0, supports_vision=True),
+    "fast": ModelSpec("glm-4.7-flash", "fast", 0.0, 0.0),
     "embed": ModelSpec("embedding-3", "embed", 0.05, 0.0),
 }
 
@@ -63,9 +69,13 @@ _OVERRIDES: dict[ChatRole, str] = {
 #: MODEL_BRAIN=z-ai/glm-4.6 молча считало бы расходы по прайсу z.ai (~2x).
 #: Ступенчатые цены взяты по нижнему слою контекста (<32k) — для личных запросов он основной.
 PRICES: dict[str, tuple[float, float]] = {
-    # z.ai напрямую
+    # z.ai напрямую (https://docs.z.ai/guides/overview/pricing, срез 05.09.2026)
+    "glm-4.7": (0.6, 2.2),
+    "glm-4.7-flash": (0.0, 0.0),  # free-тиер
+    "glm-4.7-flashx": (0.07, 0.4),
     "glm-4.6": (0.6, 2.2),
-    "glm-4.6v": (0.6, 1.8),
+    "glm-4.6v": (0.3, 0.9),
+    "glm-4.6v-flash": (0.0, 0.0),  # free-тиер, vision
     "glm-4.5-air": (0.2, 1.1),
     "glm-4.5-flash": (0.0, 0.0),
     "embedding-3": (0.05, 0.0),
@@ -95,6 +105,34 @@ PRICES: dict[str, tuple[float, float]] = {
 THINKING_ALWAYS_ON = frozenset({"glm-5.3", "glm-5.3-flash", "z-ai/glm-5.3", "z-ai/glm-5.3-flash"})
 
 
+def _named(spec: ModelSpec, name: str) -> ModelSpec:
+    """Тот же контур, но с другим именем модели: цена и flags — по имени, роль — прежняя.
+
+    Возможности привязаны к ИМЕНИ, а не к роли: glm-5.3-flash закрывает и текст, и картинки,
+    но думает всегда — помнить об этом надо на любом уровне деградации.
+    """
+    if name == spec.name:
+        return spec
+    always_on = name in THINKING_ALWAYS_ON
+    updated = replace(
+        spec,
+        name=name,
+        supports_thinking=spec.supports_thinking or always_on,
+        thinking_always_on=always_on,
+    )
+    price = PRICES.get(name)
+    if price is None:
+        # незнакомое имя: считаем по прайсу роли и предупреждаем — иначе бюджет молча врёт
+        log.warning(
+            "models.unknown_price",
+            model=name,
+            role=spec.role,
+            hint="допишите цену в platform/gateway/models.py:PRICES (RUNBOOK §8)",
+        )
+        return updated
+    return replace(updated, in_usd_per_m=price[0], out_usd_per_m=price[1])
+
+
 def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
     """Спека роли с учётом переопределения имени из конфигурации (и цены этого имени)."""
     spec = CATALOG[role]
@@ -103,29 +141,11 @@ def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
 
         cfg = settings()
     override = getattr(cfg, _OVERRIDES[role], None)
-    if not override or override == spec.name:
+    if not override:
         return spec
-    # возможности и цена привязаны к ИМЕНИ: glm-5.3-flash закрывает и текст, и картинки,
-    # но думает всегда — помнить об этом надо на любом уровне деградации
-    always_on = override in THINKING_ALWAYS_ON
-    thinking = spec.supports_thinking or always_on
-    price = PRICES.get(override)
-    if price is None:
-        # незнакомое имя: считаем по прайсу роли и предупреждаем — иначе бюджет молча врёт
-        log.warning(
-            "models.unknown_price",
-            model=override,
-            role=role,
-            hint="допишите цену в platform/gateway/models.py:PRICES (RUNBOOK §8)",
-        )
-        return replace(
-            spec, name=override, supports_thinking=thinking, thinking_always_on=always_on
-        )
-    return replace(
-        spec,
-        name=override,
-        supports_thinking=thinking,
-        thinking_always_on=always_on,
-        in_usd_per_m=price[0],
-        out_usd_per_m=price[1],
-    )
+    return _named(spec, override)
+
+
+def spec_for_name(name: str, base: ModelSpec) -> ModelSpec:
+    """Спека под реально отправленное имя (fallback-модель называется иначе, чем роль)."""
+    return _named(base, name)
