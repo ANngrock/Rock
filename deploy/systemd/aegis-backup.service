@@ -1,0 +1,20 @@
+[Unit]
+Description=aegis: pg_dump + контрольное восстановление
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь поправьте под свой клон; WorkingDir нужен, чтобы скрипт нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+# переменные берём из .env файла юнита (см. EnvironmentFile ниже), секреты — с chmod 600
+EnvironmentFile=-/srv/aegis/.env
+ExecStart=/srv/aegis/deploy/backup.sh backup
+ExecStart=/srv/aegis/deploy/backup.sh verify
+# сетевые сбои rclone/pg — норма для домашней машины: не роняем юнит на первой же паузе
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

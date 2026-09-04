@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Локальное состояние и секреты — никогда не коммитим
+.env
+.env.*
+!.env.example
+data/
+backups/
+*.dump
+deploy/searxng/*.yml.local
+temporal.db*
+pgdata/

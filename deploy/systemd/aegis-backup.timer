@@ -1,0 +1,12 @@
+[Unit]
+Description=aegis: ежедневный бэкап (пункт 1.11)
+
+[Timer]
+# 03:40 по локальному времени; Persistent=догонит пропущенный запуск после выключения машины
+OnCalendar=*-*-* 03:40:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=aegis-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,42 @@
+# Минимальная конфигурация SearXNG для aegis.
+# Ключевое: разрешён json-формат ответа (без него web_search получит HTML и будет парсить страницу).
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "aegis-searxng"
+  priv:
+    # только внутренняя сеть compose: наружу ничего не торчим
+    "172.16.0.0/12": "ml"
+
+server:
+  secret_key: "change-me-please"      # переопределяется env SEARXNG_SECRET
+  limiter: false                      # самохостинг для одного пользователя: rate limiter не нужен
+  public_instance: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+  safe_search: 0
+  autocomplete: ""
+
+ui:
+  results_on_new_tab: 1
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+  proxies: {}
+
+engines:
+  # Свой список при необходимости: включить/выключить, расставить весa.
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: wikipedia
+    disabled: false

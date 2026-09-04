@@ -1,0 +1,135 @@
+name: aegis
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+      POSTGRES_DB: aegis
+      # PGDATA вложенным каталогом — стандартный образ ругается на примонтированный корень
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    # wal_level=replica + archive — задел под RPO=0 для finance (шаг 3) и PITR
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=/bin/true
+      - -c
+      - max_wal_senders=3
+      - -c
+      - shared_preload_libraries=
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    # AOF: история диалога и pending_actions не должны исчезать при рестарте контейнера
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+    logging: *logging
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+      SEARXNG_SECRET: "${SEARXNG_SECRET:-change-me-please}"
+    volumes:
+      - ./searxng:/etc/searxng
+    # каталог конфигурации примонтирован из хоста, поэтому образ не может создать в
+    # нём static/кэш от своего uid. Для изолированного self-hosted-контейнера — осознанный компромисс.
+    user: "0:0"
+    ports:
+      - "127.0.0.1:8888:8080"
+    restart: unless-stopped
+    logging: *logging
+
+  # --- durable-слой: включается `docker compose --profile durable up` (шаг 2) ---
+  nats:
+    image: nats:2.10-alpine
+    profiles: ["durable"]
+    command: ["-js", "-sd", "/data"]
+    volumes:
+      - natsdata:/data
+    ports:
+      - "127.0.0.1:4222:4222"
+    restart: unless-stopped
+    logging: *logging
+
+  temporal:
+    image: temporalio/auto-setup:1.25
+    profiles: ["durable"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: aegis
+      POSTGRES_PWD: aegis
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development.yaml
+    ports:
+      - "127.0.0.1:7233:7233"
+    restart: unless-stopped
+    logging: *logging
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    profiles: ["durable"]
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "127.0.0.1:8233:8080"
+    restart: unless-stopped
+    logging: *logging
+
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: aegis:latest
+    env_file: ../.env
+    environment:
+      # внутри сети контейнеров ходим по сервисам, а не по localhost-пробросам
+      DATABASE_URL: postgresql+asyncpg://aegis:aegis@postgres:5432/aegis
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      SEARXNG_URL: http://searxng:8080
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: ["aegis", "bot"]
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  natsdata: {}
