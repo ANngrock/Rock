@@ -19,7 +19,7 @@ from typing import Any
 import structlog
 
 from aegis.platform.config import Settings, settings
-from aegis.web.rates import RateAnswer, fetch_rates, parse_rate_question
+from aegis.web.rates import RateAnswer, collapse_causes, fetch_rates, parse_rate_question
 
 __all__ = ["IntentAnswer", "try_answer"]
 
@@ -60,7 +60,7 @@ async def try_answer(
     cache = kv if cfg.rate_cache_ttl_s > 0 else None
     answer = await fetch_rates(question, cfg=cfg, kv=cache)
     if answer.verdict == "unavailable":
-        causes = "; ".join(answer.causes[:3]) or "источники не ответили"
+        causes = "; ".join(collapse_causes(answer.causes)) or "источники не ответили"
         log.warning("intent.rates_unavailable", causes=causes[:300])
         if notices is not None:
             notices.append(f"прямые источники курсов не ответили: {causes}")

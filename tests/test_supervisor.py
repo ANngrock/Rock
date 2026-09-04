@@ -12,7 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 from aegis.agents.services import Services
-from aegis.agents.supervisor import Inbound, Supervisor
+from aegis.agents.supervisor import Inbound, Reply, Supervisor, _append_notices
 from aegis.agents.tools.registry import Attachment, ToolContext, ToolRegistry
 from aegis.governance.killswitch import KillSwitchState
 from aegis.governance.policy import PolicyEngine, Risk
@@ -589,3 +589,18 @@ async def test_notices_are_deduplicated_in_the_answer() -> None:
     reply = await h.handle("что там")
     assert reply.text.count("поиск лежит") == 1, reply.text
     assert "⚠️" in reply.text
+
+
+def test_notices_are_consumed_so_the_tail_appears_once() -> None:
+    """Два одинаковых «⚠️» в одном сообщении — реальная картинка до правки: хвост добавляли и
+    ветка деградации, и общий путь."""
+    ctx = ToolContext(
+        trace_id="t", owner_id=1, extras={"notices": ["поиск недоступен: searxng 403"]}
+    )
+    reply = Reply(text="отвечаю по тому, что есть", trace_id="t")
+    _append_notices(reply, ctx)
+    once = reply.text
+    _append_notices(reply, ctx)
+    assert reply.text == once
+    assert once.count("⚠️") == 1
+    assert ctx.extras["notices"] == []

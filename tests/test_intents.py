@@ -95,6 +95,24 @@ async def test_dead_sources_fall_through_with_the_reason(patch_rates: Any) -> No
     assert notices and "privatbank" in notices[0] and "nbu" in notices[0]
 
 
+async def test_question_without_the_word_rate_is_still_answered(patch_rates: Any) -> None:
+    """«сколько сейчас евро» — тот же вопрос: ждать слова «курс» парсер не имеет права."""
+    seen = patch_rates(
+        _answer(
+            question=RateQuestion(base="EUR", quote="UAH", mode="pair", raw="сколько сейчас евро")
+        )
+    )
+    answer = await try_answer("сколько сейчас евро", cfg=_CFG)
+    assert answer is not None and answer.intent == "rates"
+    assert seen and seen[0].base == "EUR"
+
+
+async def test_write_with_a_rate_word_stops_before_the_sources(patch_rates: Any) -> None:
+    """Запись с числом в тексте — не вопрос о курсе: до источников идти не должны."""
+    patch_rates(None)
+    assert await try_answer("запиши: держим курс EUR/USD 41.5", cfg=_CFG) is None
+
+
 async def test_attachments_are_not_hijacked(patch_rates: Any) -> None:
     """На фото чека «какой курс» отвечает vision-путь, а не парсер текста."""
     patch_rates(_answer())

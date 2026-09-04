@@ -684,6 +684,9 @@ def _append_notices(reply: Reply, ctx: ToolContext) -> None:
     notices = [str(note) for note in (ctx.extras.get("notices") or []) if str(note).strip()]
     if not notices:
         return
+    #: снимаем список: ветка деградации и общий путь зовут helper подряд — не должно быть двух
+    #  одинаковых «⚠️» в конце одного сообщения
+    ctx.extras["notices"] = []
     tail = "\n\n⚠️ " + "; ".join(dict.fromkeys(notices))[:400]
     reply.text = (reply.text + tail)[:MAX_MESSAGE_CHARS]
 

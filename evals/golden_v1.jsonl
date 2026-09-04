@@ -30,3 +30,6 @@
 {"id": "intent-not-a-rate", "kind": "intent", "input": "столица германии", "expect": {"mode": null, "base": null}}
 {"id": "intent-memory-is-not-a-rate", "kind": "intent", "input": "запомни: рост 182", "expect": {"mode": null}}
 {"id": "intent-spend-is-not-a-rate", "kind": "intent", "input": "добавь расход 12 евро за такси", "expect": {"mode": null}}
+{"id": "intent-rate-without-word", "kind": "intent", "input": "сколько сейчас евро", "expect": {"mode": "pair", "base": "EUR", "quote": "UAH"}}
+{"id": "intent-rate-relation", "kind": "intent", "input": "евро к доллару", "expect": {"mode": "pair", "base": "EUR", "quote": "USD"}}
+{"id": "intent-write-beats-parser", "kind": "intent", "input": "запиши: держим курс EUR/USD 41.5", "expect": {"mode": null}}

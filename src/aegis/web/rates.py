@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -46,7 +47,7 @@ _CURRENCIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("GBP", ("фунт", "gbp", "стерлинг")),
     ("CNY", ("юан", "cny", "жэньминьби")),
     ("TRY", ("лир", "try", "турецк")),
-    ("CHF", ("франк", "CHF")),
+    ("CHF", ("франк", "chf")),
     ("RUB", ("рубл", "rub")),
     ("KZT", ("тенге", "kzt")),
     ("BTC", ("биткоин", "bitcoin", "btc")),
@@ -58,6 +59,19 @@ _SYMBOLS: tuple[tuple[str, str], ...] = (("$", "USD"), ("€", "EUR"), ("₴", "
 #: путь начнёт перехватывать произвольные сообщения владельца.
 _RATE_HINT_RX = re.compile(
     r"(курс\w*|по сколько|скольк\w* стоит|обмен\w*|конвертац\w*|买|курс валют|rate|exchange)",
+    re.IGNORECASE,
+)
+#: вопрос о курсе можно задать и без слова «курс»: «сколько сейчас евро», «почём доллар»
+_ASK_RX = re.compile(
+    r"(\bсколько\w*|\bпоч[ёе]м\b|\bпо скольку\b|\bза сколько\b|\bпо какой цене\b"
+    r"|\bсколько стоит\b|\bhow much\b)",
+    re.IGNORECASE,
+)
+#: сообщение, где владелец что-то записывает или просит сделать, — не про курс. Перехватить его
+#: означало бы ответить числом вместо того, чтобы отдать решение policy engine.
+_WRITE_RX = re.compile(
+    r"(добав|запиш|вн[ёе]с|потрат|приход|расход|перевед|оплат|запомн|удали|измен"
+    r"|напомн|создай|запланир|учт[иё]|поставь)",
     re.IGNORECASE,
 )
 _CASH_RX = re.compile(r"(наличн|обменник|в отделени|касс\w*|cash)", re.IGNORECASE)
@@ -191,7 +205,7 @@ class RateAnswer:
         if self.verdict == "unavailable":
             return (
                 "Курсы не получил — ни один источник не ответил.\n"
-                + "\n".join(f"· {cause}" for cause in self.causes[:4])
+                + "\n".join(f"· {cause}" for cause in collapse_causes(self.causes)[:4])
                 + f"\nПроверка: aegis doctor (раздел rates){cache_note}"
             )
         if self.question.mode == "table":
@@ -276,6 +290,9 @@ def parse_rate_question(text: str, *, home: str = "UAH") -> RateQuestion | None:
     normalized = _norm(raw)
     if not normalized:
         return None
+    if _WRITE_RX.search(normalized):
+        # «запиши: держим курс EUR/USD 41.5» — это заметка или расход, а не вопрос о курсе
+        return None
     codes = {code for code, _needles in _CURRENCIES}
 
     direct = re.search(
@@ -284,10 +301,14 @@ def parse_rate_question(text: str, *, home: str = "UAH") -> RateQuestion | None:
     if direct and direct.group(1).upper() in codes and direct.group(2).upper() in codes:
         base, quote = direct.group(1).upper(), direct.group(2).upper()
     else:
-        if not _RATE_HINT_RX.search(normalized):
-            return None
         found = _find_currencies(normalized)
         if not found:
+            return None
+        # «евро к доллару» — вопроса нет, но порядок явно задан отношением: это тоже про курс
+        relation = len(dict.fromkeys(code for code, _ in found)) > 1 and bool(
+            _RELATION_RX.search(normalized)
+        )
+        if not (_RATE_HINT_RX.search(normalized) or _ASK_RX.search(normalized) or relation):
             return None
         if len(found) == 1:
             code = found[0][0]
@@ -802,6 +823,30 @@ def _decode(payload: str | bytes, question: RateQuestion) -> RateAnswer | None:
     except (ValueError, TypeError) as exc:
         log.warning("rates.cache_invalid", err=repr(exc)[:160])
         return None
+
+
+def collapse_causes(causes: Sequence[str]) -> list[str]:
+    """Одинаковый сбой на трёх источниках — одна строка, а не три.
+
+    Хвост `⚠️` ограничен 400 символами: три копии «ConnectError …» вытесняют из него всё полезное,
+    а перечислить, кто именно не ответил, — смысл единственной строчки диагноза.
+    """
+    grouped: dict[str, list[str]] = {}
+    order: list[str] = []
+    for cause in causes:
+        name, sep, rest = cause.partition(": ")
+        if not sep:
+            name, rest = "", cause
+        key = rest.strip()
+        if not key:
+            continue
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        source = name.strip()
+        if source and source not in grouped[key]:
+            grouped[key].append(source)
+    return [(f"{', '.join(grouped[key])}: {key}" if grouped[key] else key) for key in order]
 
 
 def _group(quotes: list[RateQuote]) -> dict[str, list[RateQuote]]:

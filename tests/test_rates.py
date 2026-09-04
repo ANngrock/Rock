@@ -15,6 +15,7 @@ from aegis.web.rates import (
     RateAnswer,
     RateQuestion,
     RateQuote,
+    collapse_causes,
     fetch_rates,
     parse_rate_question,
     rates_cache_key,
@@ -84,6 +85,14 @@ def transport(*, fail: tuple[str, ...] = ()) -> httpx.AsyncClient:
         ("курс злотого в обменнике", ("pair", "PLN", "UAH")),
         ("курс доллара и евро", ("table", "USD", "UAH")),
         ("сколько стоит гривна", ("table", "UAH", "UAH")),
+        # вопрос без слова «курс» — владелец так и пишет, отказываться нельзя
+        ("сколько сейчас евро", ("pair", "EUR", "UAH")),
+        ("сколько евро", ("pair", "EUR", "UAH")),
+        ("почём доллар", ("pair", "USD", "UAH")),
+        # отношение задано порядком, вопросительного слова нет — «евро к доллару»
+        ("евро к доллару", ("pair", "EUR", "USD")),
+        ("$/€", ("pair", "USD", "EUR")),
+        ("курс франка", ("pair", "CHF", "UAH")),
     ],
 )
 def test_rate_questions_are_recognised(text: str, expected: tuple[str, str, str]) -> None:
@@ -98,6 +107,10 @@ def test_rate_questions_are_recognised(text: str, expected: tuple[str, str, str]
         "столица германии",
         "запомни: рост 182",
         "добавь расход 12 евро за такси",
+        "переведи 100 евро в доллары",
+        "у меня 200 евро на карте",
+        "доллар и евро",
+        "сколько будет 2+2",
         "привет",
         "",
     ],
@@ -107,12 +120,44 @@ def test_everything_else_is_left_to_the_model(text: str) -> None:
     assert parse_rate_question(text) is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "запиши: держим курс EUR/USD 41.5",
+        "добавь расход: платил по курсу 42 за евро",
+        "напомни узнать в банке, по какому курсу обмен",
+    ],
+)
+def test_write_message_losing_a_rate_word_stays_a_write(text: str) -> None:
+    """Сообщение про действия важнее парсера: решение принимает policy engine, не маркер «курс».
+
+    Иначе «запиши расход по курсу 42» превратилось бы в витрину живых котировок, а запись — в
+    молча потерянное намерение.
+    """
+    assert parse_rate_question(text) is None
+
+
 def test_cash_wording_selects_the_right_office() -> None:
     assert parse_rate_question("наличный курс доллара").cash is True  # type: ignore[union-attr]
     assert (
         parse_rate_question("курс доллара по карте").cash is False  # type: ignore[union-attr]
     )
     assert parse_rate_question("курс доллара").cash is None  # type: ignore[union-attr]
+
+
+def test_identical_source_failures_collapse_into_one_line() -> None:
+    """Три копии одной сетевой ошибки съедают весь лимит хвоста `⚠️` и не добавляют ничего."""
+    eof = "ConnectError TLS/SSL connection has been closed (EOF) (_ssl.c:992)"
+    causes = [f"{name}: {eof}" for name in ("privatbank", "nbu", "erapi")] + [
+        "privatbank: HTTP 503",
+        "у источника вообще нет имени",
+    ]
+    out = collapse_causes(causes)
+    assert out == [
+        f"privatbank, nbu, erapi: {eof}",
+        "privatbank: HTTP 503",
+        "у источника вообще нет имени",
+    ]
 
 
 # --------------------------------------------------------------------- сверка
