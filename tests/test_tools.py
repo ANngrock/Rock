@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -53,23 +54,25 @@ def ctx(**kw: Any) -> ToolContext:
     return ToolContext(trace_id="trace-1", owner_id=1, services=ServicesStub(**kw))
 
 
+#: день недели сверяется с той же датой, что и строка: проверка «любой день недели» ловила бы
+#: расхождение только на границе суток (в UTC один день, у владельца — уже другой)
+_DAYS_RU = {
+    "Monday": "понедельник",
+    "Tuesday": "вторник",
+    "Wednesday": "среда",
+    "Thursday": "четверг",
+    "Friday": "пятница",
+    "Saturday": "суббота",
+    "Sunday": "воскресенье",
+}
+
+
 async def test_get_datetime_reports_owner_timezone_in_russian() -> None:
     with override_settings(timezone="Europe/Moscow"):
         out = await builtin.get_datetime(builtin.NoArgs(), ctx())
-    today = datetime.now().strftime("%Y-%m-%d")
-    assert today in out
-    assert any(
-        day in out
-        for day in (
-            "понедельник",
-            "вторник",
-            "среда",
-            "четверг",
-            "пятница",
-            "суббота",
-            "воскресенье",
-        )
-    )
+    owner_now = datetime.now(ZoneInfo("Europe/Moscow"))
+    assert owner_now.strftime("%Y-%m-%d") in out, "дата считается в поясе владельца, не в UTC"
+    assert _DAYS_RU[owner_now.strftime("%A")] in out
 
 
 async def test_remember_fact_writes_through_repo() -> None:

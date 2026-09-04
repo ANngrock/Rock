@@ -270,10 +270,23 @@ class ModelGateway:
         )
         return [list(item.embedding) for item in resp.data]
 
+    def auth_hint(self) -> str:
+        """«Ключ выдан не этим сервисом» — детерминированно, без обращения в сеть.
+
+        Пустая строка означает, что по префиксу ключа и хосту противоречия не видно: тогда
+        причину ищет :func:`aegis.platform.gateway.diagnose` по ответу провайдера.
+        """
+        from aegis.platform.gateway.diagnose import auth_hint_for
+
+        key = self.cfg.glm_api_key.get_secret_value() if self.cfg.glm_api_key is not None else ""
+        return auth_hint_for(base_url=self.cfg.glm_base_url, api_key=key)
+
     def describe(self) -> dict[str, Any]:
         """Без секретов — для /status и doctor."""
         return {
             "base_url": self.cfg.glm_base_url,
+            "endpoint": self.cfg.glm_base_url.split("//")[-1].split("/")[0],
+            "auth_hint": self.auth_hint(),
             "models": {
                 role: resolve_spec(role, self.cfg).name
                 for role in ("brain", "vision", "fast", "embed")

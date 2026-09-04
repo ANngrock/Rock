@@ -353,6 +353,32 @@ async def test_model_unavailable_degrades() -> None:
     assert "недоступны" in reply.text
 
 
+async def test_model_unavailable_reply_reaches_owner_without_markup() -> None:
+    """Текст деградации — без HTML: его читает человек, а не парсер.
+
+    Ровно этот баг и закрыт: шаблон был в <i>/<br>/<code>, и при любом отказе Telegram принять
+    разметку владелец видел «<code>/status</code>» вместо инструкции.
+    """
+    h = harness(
+        [ModelUnavailable("нет", cause="AuthenticationError: Error code: 401 - invalid api key")]
+    )
+    reply = await h.handle("что нового?")
+    assert "<" not in reply.text and ">" not in reply.text, reply.text
+    assert "\n" in reply.text
+    assert "Причина:" in reply.text and "401" in reply.text
+
+
+async def test_model_unavailable_names_key_endpoint_mismatch() -> None:
+    """401 при валидном ключе = ключ от соседнего сервиса: бот обязан сказать это прямо."""
+    h = harness([ModelUnavailable("нет", cause="AuthenticationError: Error code: 401")])
+    h.gateway.auth_hint_text = (
+        "ключ с префиксом sk-ai-v1-… выдан z.ai, а запрос уходит на zenmux.ai"
+    )
+    reply = await h.handle("что нового?")
+    assert "выдан z.ai" in reply.text
+    assert "GLM_BASE_URL" in reply.text or "GLM_API_KEY" in reply.text
+
+
 async def test_kill_switch_blocks_writes_but_not_reads() -> None:
     h = harness(
         [

@@ -24,9 +24,10 @@ COPY migrations ./migrations
 RUN useradd -m -u 10001 aegis && chown -R aegis: /app
 USER aegis
 
-# health: конфиг читается, БД доступна
+# health: конфиг читается, БД доступна. --quick обязателен: полная проверка ходит в SearXNG и
+# в LLM, а HEALTHCHECK не имеет права зависеть от провайдера (таймаут пробы 10 c) и тратить бюджет.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD python -m aegis.cli doctor --json >/dev/null 2>&1 || exit 1
+  CMD python -m aegis.cli doctor --quick --json >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["aegis", "bot"]

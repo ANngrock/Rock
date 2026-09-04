@@ -263,7 +263,7 @@ docker compose -f deploy/docker-compose.yml exec postgres psql -U aegis -d aegis
 
 | Причина в скобках | Что делать |
 | ----------------- | ---------- |
-| `401 — ключ не принят` | `GLM_API_KEY` в `.env` не тот/отозван → обновить и `up -d --force-recreate bot` |
+| `401 — ключ не принят именно этим адресом` | ключ и адрес должны принадлежать **одному** сервису: `GLM_API_KEY` от z.ai (`sk-ai-v1-…`) не работает на ZenMux и наоборот. Бот сам сравнивает префикс ключа с хостом и дописывает вывод; после правки `.env` — `up -d --force-recreate bot` |
 | `404 — неверный путь` | `GLM_BASE_URL` обязан быть `https://api.z.ai/api/paas/v4/` (OpenAI-клиент сам дописывает `/chat/completions`) |
 | `429` | квота/частота: пауза, либо перевести роль на `glm-4.5-flash` |
 | `соединение ... TLS` | антивирус/корпоративный прокси перехватывает сертификат; из контейнера — `docker compose exec bot python -c "import httpx;print(httpx.get('https://api.z.ai', timeout=10).status_code)"` |
@@ -287,6 +287,19 @@ docker compose -f deploy\docker-compose.yml exec bot aegis doctor
 ```powershell
 docker compose -f deploy\docker-compose.yml exec bot aegis doctor --models
 ```
+
+Сравнение «ключ ↔ endpoint» живёт в `aegis.platform.gateway.diagnose.auth_hint_for`: оно
+детерминированное (без сети), печатается в `doctor`/`--models` и отдельной строкой в `/status`
+(`⚠️ ключ с префиксом sk-ai-v1-… выдан z.ai, а запрос уходит на zenmux.ai …`). Наружу уходит только
+префикс ключа — значение никогда.
+
+Каждая живая проба ограничена `_PROBE_TIMEOUT_S` (20 c): висящее соединение провайдера не должно
+превращать `doctor` в «ничего не вывелось». Если в отчёте `TimeoutError: проба «brain» …` — это не
+«модели нет», а сеть/прокси держит запрос; HEALTHCHECK при этом остаётся офлайн и не реагирует.
+
+Текст деградации в чате — без разметки (`\n`, не `<br>`): он обязан читаться целиком и тогда,
+когда Telegram не принял HTML (запасной путь `send_reply` снимает теги через `strip_tags`, а не
+экранирует их — иначе владелец видел бы `<code>/status</code>` вместо инструкции).
 
 По одному запросу на роль (`brain`/`fast`/`vision`) + эмбеддинги; там же печатается `dims`, так
 что расхождение размерности `embedding-3` с колонкой `vector(2048)` видно сразу. Список моделей у

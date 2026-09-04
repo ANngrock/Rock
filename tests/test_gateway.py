@@ -361,3 +361,41 @@ async def test_embeddings_fall_back_to_primary_endpoint() -> None:
     gateway.primary = SimpleNamespace(embeddings=SimpleNamespace(create=create), close=_noop)  # type: ignore[assignment]
     gateway.embed_client = gateway.primary
     assert await gateway.embed(["текст"]) == [[0.1] * 2]
+
+
+# ------------------------------------------------- ключ vs endpoint (причина 401 без логов)
+
+
+async def test_auth_hint_reports_foreign_key() -> None:
+    from aegis.platform.config import Settings
+    from aegis.platform.gateway.client import ModelGateway
+
+    cfg = Settings(
+        _env_file=None,
+        glm_api_key="sk-ai-v1-abcdef0123",
+        glm_base_url="https://zenmux.ai/api/v1/",
+        kv_backend="memory",
+    )
+    gateway = ModelGateway(cfg, None)  # type: ignore[arg-type]
+    hint = gateway.auth_hint()
+    assert "z.ai" in hint and "zenmux.ai" in hint
+    describe = gateway.describe()
+    assert describe["endpoint"] == "zenmux.ai"
+    assert describe["auth_hint"] == hint
+    assert "abcdef0123" not in hint, "наружу уходит только префикс"
+    await gateway.aclose()
+
+
+async def test_auth_hint_quiet_when_key_matches_endpoint() -> None:
+    from aegis.platform.config import Settings
+    from aegis.platform.gateway.client import ModelGateway
+
+    cfg = Settings(
+        _env_file=None,
+        glm_api_key="sk-ss-v1-abcdef0123",
+        glm_base_url="https://zenmux.ai/api/v1/",
+        kv_backend="memory",
+    )
+    gateway = ModelGateway(cfg, None)  # type: ignore[arg-type]
+    assert gateway.auth_hint() == ""
+    await gateway.aclose()

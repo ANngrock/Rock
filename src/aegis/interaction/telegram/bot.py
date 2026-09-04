@@ -39,8 +39,9 @@ from aegis.agents.supervisor import Inbound, Reply
 from aegis.agents.tools import builtin  # noqa: F401  — импорт регистрирует инструменты
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
-from aegis.interaction.telegram.render import render_for_telegram
+from aegis.interaction.telegram.render import render_for_telegram, strip_tags
 from aegis.platform.config import ConfigError
+from aegis.platform.gateway.diagnose import redact_secrets
 from aegis.runtime import App, build_app
 
 __all__ = ["OwnerOnly", "build_dispatcher", "main"]
@@ -109,9 +110,13 @@ async def send_reply(bot: Bot, chat_id: int, reply: Reply) -> Message | None:
                 chat_id, chunk, reply_markup=markup, link_preview_options=None
             )
         except TelegramBadRequest:
-            # разметка всё-таки не прошла (например, <a> с относительным href) — уходим в текст
+            # разметка всё-таки не прошла (например, <a> с относительным href) — уходим в текст:
+            # теги снимаем (а не экранируем), иначе владелец читает <code> вместо ответа
             last = await bot.send_message(
-                chat_id, html_lib.escape(chunk), reply_markup=markup, link_preview_options=None
+                chat_id,
+                html_lib.escape(strip_tags(chunk), quote=False),
+                reply_markup=markup,
+                link_preview_options=None,
             )
         except TelegramAPIError as exc:
             log.error("telegram.send_failed", err=repr(exc)[:300], chat_id=chat_id)
@@ -158,17 +163,25 @@ async def cmd_status(message: Message, app: App) -> None:
     cost: dict[str, Any] = status["cost"]
     budget_line = f"${cost['spent_usd']:.3f} из ${cost['limit_usd']:.2f}"
     trace = _trace_label(app, status)
-    await message.answer(
-        "<b>Состояние</b>\n"
-        f"Трассировка: {trace}\n"
-        f"Промпт: <code>{status['prompt_version']}</code> · итераций ≤ {status['max_iterations']}\n"
-        f"Модели:\n{models}\n"
-        f"Fallback: {'включён' if status['gateway']['fallback_enabled'] else 'выключен'}\n"
-        f"Бюджет: <code>{budget_line}</code>\n"
-        f"Kill switch: <b>{_kill_label(status)}</b>\n"
-        f"История в контексте: {status['history_messages']} реплик\n"
-        f"Инструментов: {len(status['tools'])}"
-    )
+    # ключ от соседнего сервиса — то, из-за чего «Модели недоступны» на ровном месте:
+    # показываем это и в /status, потому что именно туда отправляет деградированный ответ
+    auth_warn = str(status["gateway"].get("auth_hint") or "")
+    lines = [
+        "<b>Состояние</b>",
+        f"Трассировка: {trace}",
+        f"Промпт: <code>{status['prompt_version']}</code> · итераций ≤ {status['max_iterations']}",
+        f"Модели:\n{models}",
+        f"Fallback: {'включён' if status['gateway']['fallback_enabled'] else 'выключен'}",
+    ]
+    if auth_warn:
+        lines.append(f"⚠️ {auth_warn}")
+    lines += [
+        f"Бюджет: <code>{budget_line}</code>",
+        f"Kill switch: <b>{_kill_label(status)}</b>",
+        f"История в контексте: {status['history_messages']} реплик",
+        f"Инструментов: {len(status['tools'])}",
+    ]
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("tools"))
@@ -312,9 +325,11 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
     except Exception as exc:  # noqa: BLE001 - владельцу показываем деградацию, а не traceback
         log.exception("handle.failed")
         reply = Reply(
+            # без разметки: это аварийный текст, он обязан дойти независимо от того, принял
+            # Telegram HTML или нет
             text=(
-                f"Сбой: <code>{type(exc).__name__}</code>. Команды продолжают работать — "
-                "напиши <code>/status</code>."
+                f"Сбой: {type(exc).__name__}. Команды продолжают работать — напиши /status. "
+                f"Детали: {redact_secrets(str(exc))[:300]}"
             ),
             degraded=True,
         )

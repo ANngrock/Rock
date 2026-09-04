@@ -166,3 +166,87 @@ async def test_models_report_flags_dimension_mismatch() -> None:
     report = await _models_report(SimpleNamespace(gateway=Gateway()), cfg)
     assert report["ok"] is False
     assert "1024" in report["roles"]["embed"]["hint"]
+
+
+# ----------------------------------------------------------------- контракт HEALTHCHECK
+
+
+async def test_quick_skips_every_live_probe(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--quick` = офлайн-контракт: его вызывает HEALTHCHECK контейнера с таймаутом 10 c.
+
+    Живой провайдер внутри health-пробы — это «бот выглядит мёртвым» при 401 или таймауте у
+    провайдера (и лишний бюджет на каждый цикл проверки).
+    """
+    import json
+
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    async def forbidden(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        raise AssertionError(f"--quick не имеет права ходить в сеть: {args[:1]}")
+
+    async def ok() -> dict[str, Any]:
+        return {"ok": True}
+
+    cfg = Settings(_env_file=None, kv_backend="memory", glm_api_key="k", daily_budget_usd=1.0)
+    # doctor настраивает structlog на stderr; в тесте этот поток закроется вместе с capsys,
+    # и логгер следующих тестов упал бы на «I/O operation on closed file»
+    monkeypatch.setattr("aegis.runtime.setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr("aegis.platform.config.settings", lambda: cfg)
+    monkeypatch.setattr(cli, "_model_report", forbidden)
+    monkeypatch.setattr(cli, "_models_report", forbidden)
+    monkeypatch.setattr(cli, "_postgres_report", ok)
+    assert await cli._cmd_doctor(as_json=True, quick=True) == 0
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert set(report["checks"]) == {"postgres", "redis"}, report["checks"]
+    assert report["checks"]["redis"]["backend"] == "memory"
+
+
+async def test_live_probe_cannot_hang_doctor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Висящее соединение провайдера не превращает doctor в «ничего не выводится»."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    class HangingGateway:
+        async def chat(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            await asyncio.sleep(30)
+            raise AssertionError("не должно быть достигнуто")
+
+        async def embed(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            await asyncio.sleep(30)
+            raise AssertionError("не должно быть достигнуто")
+
+    monkeypatch.setattr(cli, "_PROBE_TIMEOUT_S", 0.05)
+    cfg = Settings(_env_file=None, glm_api_key="k", llm_timeout_s=30)
+    report = await cli._models_report(SimpleNamespace(gateway=HangingGateway()), cfg)
+    assert report["ok"] is False
+    assert all(e["error"].startswith("TimeoutError") for e in report["roles"].values())
+    assert "--quick" in report["hint"]
+
+    single = await cli._model_report(SimpleNamespace(gateway=HangingGateway()), cfg)
+    assert single["ok"] is False and "TimeoutError" in single["error"]
+
+
+async def test_model_hint_names_key_provider_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """401 от чужого endpoint: человек должен получить «ключ от z.ai, запрос на zenmux.ai»."""
+    from types import SimpleNamespace
+
+    from aegis import cli
+    from aegis.platform.config import Settings
+    from aegis.platform.gateway.client import ModelUnavailable
+
+    class Gateway:
+        async def chat(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            raise ModelUnavailable("нет", cause="AuthenticationError: Error code: 401")
+
+        def auth_hint(self) -> str:
+            return "ключ с префиксом sk-ai-v1-… выдан z.ai, а запрос уходит на zenmux.ai"
+
+    cfg = Settings(_env_file=None, glm_api_key="k")
+    report = await cli._model_report(SimpleNamespace(gateway=Gateway()), cfg)
+    assert "выдан z.ai" in report["hint"]

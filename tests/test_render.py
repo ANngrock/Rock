@@ -13,6 +13,7 @@ from aegis.interaction.telegram.render import (
     chunk_html,
     render_for_telegram,
     sanitize_html,
+    strip_tags,
 )
 
 
@@ -100,3 +101,31 @@ def test_limit_respected_for_realistic_llm_answer() -> None:
     joined = "".join(chunk.replace("<b>", "").replace("</b>", "") for chunk in rendered.chunks)
     assert "данные из инструмента" in joined
     assert html.unescape(joined).replace(" ", "") != ""
+
+
+# ------------------------------------------------------------------ strip_tags (запасной путь)
+
+
+def test_strip_tags_turns_breaks_into_newlines_and_keeps_text() -> None:
+    text = "Первая строка.<br><i>401 — ключ не принят</i><br><code>/status</code> покажет."
+    out = strip_tags(text)
+    assert out == "Первая строка.\n401 — ключ не принят\n/status покажет."
+    assert "<" not in out and ">" not in out
+
+
+def test_strip_tags_understands_markdown_too() -> None:
+    assert strip_tags("**важно** и `код`") == "важно и код"
+
+
+def test_strip_tags_is_noop_for_plain_text() -> None:
+    assert strip_tags("обычный ответ\nвторая строка") == "обычный ответ\nвторая строка"
+
+
+def test_strip_tags_collapses_empty_lines() -> None:
+    assert strip_tags("a<br><br><br>b") == "a\n\nb"
+
+
+def test_strip_tags_decodes_entities_from_sanitize() -> None:
+    # sanitize_html экранирует «<» в тексте: наружу должны уйти угловые скобки, а не &lt;
+    safe, _ = sanitize_html("если a<b и c>d")
+    assert strip_tags(safe) == "если a<b и c>d"

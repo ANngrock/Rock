@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["diagnose", "redact_secrets"]
+__all__ = ["auth_hint_for", "diagnose", "gateway_auth_hint", "redact_secrets"]
 
 # Секреты в текст ошибок попадают через логи библиотек; ни один из паттернов не должен
 # пройти в сообщение Telegram.
@@ -32,16 +32,20 @@ def redact_secrets(text: str) -> str:
         out = pattern.sub(replacement, out)
     return out
 
-    # Порядок важен: от специфичного к общему. Ключ — подстрока в repr исключения:
-    # openai-ошибки приходят как 'AuthenticationError: Error code: 401 - {...}'
 
+_AUTH_401 = (
+    "401 — ключ не принят именно этим адресом: GLM_API_KEY и GLM_BASE_URL должны принадлежать "
+    "одному сервису; после правки .env контейнер нужно пересоздать"
+)
 
+#: Порядок важен: от специфичного к общему. Ключ — подстрока в repr исключения: openai-ошибки
+#: приходят как 'AuthenticationError: Error code: 401 - {...}'.
 _RULES: tuple[tuple[str, str], ...] = (
     (
         "authenticationerror",
-        "401 — ключ не принят. Обнови GLM_API_KEY в .env и пересоздай контейнер",
+        _AUTH_401,
     ),
-    ("401", "401 — ключ не принят. Обнови GLM_API_KEY в .env и пересоздай контейнер"),
+    ("401", _AUTH_401),
     (
         "permissiondeniederror",
         "403 — ключ принят, но доступа к модели нет: проверь тариф и имя модели",
@@ -93,18 +97,58 @@ _RULES: tuple[tuple[str, str], ...] = (
 )
 
 
-def diagnose(error: str, *, timeout_s: float = 60.0) -> str:
+#: Префиксы, по которым ключ однозначно привязан к сервису. Проверка нужна потому, что текст
+#: ответа провайдера об этом молчит, а «ключ не принят» при валидном ключе — почти всегда
+#: ключ от соседнего сервиса (z.ai и роутеры живут разными учётками).
+_ISSUERS: tuple[tuple[str, str, str], ...] = (
+    ("sk-ai-v1-", "z.ai", "https://api.z.ai/api/paas/v4/"),
+    ("sk-ss-v1-", "ZenMux", "https://zenmux.ai/api/v1/"),
+    ("sk-cs-v1-", "ZenMux", "https://zenmux.ai/api/v1/"),
+)
+_ISSUER_HOSTS = {"z.ai": ("api.z.ai",), "ZenMux": ("zenmux.ai",)}
+
+
+def _host_of(base_url: str) -> str:
+    return (base_url or "").split("//")[-1].split("/")[0].casefold()
+
+
+def auth_hint_for(*, base_url: str, api_key: str) -> str:
+    """«Ключ выдан не этим сервисом» — одна строка, без сети. Пусто, если сказать нечего."""
+    key, host = (api_key or "").strip(), _host_of(base_url)
+    if not key or not host:
+        return ""
+    row = next((r for r in _ISSUERS if key.startswith(r[0])), None)
+    if row is None or any(needle in host for needle in _ISSUER_HOSTS[row[1]]):
+        return ""
+    prefix, issuer, issuer_url = row
+    return (
+        f"ключ с префиксом {prefix}… выдан {issuer}, а запрос уходит на {host}: это разные "
+        f"сервисы. Подставь ключ {issuer} в GLM_API_KEY либо верни "
+        f"GLM_BASE_URL={issuer_url}"
+    )
+
+
+def gateway_auth_hint(gateway: object) -> str:
+    """То же через шлюз; у тестовых заглушек метода может не быть — это не ошибка."""
+    fn = getattr(gateway, "auth_hint", None)
+    if not callable(fn):
+        return ""
+    return str(fn() or "")
+
+
+def diagnose(error: str, *, timeout_s: float = 60.0, context: str = "") -> str:
     """Одна короткая строка с причиной и первым действием.
 
     Пустой вход — частый случай, когда исключение прилетело не от OpenAI-совместимого
     клиента: тогда честно говорим, что классифицировать нечего.
     """
     clean = redact_secrets(error or "").strip()
+    extra = f" · {context.strip()}" if context and context.strip() else ""
     if not clean:
-        return "провайдер не дал деталей; смотри `aegis doctor`"
+        return "провайдер не дал деталей; смотри `aegis doctor`" + extra
     low = clean.lower()
     for needle, remedy in _RULES:
         if needle in low:
-            return remedy.format(timeout_s=timeout_s)
+            return remedy.format(timeout_s=timeout_s) + extra
     # классифицировать нечем, но текст может быть полезен: отдаём замаскированный кусок
-    return f"ошибка провайдера: {clean[:120]}"
+    return f"ошибка провайдера: {clean[:120]}" + extra

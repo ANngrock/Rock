@@ -36,7 +36,7 @@ from aegis.platform.config import Settings, settings
 from aegis.platform.events.sink import EventSink, NullEventSink
 from aegis.platform.gateway.client import ChatResult, ModelUnavailable
 from aegis.platform.gateway.cost import BudgetExceeded
-from aegis.platform.gateway.diagnose import diagnose
+from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint
 from aegis.platform.gateway.models import ChatRole
 from aegis.platform.kv import KV, history_key, pending_key
 from aegis.platform.logging import bind_contextvars
@@ -285,8 +285,9 @@ class Supervisor:
             redacted = self.services.gateway.dlp.redact(str(exc))
             return Reply(
                 text=(
-                    "Дневной бюджет LLM исчерпан — умная часть на паузе. "
-                    f"<i>{redacted}</i><br><code>/cost</code> покажет расходы, команды работают."
+                    "Дневной бюджет LLM исчерпан — умная часть на паузе.\n"
+                    f"{redacted}\n"
+                    "/cost покажет расходы, команды работают."
                 ),
                 trace_id=ctx.trace_id,
                 degraded=True,
@@ -295,14 +296,18 @@ class Supervisor:
             # Владелец должен увидеть ПРИЧИНУ, а не «попробуй позже»: читать логи контейнера
             # ради 401 — не тот уровень сервиса для личного инструмента.
             reason = diagnose(
-                str(getattr(exc, "cause", "") or exc), timeout_s=self.cfg.llm_timeout_s
+                str(getattr(exc, "cause", "") or exc),
+                timeout_s=self.cfg.llm_timeout_s,
+                context=gateway_auth_hint(self.services.gateway),
             )
             log.warning("supervisor.model_unavailable", err=reason[:200])
+            # Только переносы строк, никакой разметки: этот текст обязан дойти целиком даже
+            # тогда, когда Telegram не принял HTML и слой отправки ушёл в запасной путь.
             return Reply(
                 text=(
-                    "Модели сейчас недоступны — провайдер не ответил.<br>"
-                    f"Причина: <i>{reason}</i><br>"
-                    "<code>/status</code> и <code>aegis doctor</code> показывают состояние; "
+                    "Модели сейчас недоступны — провайдер не ответил.\n"
+                    f"Причина: {reason}\n"
+                    "/status и aegis doctor показывают состояние; "
                     "команды и работа с базой продолжаются."
                 ),
                 trace_id=ctx.trace_id,

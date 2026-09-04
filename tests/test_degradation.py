@@ -103,3 +103,44 @@ def test_no_structlog_reserved_kwargs_in_source(path: pathlib.Path) -> None:
     """Ни одного `log.*(event=...)` в исходниках: это TypeError внутри обработки отказа."""
     offenders = _log_calls_with_reserved_kw(ast.parse(path.read_text(), filename=str(path)))
     assert not offenders, f"{path.name}: зарезервированный ключ structlog -> {offenders}"
+
+
+# --------------------------------------------- разметка в служебных текстах запрещена
+_markup_tags = ("<i>", "</i>", "<br>", "<code>", "</code>", "<b>", "</b>")
+
+
+def _literal_parts(node: ast.expr) -> list[str]:
+    """Строковые куски аргумента: f-строки ast отдаёт теми же Constant-узлами."""
+    return [
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        p
+        for p in sorted(SRC.rglob("*.py"))
+        if "interaction/telegram" not in str(p.relative_to(SRC.parent)).replace("\\", "/")
+    ],
+    ids=lambda p: str(p.relative_to(SRC.parent)),
+)
+def test_reply_text_carries_no_markup(path: pathlib.Path) -> None:
+    """`Reply.text` — то, что человек читает при отказе провайдера.
+
+    Telegram-рендер умеет и HTML, но путь деградации не должен от него зависеть: теги в тексте
+    бота превращаются в «<code>/status</code>» ровно тогда, когда разметку не приняли.
+    """
+    tree = ast.parse(path.read_text(), filename=str(path))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or getattr(node.func, "attr", "") != "Reply":
+            continue
+        for kw in node.keywords:
+            if kw.arg in {"text", "note"} and any(
+                tag in part for part in _literal_parts(kw.value) for tag in _markup_tags
+            ):
+                offenders.append(f"строка {kw.value.lineno}")
+    assert not offenders, f"{path.name}: разметка в Reply -> {offenders}"

@@ -101,22 +101,46 @@ async def _postgres_report() -> dict[str, Any]:
     return out
 
 
+#: Живые пробы doctor: жёсткий потолок на запрос. Висящее соединение провайдера не имеет права
+#: превращать `aegis doctor` в «ничего не выводится» — и уж тем более висящий HEALTHCHECK.
+_PROBE_TIMEOUT_S = 20.0
+
+
+def _probe_timeout_entry(label: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "role": label,
+        "error": f"TimeoutError: проба «{label}» не завершилась за {_PROBE_TIMEOUT_S:.0f} c",
+        "hint": (
+            "провайдер держит соединение: проверь VPN/прокси/таймаут LLM_TIMEOUT_S; "
+            "HEALTHCHECK контейнера ходит с --quick и от сети не зависит"
+        ),
+    }
+
+
 async def _model_report(app: Any, cfg: Any) -> dict[str, Any]:
     """Живой запрос на 8 токенов: только так видно, примет ли провайдер ключ и модель.
 
     Только вне --quick: HEALTHCHECK контейнера ходит именно с --quick, чтобы не тратить бюджет.
     """
-    from aegis.platform.gateway.diagnose import diagnose, redact_secrets
+    from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint, redact_secrets
 
     out: dict[str, Any] = {"ok": False, "role": "fast"}
     try:
-        res = await app.gateway.chat("fast", [{"role": "user", "content": "ping"}], max_tokens=8)
+        res = await asyncio.wait_for(
+            app.gateway.chat("fast", [{"role": "user", "content": "ping"}], max_tokens=8),
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        return _probe_timeout_entry("fast")
     except Exception as exc:  # noqa: BLE001
         # деталь транспорта живёт в cause (у ModelUnavailable), str() — только «нет провайдеров»
         cause = str(getattr(exc, "cause", "") or "")
         raw = f"{type(exc).__name__}: {cause or exc}"
         out["error"] = redact_secrets(raw)[:160]
-        out["hint"] = diagnose(raw, timeout_s=cfg.llm_timeout_s)
+        out["hint"] = diagnose(
+            raw, timeout_s=cfg.llm_timeout_s, context=gateway_auth_hint(app.gateway)
+        )
         return out
     out.update(
         ok=True,
@@ -130,26 +154,46 @@ async def _model_report(app: Any, cfg: Any) -> dict[str, Any]:
 
 async def _models_report(app: Any, cfg: Any) -> dict[str, Any]:
     """По одному крошечному запросу на роль: ловит и «ключа нет», и «такой модели нет»."""
-    from aegis.platform.gateway.diagnose import diagnose, redact_secrets
+    from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint, redact_secrets
 
     out: dict[str, Any] = {"ok": True, "roles": {}}
     for role in ("brain", "fast", "vision"):
         try:
-            res = await app.gateway.chat(
-                role, [{"role": "user", "content": "ping"}], max_tokens=8, thinking=False
+            res = await asyncio.wait_for(
+                app.gateway.chat(
+                    role, [{"role": "user", "content": "ping"}], max_tokens=8, thinking=False
+                ),
+                timeout=_PROBE_TIMEOUT_S,
             )
+        except TimeoutError:
+            out["roles"][role] = _probe_timeout_entry(role)
+            out["ok"] = False
+            continue
         except Exception as exc:  # noqa: BLE001
             raw = f"{type(exc).__name__}: {getattr(exc, 'cause', '') or exc}"
             out["roles"][role] = {
                 "ok": False,
                 "error": redact_secrets(raw)[:160],
-                "hint": diagnose(raw, timeout_s=cfg.llm_timeout_s),
+                "hint": diagnose(
+                    raw, timeout_s=cfg.llm_timeout_s, context=gateway_auth_hint(app.gateway)
+                ),
             }
             out["ok"] = False
             continue
         out["roles"][role] = {"ok": True, "model": res.model, "latency_ms": res.latency_ms}
     try:
-        vecs = await app.gateway.embed(["ping"])
+        vecs = await asyncio.wait_for(
+            app.gateway.embed(["ping"]),
+            timeout=_PROBE_TIMEOUT_S,  # эмбеддинги тоже в сети
+        )
+    except TimeoutError:
+        out["roles"]["embed"] = _probe_timeout_entry("embed")
+        out["ok"] = False
+    except Exception as exc:  # noqa: BLE001
+        raw = f"{type(exc).__name__}: {exc}"
+        out["roles"]["embed"] = {"ok": False, "error": redact_secrets(raw)[:160]}
+        out["ok"] = False
+    else:
         dims = len(vecs[0]) if vecs else 0
         out["roles"]["embed"] = {"ok": dims > 0, "dims": dims}
         if dims and dims != cfg.embedding_dims:
@@ -158,10 +202,6 @@ async def _models_report(app: Any, cfg: Any) -> dict[str, Any]:
                 "нужна миграция либо dimensions=... в запросе"
             )
             out["ok"] = False
-    except Exception as exc:  # noqa: BLE001
-        raw = f"{type(exc).__name__}: {exc}"
-        out["roles"]["embed"] = {"ok": False, "error": redact_secrets(raw)[:160]}
-        out["ok"] = False
     out["note"] = " · ".join(
         f"{role}:{'ok' if r.get('ok') else 'FAIL'}" for role, r in out["roles"].items()
     )

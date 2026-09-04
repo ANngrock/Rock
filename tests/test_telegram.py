@@ -77,10 +77,20 @@ async def test_send_reply_splits_long_messages() -> None:
     assert "".join(text for _, text, _ in bot.sent) == "x" * 9000
 
 
-async def test_send_reply_falls_back_to_escaped_text() -> None:
+async def test_send_reply_falls_back_to_readable_text() -> None:
+    """Telegram не принял разметку -> отправляем ТЕКСТ, а не экранированный HTML."""
     bot = RecordingBot(fail_html_once=True)
     await send_reply(bot, 7, Reply(text="<b>важно</b>"))  # type: ignore[arg-type]
-    assert bot.sent[0][1] == "&lt;b&gt;важно&lt;/b&gt;"
+    assert bot.sent[0][1] == "важно"
+
+
+async def test_send_reply_fallback_keeps_line_breaks() -> None:
+    """Запасной путь обязан сохранить читаемость: переносы вместо <br>, текст вместо тегов."""
+    bot = RecordingBot(fail_html_once=True)
+    await send_reply(
+        bot, 7, Reply(text="Модели недоступны.<br><b>401</b><br><code>/status</code> покажет")
+    )  # type: ignore[arg-type]
+    assert bot.sent[0][1] == "Модели недоступны.\n401\n/status покажет"
 
 
 async def test_confirmation_buttons_attached_to_last_chunk() -> None:

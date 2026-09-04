@@ -43,6 +43,7 @@ class FakeGateway:
         self.dlp = DLP()
         self.calls: list[dict[str, Any]] = []
         self.embed_calls = 0
+        self.auth_hint_text = ""
 
     async def chat(
         self,
@@ -67,6 +68,9 @@ class FakeGateway:
     async def embed(self, texts: list[str], *, trace_id: str | None = None) -> list[list[float]]:
         self.embed_calls += 1
         return [[0.1, 0.2, 0.3] for _ in texts]
+
+    def auth_hint(self) -> str:
+        return self.auth_hint_text
 
     def describe(self) -> dict[str, Any]:
         return {

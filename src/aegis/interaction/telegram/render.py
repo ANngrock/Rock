@@ -28,6 +28,7 @@ __all__ = [
     "chunk_html",
     "render_for_telegram",
     "sanitize_html",
+    "strip_tags",
 ]
 
 MAX_MESSAGE_LEN = 4096  # лимит sendMessage
@@ -203,6 +204,24 @@ def chunk_html(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
 def _inside_tag(text: str, pos: int) -> bool:
     """True, если позиция попадает внутрь угловой скобки тега (граница реза недопустима)."""
     return text.rfind("<", 0, pos) > text.rfind(">", 0, pos)
+
+
+def strip_tags(text: str) -> str:
+    """Разметку в обычный текст: ``<br>`` -> перевод строки, содержимое сохраняется.
+
+    Нужен для запасного пути отправки: экранировать HTML нельзя — владелец получит ``<code>``
+    вместо ответа, а молча потерять сообщение тем более нельзя.
+    """
+    converted = _md_to_html(text)
+    out: list[str] = []
+    pos = 0
+    for match in _ANY_TAG.finditer(converted):
+        out.append(converted[pos : match.start()])
+        pos = match.end()
+        if match.group(2).lower() == "br" and match.group(1) != "/":
+            out.append("\n")
+    out.append(converted[pos:])
+    return re.sub(r"\n{3,}", "\n\n", html.unescape("".join(out))).strip()
 
 
 def render_for_telegram(text: str, *, limit: int = MAX_MESSAGE_LEN) -> RenderedMessage:
