@@ -131,3 +131,52 @@ def test_trace_label_needs_more_than_an_open_port() -> None:
     assert "alembic upgrade head" in _trace_label(ready, broken)
     assert "2 сбоя" in _trace_label(ready, broken)
     assert _trace_label(SimpleNamespace(db_ready=False), ok) == "БД не настроена — только память"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/restart", "restart"),
+        ("/ReStart", "restart"),
+        ("/nope@RockBot arg", "nope"),
+        ("/start", None),
+        ("/status", None),
+        ("/halt причина", None),
+        ("расскажи про себя", None),
+        ("/home/user/Rock/README.md", None),
+        ("", None),
+    ],
+)
+def test_unknown_command_detection(text: str, expected: str | None) -> None:
+    from aegis.interaction.telegram.bot import _unknown_command
+
+    assert _unknown_command(text) == expected
+
+
+async def test_unknown_command_answered_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """«/restart» не должен уходить в модель: ответ дешёвый и честный."""
+    from aegis.interaction.telegram import bot as bot_mod
+
+    sent: list[str] = []
+    handled: list[str] = []
+
+    async def answer(text: str, *args: Any, **kwargs: Any) -> None:
+        sent.append(text)
+
+    async def fake_run(message: Any, app: Any, inbound: Any, bot: Any) -> None:
+        handled.append(inbound.text)
+
+    monkeypatch.setattr(bot_mod, "run", fake_run)
+    message = SimpleNamespace(from_user=SimpleNamespace(id=1), text="/restart", answer=answer)
+    await bot_mod.on_text(message, SimpleNamespace(), None)  # type: ignore[arg-type]
+
+    assert not handled, "неизвестная команда не отправляется в LLM"
+    assert "/restart" in sent[0]
+    assert "docker compose" in sent[0], "про перезапуск контейнера надо сказать, где его делают"
+
+    await bot_mod.on_text(
+        SimpleNamespace(from_user=SimpleNamespace(id=1), text="привет", answer=answer),
+        SimpleNamespace(),
+        None,  # type: ignore[arg-type]
+    )
+    assert handled == ["привет"]

@@ -36,6 +36,93 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _scalar(sql: str) -> Any:
+    """Один запрос — одна сессия. Иначе упавший запрос отравляет остаток проверки."""
+    from sqlalchemy import text
+
+    from aegis.platform.db import session
+
+    async with session() as s:
+        return await s.scalar(text(sql))
+
+
+async def _postgres_report() -> dict[str, Any]:
+    """Связность И состояние схемы. Раньше «порт открыт, таблиц нет» печаталось как «БД недоступна».
+
+    Версия alembic нужна, чтобы отвечать на «миграции накатаны?» не заглядывая в контейнер:
+    именно этот вопрос стоил владельцу вечера.
+    """
+    out: dict[str, Any] = {"ok": False}
+    try:
+        out["server_version"] = str(await _scalar("SELECT current_setting('server_version')"))
+    except Exception as exc:  # noqa: BLE001 - диагностика, а не бизнес-ошибка
+        out["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        out["hint"] = (
+            "postgres не отвечает: docker compose -f deploy/docker-compose.yml ps postgres"
+        )
+        return out
+
+    counts = (
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relkind = 'r' AND n.nspname IN ('platform', 'governance', 'memory', 'knowledge')"
+    )
+    for key, sql in (
+        ("schema_ready", "SELECT to_regclass('platform.events') IS NOT NULL"),
+        ("tables", counts),
+        ("alembic_version", "SELECT version_num FROM public.alembic_version"),
+    ):
+        try:
+            out[key] = await _scalar(sql)
+        except Exception as exc:  # noqa: BLE001
+            out[key] = None
+            out[f"{key}_error"] = type(exc).__name__
+
+    out["tables"] = int(out.get("tables") or 0)
+    if not out["schema_ready"]:
+        out["hint"] = (
+            "миграции не накатаны: docker compose -f deploy/docker-compose.yml "
+            "run --rm bot alembic upgrade head"
+        )
+        return out
+    try:
+        out["events"] = int(await _scalar("SELECT count(*) FROM platform.events"))
+    except Exception:  # noqa: BLE001, S110 - счётчик не важнее самого факта ok
+        out["events"] = 0
+    out["ok"] = True
+    out["note"] = (
+        f"таблиц {out['tables']} · миграции {out['alembic_version'] or 'не записаны'} "
+        f"· событий {out['events']}"
+    )
+    return out
+
+
+async def _model_report(app: Any, cfg: Any) -> dict[str, Any]:
+    """Живой запрос на 8 токенов: только так видно, примет ли провайдер ключ и модель.
+
+    Только вне --quick: HEALTHCHECK контейнера ходит именно с --quick, чтобы не тратить бюджет.
+    """
+    from aegis.platform.gateway.diagnose import diagnose, redact_secrets
+
+    out: dict[str, Any] = {"ok": False, "role": "fast"}
+    try:
+        res = await app.gateway.chat("fast", [{"role": "user", "content": "ping"}], max_tokens=8)
+    except Exception as exc:  # noqa: BLE001
+        # деталь транспорта живёт в cause (у ModelUnavailable), str() — только «нет провайдеров»
+        cause = str(getattr(exc, "cause", "") or "")
+        raw = f"{type(exc).__name__}: {cause or exc}"
+        out["error"] = redact_secrets(raw)[:160]
+        out["hint"] = diagnose(raw, timeout_s=cfg.llm_timeout_s)
+        return out
+    out.update(
+        ok=True,
+        model=res.model,
+        latency_ms=res.latency_ms,
+        cost_usd=round(float(res.cost_usd), 6),
+        note=f"{res.model} · {res.latency_ms} мс · ${float(res.cost_usd):.6f}",
+    )
+    return out
+
+
 async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
     from aegis.agents.tools import builtin  # noqa: F401  (регистрирует инструменты)
     from aegis.agents.tools.registry import registry
@@ -56,26 +143,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
     # ровно один объект, который можно отдать jq/HEALTHCHECK
     app = build_app(registry=registry, cfg=cfg, configure_logging=True)
     try:
-        from sqlalchemy import text
-
-        from aegis.platform.db import session
-
-        try:
-            async with session() as s:
-                version = await s.scalar(text("SELECT current_setting('server_version')"))
-                events = await s.scalar(text("SELECT count(*) FROM platform.events"))
-                report["checks"]["postgres"] = {
-                    "ok": True,
-                    "server_version": str(version),
-                    "events": int(events),
-                }
-        except Exception as exc:  # noqa: BLE001 - диагностика, а не бизнес-ошибка
-            msg = f"{type(exc).__name__}: {exc}"[:300]
-            entry: dict[str, Any] = {"ok": False, "error": msg}
-            if "does not exist" in msg:
-                # самое частое: бот поднят до `alembic upgrade head`
-                entry["hint"] = "накай миграции: make migrate (alembic upgrade head внутри бота)"
-            report["checks"]["postgres"] = entry
+        report["checks"]["postgres"] = await _postgres_report()
 
         try:
             if cfg.kv_backend == "memory":
@@ -112,6 +180,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}"[:200],
                 }
+            report["checks"]["model"] = await _model_report(app, cfg)
     finally:
         await app.aclose()
 
@@ -126,7 +195,9 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
             print("  ! не хватает в конфиге: " + ", ".join(report["config_missing"]))
         for name, res in checks.items():
             mark = "ok " if res.get("ok") else "!! "
-            detail = " · ".join(str(x) for x in (res.get("error"), res.get("hint")) if x)
+            detail = " · ".join(
+                str(x) for x in (res.get("error"), res.get("hint"), res.get("note")) if x
+            )
             print(f"  {mark}{name:<9} {str(detail)[:120]}")
     return 0 if ok else 1
 

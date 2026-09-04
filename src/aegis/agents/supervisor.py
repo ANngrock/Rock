@@ -36,6 +36,7 @@ from aegis.platform.config import Settings, settings
 from aegis.platform.events.sink import EventSink, NullEventSink
 from aegis.platform.gateway.client import ChatResult, ModelUnavailable
 from aegis.platform.gateway.cost import BudgetExceeded
+from aegis.platform.gateway.diagnose import diagnose
 from aegis.platform.gateway.models import ChatRole
 from aegis.platform.kv import KV, history_key, pending_key
 from aegis.platform.logging import bind_contextvars
@@ -291,11 +292,18 @@ class Supervisor:
                 degraded=True,
             )
         except ModelUnavailable as exc:
-            log.warning("supervisor.model_unavailable", err=str(exc)[:300])
+            # Владелец должен увидеть ПРИЧИНУ, а не «попробуй позже»: читать логи контейнера
+            # ради 401 — не тот уровень сервиса для личного инструмента.
+            reason = diagnose(
+                str(getattr(exc, "cause", "") or exc), timeout_s=self.cfg.llm_timeout_s
+            )
+            log.warning("supervisor.model_unavailable", err=reason[:200])
             return Reply(
                 text=(
-                    "Модели сейчас недоступны — провайдер не ответил. Команды и работа с базой "
-                    "продолжаются; попробуй ещё раз чуть позже."
+                    "Модели сейчас недоступны — провайдер не ответил.<br>"
+                    f"Причина: <i>{reason}</i><br>"
+                    "<code>/status</code> и <code>aegis doctor</code> показывают состояние; "
+                    "команды и работа с базой продолжаются."
                 ),
                 trace_id=ctx.trace_id,
                 degraded=True,

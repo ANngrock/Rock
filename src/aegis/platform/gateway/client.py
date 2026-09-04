@@ -39,7 +39,15 @@ _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 class ModelUnavailable(RuntimeError):
-    """Ни primary, ни fallback не ответили. Верхний слой обязан деградировать, а не падать."""
+    """Ни primary, ни fallback не ответили. Верхний слой обязан деградировать, а не падать.
+
+    ``cause`` хранит последнюю сырую ошибку транспорта. Она не идёт наружу как есть (там
+    бывают URL и заголовки) — её классифицирует :func:`aegis.platform.gateway.diagnose`.
+    """
+
+    def __init__(self, message: str, *, cause: str = "") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 @dataclass(slots=True)
@@ -194,7 +202,10 @@ class ModelGateway:
                     dlp_map=dlp_map,
                     started=started,
                 )
-        raise ModelUnavailable(f"все провайдеры недоступны; последняя ошибка: {last_error}")
+        raise ModelUnavailable(
+            f"все провайдеры недоступны; последняя ошибка: {last_error}",
+            cause=last_error or "",
+        )
 
     async def embed(
         self, texts: Sequence[str], *, trace_id: str | None = None
@@ -223,7 +234,9 @@ class ModelGateway:
                     error=repr(exc)[:2000],
                 )
             )
-            raise ModelUnavailable(f"эмбеддинги недоступны: {exc!r}") from exc
+            raise ModelUnavailable(
+                f"эмбеддинги недоступны: {exc!r}", cause=f"{type(exc).__name__}: {exc}"
+            ) from exc
         tokens = int(resp.usage.total_tokens) if resp.usage else 0
         cost = tokens * spec.in_usd_per_m / 1_000_000
         await self.cost.record(cost)

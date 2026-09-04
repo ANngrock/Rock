@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import html as html_lib
+import re
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -244,9 +245,42 @@ async def on_unsupported(message: Message) -> None:
     )
 
 
+#: Команды, которые знает бот. aiogram требует точного совпадения имени команды, поэтому
+#: «/restart» без этой проверки улетал бы в модель как обычный текст: трата токенов и
+#: загадочный ответ вместо «такой команды нет».
+KNOWN_COMMANDS = frozenset({"start", "help", "new", "cost", "status", "tools", "halt", "resume"})
+_COMMAND_SHAPED = re.compile(r"^/([A-Za-z][A-Za-z0-9_]{1,31})(?:@\w+)?$")
+#: команды, которые просят сделать что-то с самим процессом — это делается снаружи
+OUTSIDE_COMMANDS = frozenset({"restart", "reboot", "stop", "update", "upgrade", "logs", "pull"})
+HELP_HINT = "Список команд и их смысл — в <code>/help</code>."
+
+
+def _unknown_command(text: str) -> str | None:
+    """Имя неизвестной команды либо None. Путь вида /home/user/file — не команда."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first = stripped.split(maxsplit=1)[0]
+    match = _COMMAND_SHAPED.match(first)
+    if not match:
+        return None
+    name = match.group(1).casefold()
+    return None if name in KNOWN_COMMANDS else name
+
+
 @router.message(F.text)
 async def on_text(message: Message, app: App, bot: Bot) -> None:
     if message.from_user is None or not message.text:
+        return
+    unknown = _unknown_command(message.text)
+    if unknown is not None:
+        text = f"Не знаю команду <code>/{unknown}</code>. " + HELP_HINT
+        if unknown in OUTSIDE_COMMANDS:
+            text += (
+                "<br>Управлением контейнером я не занимаюсь: "
+                "<code>docker compose -f deploy/docker-compose.yml restart bot</code>"
+            )
+        await message.answer(text)
         return
     await run(message, app, Inbound(text=message.text, owner_id=message.from_user.id), bot)
 

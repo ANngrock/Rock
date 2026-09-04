@@ -439,3 +439,25 @@ async def test_resume_after_unknown_id_is_polite(approved: bool) -> None:
     h = harness([])
     reply = await h.resume("нет-такого", approved)
     assert "устарело" in reply.text or "обработано" in reply.text
+
+
+async def test_model_unavailable_names_the_reason() -> None:
+    """Деградация обязана быть объяснимой: «401» и «нет сети» лечатся по-разному."""
+    h = harness([ModelUnavailable("все провайдеры недоступны", cause="AuthenticationError: 401")])
+    reply = await h.handle("что нового?")
+    assert "401" in reply.text
+    assert "GLM_API_KEY" in reply.text
+
+
+async def test_model_unavailable_does_not_leak_keys() -> None:
+    h = harness(
+        [
+            ModelUnavailable(
+                "все провайдеры недоступны",
+                cause="APIConnectionError: header Authorization: Bearer sk-REALKEY123456",
+            )
+        ]
+    )
+    reply = await h.handle("что нового?")
+    assert "sk-REALKEY123456" not in reply.text
+    assert "соединение" in reply.text.lower()
