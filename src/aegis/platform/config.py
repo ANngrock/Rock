@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     fallback_base_url: str | None = None
     fallback_model: str | None = None
     llm_timeout_s: float = 60.0
+    #: Некоторые роутеры отклоняют нестандартный параметр thinking в теле запроса (400). Если после
+    #: смены провайдера ответы пропали, а `doctor --models` показывает 400 — выставьте false.
+    llm_thinking_param: bool = True
     llm_retries_per_client: int = Field(default=2, ge=0, le=6)
     llm_backoff_s: float = Field(default=1.5, ge=0.05, le=30.0)
 
@@ -98,6 +101,24 @@ class Settings(BaseSettings):
         if v not in available_timezones():  # падение на старте лучше падения в первом запросе
             raise ValueError(f"неизвестная TZ '{v}' (см. zoneinfo)")
         return v
+
+    @field_validator("glm_base_url", "fallback_base_url")
+    @classmethod
+    def _normalize_base_url(cls, v: str | None) -> str | None:
+        """Открытый чат с собой: в .env регулярно прилетает полный URL эндпоинта.
+
+        OpenAI-клиент сам дописывает ``chat/completions``, поэтому ``.../v4/chat/completions``
+        превращается в 404, а выглядит как «провайдер не ответил». Срезаем и хвостовой слэш,
+        и явный путь эндпоинта; trailing slash приводим к единому виду.
+        """
+        if v is None:
+            return None
+        cleaned = v.strip().rstrip("/")
+        for suffix in ("/chat/completions", "/responses", "/completions", "/embeddings"):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)]
+                break
+        return f"{cleaned}/"
 
     @field_validator("base_currency")
     @classmethod

@@ -275,3 +275,17 @@ def test_describe_does_not_leak_keys() -> None:
     assert "sk-super-secret" not in dumped
     assert "sk-fb" not in dumped
     assert "brain" in dumped
+
+
+async def test_thinking_param_can_be_switched_off_for_routers() -> None:
+    """Роутер, не знающий нестандартного параметра thinking, не должен получать 400 из-за него."""
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        llm_backoff_s=0.05,
+        llm_thinking_param=False,
+    )
+    gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
+    await gateway.chat("brain", [{"role": "user", "content": "привет"}], thinking=True)
+    assert "extra_body" not in primary.requests[0]

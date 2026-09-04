@@ -158,7 +158,7 @@ class ModelGateway:
                 model_name = self.cfg.fallback_model
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
             # нестандартные параметры (thinking) провайдер fallback может не понимать
-            if spec.supports_thinking and provider == "primary":
+            if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
                 kwargs["extra_body"] = {"thinking": {"type": "enabled" if thinking else "disabled"}}
             for retry in range(self.cfg.llm_retries_per_client + 1):
                 attempt += 1

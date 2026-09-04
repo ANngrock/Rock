@@ -43,8 +43,9 @@ docker compose -f deploy/docker-compose.yml logs -f bot
 | `TELEGRAM_BOT_TOKEN` | — | токен от @BotFather |
 | `TELEGRAM_OWNER_ID` | — | единственный пользователь, которому бот отвечает |
 | `TELEGRAM_ALERTS_CHAT_ID` | пусто | чат для алертов (сначала `/start` боту, id со знаком минус) |
-| `GLM_API_KEY` | — | ключ z.ai (OpenAI-совместимый API) |
-| `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4/` | основной провайдер |
+| `GLM_API_KEY` | — | ключ OpenAI-совместимого провайдера: z.ai **или** роутера (ZenMux и т. п.) |
+| `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4/` | базовый URL **без** `/chat/completions` (хвост эндпоинта срезается автоматически, OpenAI-клиент дописывает сам) |
+| `LLM_THINKING_PARAM` | `true` | `false` — не слать нестандартный `thinking` в теле: роутеры, которые его не знают, отвечают 400 |
 | `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | переопределение имён моделей без правки кода |
 | `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | пусто | резервный провайдер при 5xx/лимите |
 | `KV_BACKEND` | `redis` | `memory` — запуск вообще без Redis: демо/CI/первое «пощупать». Состояние живёт только в процессе, в `ENV=prod` запрещено |
@@ -153,10 +154,28 @@ SearXNG требует явного включения JSON-ответов: `dep
 
 ## 8. Обновление ценников моделей
 
-Стоимость считается по `in_usd_per_m`/`out_usd_per_m` из `platform/gateway/models.py`; цены z.ai
-меняются. Раз в месяц: сверить каталог с прайсом, поправить числа, `make test` (тесты проверяют
-формулы, а не конкретные цены). Имена моделей — переопределить через `MODEL_*` в `.env`, если не
-хочется трогать код.
+Стоимость считается по `in_usd_per_m`/`out_usd_per_m` из `platform/gateway/models.py`; цены
+провайдера меняются. Раз в месяц: сверить каталог с прайсом, поправить числа, `make test` (тесты
+проверяют формулы, а не конкретные цены).
+
+Цены лежат в `PRICES`, ключ — **имя модели**, потому что одно и то же у разных шлюзов стоит
+по-разному: `glm-4.6` (z.ai, $0.6/$2.2) и `z-ai/glm-4.6` (ZenMux, ступень <32k ≈ $0.35/$1.54).
+Имя переопределяется через `MODEL_*` в `.env`; если для нового имени цены в `PRICES` нет, берётся
+прайс роли и в лог уходит `models.unknown_price` с подсказкой — молча врать про бюджет хуже, чем
+попросить дописать строчку.
+
+Смена провайдера целиком:
+
+```ini
+GLM_BASE_URL=https://zenmux.ai/api/v1/
+MODEL_BRAIN=z-ai/glm-4.6
+MODEL_VISION=z-ai/glm-4.6v
+MODEL_FAST=z-ai/glm-4.5-air
+LLM_THINKING_PARAM=false   # только если роутер отвечает 400 на thinking
+```
+
+Префикс `z-ai/` обязателен: без него роутер не знает модель. Проверка после правки —
+`aegis doctor --models` (по одному запросу на роль + размерность эмбеддинга).
 
 ## 9. Локальная разработка без Docker
 
@@ -236,6 +255,8 @@ docker compose -f deploy/docker-compose.yml exec postgres psql -U aegis -d aegis
 | `соединение ... TLS` | антивирус/корпоративный прокси перехватывает сертификат; из контейнера — `docker compose exec bot python -c "import httpx;print(httpx.get('https://api.z.ai', timeout=10).status_code)"` |
 | `таймаут` | поднять `LLM_TIMEOUT_S` или проверить VPN |
 | `5xx` | живёт и проходит само; fallback-модель уже была перепробована |
+| `провайдер не знает такую модель` | у роутеров имя с префиксом провайдера (`z-ai/glm-4.6` для ZenMux) — сверь `MODEL_*` и список роутера |
+| `400` при живом ключе и верном имени | роутер не понимает нестандартный `thinking` → `LLM_THINKING_PARAM=false` |
 
 Одна команда проверяет всё, что связано с «бот не думает»:
 
