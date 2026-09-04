@@ -227,6 +227,14 @@ class Supervisor:
         await self._kv("history.delete", self.kv.delete(history_key(owner_id)), 0)
         await self._event(owner_id=owner_id, event_type="conversation.reset", payload={})
 
+    @property
+    def _tracing_failures(self) -> int:
+        return int(getattr(self.events, "failures", 0)) + int(getattr(self.audit, "failures", 0))
+
+    @property
+    def _tracing_degraded(self) -> bool:
+        return self._tracing_failures > 0
+
     async def status(self, owner_id: int) -> dict[str, Any]:
         """Для ``/status``: режим, бюджет, инструменты. Секретов здесь нет по построению."""
         return {
@@ -238,6 +246,9 @@ class Supervisor:
             "history_messages": len(await self._history(owner_id)),
             "kv_degraded": self.kv_degraded,
             "max_iterations": self.cfg.max_iterations,
+            # «подключено» != «пишется»: без этих полей `/status` врал при мёртвой трассе
+            "tracing_degraded": self._tracing_degraded,
+            "tracing_failures": self._tracing_failures,
         }
 
     # ------------------------------------------------ роутинг

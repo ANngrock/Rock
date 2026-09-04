@@ -37,6 +37,7 @@ dev = [
   "hypothesis>=6.108",
   "import-linter>=2.1",
   "fakeredis>=2.24",
+  "pgserver>=0.1.3; python_version < '3.13'",  # переносной Postgres: интеграции без Docker
   "types-python-dateutil",
 ]
 

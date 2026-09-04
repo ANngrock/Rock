@@ -70,10 +70,12 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
                     "events": int(events),
                 }
         except Exception as exc:  # noqa: BLE001 - диагностика, а не бизнес-ошибка
-            report["checks"]["postgres"] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}"[:300],
-            }
+            msg = f"{type(exc).__name__}: {exc}"[:300]
+            entry: dict[str, Any] = {"ok": False, "error": msg}
+            if "does not exist" in msg:
+                # самое частое: бот поднят до `alembic upgrade head`
+                entry["hint"] = "накай миграции: make migrate (alembic upgrade head внутри бота)"
+            report["checks"]["postgres"] = entry
 
         try:
             if cfg.kv_backend == "memory":
@@ -124,7 +126,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
             print("  ! не хватает в конфиге: " + ", ".join(report["config_missing"]))
         for name, res in checks.items():
             mark = "ok " if res.get("ok") else "!! "
-            detail = res.get("error") or res.get("hint") or ""
+            detail = " · ".join(str(x) for x in (res.get("error"), res.get("hint")) if x)
             print(f"  {mark}{name:<9} {str(detail)[:120]}")
     return 0 if ok else 1
 

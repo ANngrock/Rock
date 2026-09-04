@@ -18,7 +18,7 @@
 | 1.5 Tool registry + инструменты | ✅ | `agents/tools/registry.py` (Pydantic → OpenAI schema, проверка имени, `writes`/`risk`), `agents/tools/builtin.py` — 10 инструментов: `get_datetime, remember_fact, list_facts, forget_fact, add_note, search_notes, web_search, fetch_page, save_link, analyze_image`; `tools/images.py` (даунскейл перед vision) |
 | 1.6 Supervisor v1 | ✅ | `agents/supervisor.py`: tier-роутинг (smalltalk → `fast` без инструментов; вложения → `brain`+tools; подсказка анализа → thinking), цикл tool calling с лимитом итераций, pending-подтверждения в Redis, `resume()` по `tool_call_id`, `status()`, деградация без LLM/БД/бюджета |
 | 1.7 Telegram | ✅ | `interaction/telegram/bot.py` + `render.py`: owner-whitelist мидлварой, команды `/start /help /new /cost /status /tools /halt /resume`, inline-кнопки подтверждения, фото/документы→vision, HTML-санитайзер + чанкер, фолбэк в plain text при 400 |
-| 1.8 Миграция 0001 | ✅ | `migrations/versions/0001_foundation.py`: схемы `platform/governance/memory/knowledge`, расширения `vector/pg_trgm/pgcrypto`, таблицы `events/outbox/llm_calls/tool_runs/facts/notes`, триггер append-only, `v_cost_daily`, HNSW + trgm индексы, `downgrade()` |
+| 1.8 Миграция 0001 | ✅ | `migrations/versions/0001_foundation.py`: схемы `platform/governance/memory/knowledge`, расширения `vector/pg_trgm/pgcrypto`, таблицы `events/outbox/llm_calls/tool_runs/facts/notes`, триггер append-only, `v_cost_daily`, trgm-индексы, `downgrade()` (HNSW убран при постмортеме 1.12: лимит pgvector 2000 измерений, а `embedding-3` даёт 2048) |
 | 1.9 Тесты и CI | ✅ | 147 тестов (139 юнит + 8 интеграционных под `-m integration`), property-тесты DLP на hypothesis, `evals/golden_v1.jsonl` (23 кейса) + `evals/run_golden.py`, `.github/workflows/ci.yml` (static → integration с pgvector/redis → сборка образа) |
 | 1.10 Запуск у владельца | 🟡 | код и инструкция готовы (`README.md`, `docs/RUNBOOK.md`): `make up && make migrate && make doctor`. В песочнице нет Docker — фактический прогон делает владелец |
 | 1.11 Бэкапы | 🟡 | `deploy/backup.sh` (`backup`/`verify`/`restore`/`list`, sha256, ротация, rclone), systemd-таймер `deploy/systemd/aegis-backup.*`, cron-строка в RUNBOOK. Требование «проверка восстановления» реализована как `make backup-verify` — именно она была слабым местом пункта. Прогон — на машине владельца |
@@ -91,6 +91,33 @@ aegis doctor --quick --json      # конфиг + связности; без Б�
 оборачивают результат в `<untrusted>` и нейтрализуют преждевременный `</untrusted>`; политика
 поднимает `CONFIRM` для записи из untrusted-источника; `save_link`/`add_note` пишут только то, что
 разрешил владелец.
+
+
+### 1.12 — Постмортем первого боевого прогона ✅
+
+Владелец поднял стек (`main` @ `5e8dd62`), бот отвечает на команды, но **каждое свободное
+сообщение** кончалось `Сбой: TypeError`. Разбор дал четыре дефекта, все — вне покрытия юнитов:
+
+| # | Причина | Что чинит |
+| - | ------- | --------- |
+| 1 | `BestEffortEventSink` при сбое записи звал `log.warning("...", event=...)`; `event` — зарезервированный ключ structlog (текст сообщения) → `TypeError: got multiple values for argument 'event'`. Обработчик отказа ронял ход, который обязан был спасти | `sink.py`: ключ переименован, лог деградации ограничен 30 с, при `relation ... does not exist` выдаётся одна подсказка с командой |
+| 2 | `log.info(..., level=...)` в `client.py`: `add_log_level` молча перезаписывает поле | переименовано в `budget_level` |
+| 3 | Миграция 0001 **никогда не выполнялась на живом Postgres**: `extract(epoch FROM avg(latency_ms))` (numeric → «function pg_catalog.extract(unknown, numeric) does not exist»), и `CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)` на `vector(2048)` (лимит ANN-индекса pgvector — 2000) | `v_cost_daily.avg_latency_s` = `avg(latency_ms)/1000.0`; HNSW заменён частичным `notes_unindexed_idx (created_at) WHERE embedding IS NULL` под индексатор; размерность зафиксирована в `config.embedding_dims` с объяснением |
+| 4 | Интеграционный тест на аудит падал на `await s.execute(...).bindparams(...)` — скобка не там; тест не гонялся нигде (CI лежит, Docker у владельца не был поднят на момент прогонов), поэтому путь `handle()` → реальные SQL-санки не был проверен ни разу | тест исправлен; добавлены `tests/integration/test_missing_schema.py` (живой Postgres без схемы: ответ обязан быть, `/status` обязан врать перестать) и `test_supervisor_turn_writes_events_and_audit` (ход = событие + `tool_runs` + outbox) |
+
+Дополнительно, чтобы состояние «БД подключена, но трасса не пишется» больше не выглядело как
+«всё хорошо»: `App.probe_schema()` (вызывается поллером на старте), `checks.postgres.hint` у
+`aegis doctor`, честная строка `Трассировка:` в `/status` (счётчики сбоев в `SqlAuditLog` и
+`BestEffortEventSink`), статический запрет зарезервированных ключей structlog по всему `src`.
+
+Инфраструктура проверки: `tools/with_local_pg.py` + `make test-live` (переносной Postgres из
+extra `dev`, без Docker) — так «проверить реальный SQL» перестаёт быть оправданием «нет поднятого
+стека». Прогон: 11/11 интеграций на Postgres 16, 196 юнитов, mypy/ruff/import-linter чисто,
+golden 23/23.
+
+Урок для следующих шагов: любой путь, который упирается в драйвер (asyncpg/redis/http), обязан
+иметь хотя бы один тест на живой инфраструктуре, иначе «зелёный гейт» означает только то, что
+моки согласованы между собой.
 
 ---
 

@@ -61,6 +61,34 @@ class App:
     #: свой ли KV-клиент: чужой (инжектированный тестом) не закрываем
     owns_kv: bool = True
 
+    async def probe_schema(self) -> bool:
+        """Есть ли таблицы платформы. Connect-ok не равен schema-ok: без этого шага бот
+        отвечает, но трассу не пишет, и выглядит это как «всё хорошо»."""
+        if not self.db_ready:
+            return False
+        from sqlalchemy import text
+
+        from aegis.platform.db import session
+
+        probe = "SELECT to_regclass('platform.events'), to_regclass('platform.llm_calls')"
+        try:
+            async with session() as s:
+                row = (await s.execute(text(probe))).first()
+        except Exception as exc:  # noqa: BLE001
+            log.error("db.probe_schema_failed", err=repr(exc)[:300])
+            return False
+        names = ("platform.events", "platform.llm_calls")
+        missing = [name for name, reg in zip(names, row or (), strict=True) if not reg]
+        if missing:
+            log.error(
+                "db.schema_missing",
+                tables=",".join(missing),
+                hint="aegis bot запущен без миграций: alembic upgrade head",
+            )
+            return False
+        log.info("db.schema_ok")
+        return True
+
     async def aclose(self) -> None:
         await self.gateway.aclose()
         if not self.owns_kv:

@@ -171,9 +171,44 @@ python evals/run_golden.py
 `pytest -m integration` поднимает схему через `alembic upgrade head` на тестовой БД; без
 `AEGIS_TEST_DATABASE_URL` тесты скипаются — так и задумано, чтобы юниты оставались офлайн.
 
+Docker для интеграций не обязателен: extra `dev` тянет `pgserver` (переносной Postgres 16 с
+pgvector), и `make test-live` сам поднимает кластер в `.cache/aegis-pg`, накатывает миграции и
+выполняет команду. Кластер переиспользуется, повторный прогон занимает секунды:
+
+```bash
+make test-live                       # portable-Postgres + миграции + pytest -m integration
+python tools/with_local_pg.py --fresh --strip-ext -- pytest -q -m integration  # с нуля
+```
+
+Флаг `--strip-ext` вырезает из миграции trigram-индексы (в переносном кластере нет
+`pg_trgm`/`pgcrypto`); на боевом образе `pgvector/pgvector:pg16` они накатываются целиком.
+
 ## 10. Диагностика «бот молчит»
 
 1. `docker compose -f deploy/docker-compose.yml ps bot` — не в `restart`-цикле?
 2. `logs bot | tail -50` — `owner_only.rejected` означает, что `TELEGRAM_OWNER_ID` не совпал.
 3. Polling не работает с прокси/файрволом → в логах `TelegramServerError`.
 4. Токен валиден? `curl -s "https://api.telegram.org/bot$TOKEN/getMe"`.
+5. «Сбой: ...» на каждое сообщение, команды при этом живы → смотри §10.1.
+
+### 10.1 Сбой на всех сообщениях при живых командах
+
+Команды (`/start`, `/status`, `/cost`) не пишут в БД, а свободный текст пишет: событие в
+`platform.events` и строку в `platform.llm_calls`. Значит «команды работают, текст падает» —
+это почти всегда путь записи, а не модель.
+
+```powershell
+# трейс последнего сбоя (структурный лог пишется в stderr контейнера)
+docker compose -f deploy/docker-compose.yml logs --tail 300 bot | Select-String "handle.failed" -Context 0,40
+docker compose -f deploy/docker-compose.yml exec bot aegis doctor --quick
+```
+
+Смотреть на `checks.postgres`: `ok: false` + `hint: накай миграции` означает, что бот поднят без
+`alembic upgrade head`. Лечится тем самым `make migrate`. С тех пор как `/status` показывает
+`Трассировка: ⚠️ не пишется (N сбоев)`, состояние видно без логов: откры порт ≠ пишутся строки.
+
+Исторически (до фиксации) в этом положении было `Сбой: TypeError`, потому что обработчик отказа
+в `BestEffortEventSink` сам кидал исключение — логирует лишний ключ `event`, который structlog
+резервирует под текст сообщения. Если снова видишь TypeError в `_degradation`/`sink`-коде — это
+возвращение того же класса багов, регрессия закрыта в `tests/test_degradation.py`
+(в том числе статическим запретом `log.*(event=...)` по всему `src`).

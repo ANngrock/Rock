@@ -25,7 +25,9 @@ _VECTOR_SEARCH = text(
            'vector' AS method
     FROM knowledge.notes
     WHERE embedding IS NOT NULL
-    ORDER BY embedding <=> CAST(:embedding AS vector)
+    -- created_at в конец: при равных расстояниях без тай-брейка порядок произвольный,
+    -- и «что нашлось» начинает зависеть от плана запроса (это ловилось на живом Postgres)
+    ORDER BY embedding <=> CAST(:embedding AS vector), created_at DESC
     LIMIT :limit
     """
 )
@@ -40,7 +42,7 @@ _TEXT_SEARCH = text(
            'text' AS method
     FROM knowledge.notes
     WHERE to_tsvector('simple', title || ' ' || body) @@ websearch_to_tsquery('simple', :query)
-    ORDER BY score DESC
+    ORDER BY score DESC, created_at DESC
     LIMIT :limit
     """
 )
@@ -166,6 +168,16 @@ class NotesRepo:
             return [Note(id=r[0], title=r[1], body=r[2], tags=list(r[3])) for r in rows]
 
     async def set_embedding(self, note_id: str, embedding: list[float]) -> None:
+        # Колонка vector(N) — фиксированная: проверить размерность здесь дешевле, чем
+        # получить ошибку драйвера изнутри индексатора (и непонятно, чья это вина).
+        from aegis.platform.config import settings
+
+        expected = settings().embedding_dims
+        if len(embedding) != expected:
+            raise ValueError(
+                f"эмбеддинг для заметки должен быть {expected}-мерным, получено {len(embedding)} "
+                f"— сверь embedding_dims с типом колонки в миграции"
+            )
         sm = self._sm or session
         async with sm() as s:
             await s.execute(

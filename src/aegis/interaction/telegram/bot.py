@@ -156,7 +156,7 @@ async def cmd_status(message: Message, app: App) -> None:
     )
     cost: dict[str, Any] = status["cost"]
     budget_line = f"${cost['spent_usd']:.3f} из ${cost['limit_usd']:.2f}"
-    trace = "события/аудит в БД" if app.db_ready else "БД не настроена — только память"
+    trace = _trace_label(app, status)
     await message.answer(
         "<b>Состояние</b>\n"
         f"Трассировка: {trace}\n"
@@ -293,6 +293,32 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         await send_reply(bot, message.chat.id, reply)
 
 
+def _trace_label(app: App, status: dict[str, Any]) -> str:
+    """«Трассировка: ok» должна значить, что строки реально пишутся, а не что порт открыт."""
+    if not app.db_ready:
+        return "БД не настроена — только память"
+    if status["tracing_degraded"]:
+        n = int(status["tracing_failures"])
+        return (
+            f"⚠️ не пишется ({n} {_plural_ru(n, ('сбой', 'сбоя', 'сбоев'))}): накай миграции — "
+            "<code>docker compose -f deploy/docker-compose.yml run --rm bot "
+            "alembic upgrade head</code>"
+        )
+    return "события/аудит в БД"
+
+
+def _plural_ru(n: int, forms: tuple[str, str, str]) -> str:
+    """Русская плюрализация: 1 сбой / 2 сбоя / 5 сбоев / 11 сбоев."""
+    if 10 <= n % 100 <= 19:  # noqa: PLR2004
+        return forms[2]
+    last = n % 10
+    if last == 1:
+        return forms[0]
+    if last in (2, 3, 4):
+        return forms[1]
+    return forms[2]
+
+
 def _kill_label(status: dict[str, Any]) -> str:
     """Строка состояния kill switch: «активен» обязан быть заметен в /status."""
     return "АКТИВЕН — записи запрещены" if status["kill_switch"]["active"] else "выключен"
@@ -334,6 +360,10 @@ async def main() -> None:
 
     bot, dp = build_dispatcher(app)
     log.info("bot.start", owner_id=app.cfg.telegram_owner_id, tools=len(app.registry.names()))
+    if app.db_ready:
+        # Старт не блокируем: без схемы бот полезен, но оператор должен узнать сразу, а не по
+        # «Сбой: ...» в каждом ответе (connect-ok != schema-ok).
+        await app.probe_schema()
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])

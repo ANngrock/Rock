@@ -166,8 +166,11 @@ async def test_notes_vector_search_when_embedding_present() -> None:
     note = await notes.add(
         "Векторная заметка", "уникальное слово зюйдвенд", ["test"], source="test"
     )
+    # уникальные компоненты: иначе вечно живущие строки прошлых прогонов дают равное
+    # расстояние (0) и assert «нашёл именно эту заметку» превращается в лотерею
     dims = 2048
-    vector = [0.5] * dims
+    seed = uuid.uuid4().int
+    vector = [((seed >> (i % 61)) % 1000) / 1000.0 + 0.001 for i in range(dims)]
     await notes.set_embedding(note.id, vector)
     hits = await notes.search("зюйдвенд", vector, 5)
     assert hits, "поиск по эмбеддингу должен найти только что проиндексированную заметку"
@@ -215,14 +218,103 @@ async def test_audit_tables_and_cost_view() -> None:
         ).one()
         assert agg.calls >= 1 and float(agg.total) > 0
 
-        tool_run = (
-            await s.execute(
-                text(
-                    "SELECT tool, decision, args->>'query' AS query "
-                    "FROM governance.tool_runs WHERE trace_id = CAST(:t AS uuid)"
-                )
-            ).bindparams(t=trace)
-        ).one()
+        stmt = text(
+            "SELECT tool, decision, args->>'query' AS query "
+            "FROM governance.tool_runs WHERE trace_id = CAST(:t AS uuid)"
+        ).bindparams(t=trace)
+        tool_run = (await s.execute(stmt)).one()
         assert tool_run.tool == "web_search"
         assert tool_run.decision == "allow"
         assert tool_run.query == "погода"
+
+
+@pytest.mark.usefixtures("db")
+async def test_supervisor_turn_writes_events_and_audit() -> None:
+    """Один ход владельца = полный след в БД (событие + tool_run), через реальные SQL-санки.
+
+    Это ровно тот путь, который не был проверен никогда: юниты гоняются на фейках, а
+    `handle()` + SqlAuditLog/OutboxEventSink на настоящном драйвере — только здесь. Именно на
+    этом стыке родился «Сбой: TypeError» у владельца (упавший обработчик отказа в sink).
+    """
+    from pydantic import BaseModel
+
+    from aegis.agents.services import Services
+    from aegis.agents.supervisor import Inbound, Supervisor
+    from aegis.agents.tools.registry import ToolContext, ToolRegistry
+    from aegis.governance.audit import SqlAuditLog
+    from aegis.governance.policy import PolicyEngine, Risk
+    from aegis.platform.config import Settings
+    from aegis.platform.events.sink import BestEffortEventSink, OutboxEventSink
+    from aegis.platform.gateway.cost import CostGovernor
+    from conftest import FakeFacts, FakeGateway, FakeKV, FakeNotes, make_chat_result
+
+    class Args(BaseModel):
+        value: str = ""
+
+    registry = ToolRegistry()
+
+    async def note(args: Args, ctx: ToolContext) -> str:
+        return f"записано: {args.value}"
+
+    registry.register("test_note", "тест", Args, writes=False, risk=Risk.NONE)(note)
+
+    kv = FakeKV()
+    gateway = FakeGateway(
+        [
+            make_chat_result(None, [("c1", "test_note", {"value": "раз"})]),
+            make_chat_result("готово"),
+        ],
+        CostGovernor(kv, 2.0),
+    )
+    events = BestEffortEventSink(OutboxEventSink())
+    audit = SqlAuditLog()
+    supervisor = Supervisor(
+        services=Services(gateway=gateway, facts=FakeFacts(), notes=FakeNotes()),
+        registry=registry,
+        policy=PolicyEngine(auto_allow_low_risk=True),
+        kv=kv,
+        cfg=Settings(_env_file=None, glm_api_key="k"),
+        events=events,
+        audit=audit,
+    )
+    owner = uuid.uuid4().int % 10**9
+    reply = await supervisor.handle(Inbound(text="запиши заметку", owner_id=owner))
+
+    assert "готово" in reply.text
+    assert events.degraded is False and events.failures == 0, (
+        "на живой схеме деградации быть не должно"
+    )
+    assert audit.failures == 0
+
+    stream = f"owner:{owner}"
+    async with session() as s:
+        recorded = await s.scalar(
+            text("SELECT count(*) FROM platform.events WHERE stream_id = :stream").bindparams(
+                stream=stream
+            )
+        )
+        assert recorded >= 1, "ход обязан оставить событие в append-only журнале"
+        tool_run = (
+            await s.execute(
+                text(
+                    "SELECT tool, decision, args->>'value' AS value FROM governance.tool_runs "
+                    "WHERE trace_id = CAST(:t AS uuid)"
+                ).bindparams(t=reply.trace_id)
+            )
+        ).one()
+        assert (tool_run.tool, tool_run.decision, tool_run.value) == (
+            "test_note",
+            "allow",
+            "раз",
+        )
+        published = await s.scalar(
+            text(
+                "SELECT count(*) FROM platform.outbox o "
+                "JOIN platform.events e ON e.id = o.event_id "
+                "WHERE e.stream_id = :stream"
+            ).bindparams(stream=stream)
+        )
+        assert published >= 1, "событие обязано уйти в outbox той же транзакцией"
+
+    status = await supervisor.status(owner)
+    assert status["tracing_degraded"] is False

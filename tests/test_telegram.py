@@ -114,3 +114,20 @@ async def test_send_reply_raises_only_on_unrecoverable_telegram_error() -> None:
 
     with pytest.raises(TelegramBadRequest):
         await send_reply(BrokenBot(), 7, Reply(text="текст"))  # type: ignore[arg-type]
+
+
+def test_trace_label_needs_more_than_an_open_port() -> None:
+    """«Трассировка: ok» — только если строки реально пишутся.
+
+    Инцидент «Сбой: TypeError» выглядел как «БД ок, а бот ломается»: connect-ok ≠ schema-ok,
+    и подпись в /status обязана это различать.
+    """
+    from aegis.interaction.telegram.bot import _trace_label
+
+    ok = {"tracing_degraded": False, "tracing_failures": 0}
+    broken = {"tracing_degraded": True, "tracing_failures": 2}
+    ready = SimpleNamespace(db_ready=True)
+    assert _trace_label(ready, ok) == "события/аудит в БД"
+    assert "alembic upgrade head" in _trace_label(ready, broken)
+    assert "2 сбоя" in _trace_label(ready, broken)
+    assert _trace_label(SimpleNamespace(db_ready=False), ok) == "БД не настроена — только память"

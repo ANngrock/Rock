@@ -67,6 +67,20 @@ class NullAudit:
 
 
 class SqlAuditLog:
+    """Запись в ``platform.llm_calls`` / ``governance.tool_runs``.
+
+    Сбой БД не поднимается выше: аудит не имеет права отнимать у владельца ответ. Но он и не
+    молчит — :attr:`failures` виден в ``/status`` и в doctor, потому что потерянная трасса
+    означает потерянную воспроизводимость (SLO шага 1), а не «всё немного хуже».
+    """
+
+    def __init__(self) -> None:
+        self.failures = 0
+
+    @property
+    def degraded(self) -> bool:
+        return self.failures > 0
+
     async def llm_call(self, record: LLMCallRecord) -> None:
         try:
             async with session() as s:
@@ -96,7 +110,13 @@ class SqlAuditLog:
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - аудит не должен ронять пользовательский запрос
-            log.warning("audit.llm_call_failed", err=repr(exc), trace_id=record.trace_id)
+            self.failures += 1
+            log.warning(
+                "audit.llm_call_failed",
+                failures=self.failures,
+                err=repr(exc)[:300],
+                trace_id=record.trace_id,
+            )
 
     async def tool_run(
         self,
@@ -130,7 +150,14 @@ class SqlAuditLog:
                     )
                 )
         except Exception as exc:  # noqa: BLE001
-            log.warning("audit.tool_run_failed", err=repr(exc), trace_id=trace_id, tool=tool)
+            self.failures += 1
+            log.warning(
+                "audit.tool_run_failed",
+                failures=self.failures,
+                err=repr(exc)[:300],
+                trace_id=trace_id,
+                tool=tool,
+            )
 
 
 # --- функциональные обёртки: исторический API, удобный для DI в aiogram-хендлерах ---

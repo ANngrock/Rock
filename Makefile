@@ -3,7 +3,7 @@ PY ?= python3
 ENVFILE = $(if $(wildcard .env),--env-file .env,)
 COMPOSE = docker compose $(ENVFILE) -f deploy/docker-compose.yml
 
-.PHONY: help check evals up up-durable down restart logs ps migrate test test-all lint fmt type imports doctor backup backup-verify backup-list restore clean
+.PHONY: help check evals up test-live up-durable down restart logs ps migrate test test-all lint fmt type imports doctor backup backup-verify backup-list restore clean
 
 help: ## что умеет Makefile
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[1m%-10s\033[0m %s\n", $$1, $$2}'
@@ -41,15 +41,25 @@ doctor: ## локальная самодиагностика конфигура�
 test: ## только юнит-тесты (без БД)
 	pytest -q
 
-test-all: ## юниты + интеграции (нужен поднятый стек)
-	AEGIS_TEST_DATABASE_URL=$${AEGIS_TEST_DATABASE_URL:-postgresql+asyncpg://aegis:aegis@localhost:5432/aegis} pytest -q
+test-live: ## интеграции на переносном Postgres (без Docker; ставится с extra dev)
+	$(PY) tools/with_local_pg.py --strip-ext -- pytest -q -m integration
+
+test-all: ## юниты + интеграции: есть AEGIS_TEST_DATABASE_URL/докер — он, иначе portable-PG
+	@if [ -n "$$AEGIS_TEST_DATABASE_URL" ]; then \
+		AEGIS_TEST_DATABASE_URL=$$AEGIS_TEST_DATABASE_URL pytest -q; \
+	elif $(PY) -c "import pgserver" >/dev/null 2>&1; then \
+		$(MAKE) test-live; \
+	else \
+		echo "нужен Postgres: подними стек (make up-core) или поставь extra dev (pgserver)"; \
+		AEGIS_TEST_DATABASE_URL=$${AEGIS_TEST_DATABASE_URL:-postgresql+asyncpg://aegis:aegis@localhost:5432/aegis} pytest -q; \
+	fi
 
 fmt: ## автоформат + автофиксы
-	ruff format src tests migrations evals
-	ruff check --fix src tests migrations evals
+	ruff format src tests migrations evals tools
+	ruff check --fix src tests migrations evals tools
 
 lint: ## все статические проверки
-	ruff check src tests migrations evals
+	ruff check src tests migrations evals tools
 	$(MAKE) type
 	$(MAKE) imports
 

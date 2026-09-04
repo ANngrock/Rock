@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     timezone: str = "Europe/Moscow"
     base_currency: str = "RUB"
     daily_budget_usd: float = Field(default=2.0, gt=0)
+    # размерность колонки knowledge.notes.embedding / memory.facts.embedding (миграция 0001).
+    # 2048 — потому что embedding-3 без parameters отдаёт именно столько; ANN-индекс pgvector
+    # для такой размерности недоступен (лимит 2000), см. комментарий в миграции.
     embedding_dims: int = Field(default=2048, ge=1)
     auto_allow_low_risk: bool = True
     pending_ttl_seconds: int = Field(default=3600, ge=30, le=86400)

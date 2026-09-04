@@ -120,7 +120,7 @@ def upgrade() -> None:
                sum(prompt_tokens)                            AS prompt_tokens,
                sum(completion_tokens)                        AS completion_tokens,
                sum(cost_usd)                                 AS cost_usd,
-               (extract(epoch FROM avg(latency_ms)) / 1000.0)::numeric(10, 3) AS avg_latency_s,
+               (avg(latency_ms) / 1000.0)::numeric(10, 3) AS avg_latency_s,
                count(*) FILTER (WHERE NOT ok)                AS failures
         FROM platform.llm_calls
         GROUP BY 1, 2, 3;
@@ -160,9 +160,15 @@ def upgrade() -> None:
         CREATE INDEX notes_tags_idx ON knowledge.notes USING gin (tags);
         CREATE INDEX notes_title_trgm_idx ON knowledge.notes USING gin (title gin_trgm_ops);
         CREATE INDEX notes_body_trgm_idx ON knowledge.notes USING gin (body gin_trgm_ops);
-        -- HNSW: семантический поиск без перестроения по полной таблице при росте базы
-        CREATE INDEX notes_embedding_hnsw ON knowledge.notes
-            USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+        -- ВАЖНО: ANN-индексы pgvector (hnsw/ivfflat) работают только для vector(<= 2000)
+        -- измерений, а embedding-3 отдаёт 2048 — индекс на колонке embedding создать нельзя
+        -- (Postgres отвечает «column cannot have more than 2000 dimensions for hnsw index»).
+        -- На личном объёме (тысячи заметок) точный косинус-скан стоит единицы миллисекунд,
+        -- поэтому индекс здесь отсутствует осознанно. Когда база вырастет, вариантов два:
+        -- попросить у embedding-3 размерность 1024 (dimensions=..., Matryoshka) и вернуть
+        -- hnsw, либо перейти на halfvec + hnsw (лимит 4000).
+        -- частичный индекс нужен индексатору: «найти незаиндексированные» без полного скана
+        CREATE INDEX notes_unindexed_idx ON knowledge.notes (created_at) WHERE embedding IS NULL;
         """
     )
 

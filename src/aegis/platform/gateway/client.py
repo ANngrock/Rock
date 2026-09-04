@@ -129,7 +129,7 @@ class ModelGateway:
         thinking = thinking and level < 1
         if level >= 2 and role == "brain":
             spec = resolve_spec("fast", self.cfg)
-            log.info("gateway.degraded_to_fast", level=level, trace_id=trace)
+            log.info("gateway.degraded_to_fast", budget_level=level, trace_id=trace)
 
         base_kwargs: dict[str, Any] = {"messages": masked, "temperature": temperature}
         if tools:
