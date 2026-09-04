@@ -135,6 +135,8 @@ class Supervisor:
         self.events: EventSink = events or NullEventSink()
         self.audit: AuditLog = audit or NullAudit()
         self.kill_switch = kill_switch
+        #: KV упал в этом процессе? Честно показываем в /status, а не молча «забываем» историю
+        self.kv_degraded = False
 
     # ------------------------------------------------ public
 
@@ -176,7 +178,13 @@ class Supervisor:
 
     async def resume(self, pending_id: str, approved: bool, owner_id: int) -> Reply:
         """Продолжение прерванного хода после решения владельца (ADR-006)."""
-        raw = await self.kv.getdel(pending_key(pending_id))
+        raw = await self._kv("pending.getdel", self.kv.getdel(pending_key(pending_id)), None)
+        if raw is None and self.kv_degraded:
+            return Reply(
+                "Память сессий сейчас недоступна (Redis), поэтому я не могу ни продолжить, ни "
+                "отменить действие. Попробуй через минуту — или повтори запрос после её починки.",
+                degraded=True,
+            )
         if raw is None:
             return Reply("Это подтверждение устарело или уже обработано. Запроси действие заново.")
         snapshot: dict[str, Any] = orjson.loads(raw)
@@ -216,7 +224,7 @@ class Supervisor:
         return reply
 
     async def reset(self, owner_id: int) -> None:
-        await self.kv.delete(history_key(owner_id))
+        await self._kv("history.delete", self.kv.delete(history_key(owner_id)), 0)
         await self._event(owner_id=owner_id, event_type="conversation.reset", payload={})
 
     async def status(self, owner_id: int) -> dict[str, Any]:
@@ -228,6 +236,7 @@ class Supervisor:
             "kill_switch": await self._kill_switch_state(),
             "tools": self.registry.names(),
             "history_messages": len(await self._history(owner_id)),
+            "kv_degraded": self.kv_degraded,
             "max_iterations": self.cfg.max_iterations,
         }
 
@@ -386,9 +395,24 @@ class Supervisor:
             # снимок пройдёт через orjson: только JSON-совместимые значения
             "messages": orjson.loads(orjson.dumps(messages)),
         }
-        await self.kv.set(
-            pending_key(pending_id), orjson.dumps(payload), ex=self.cfg.pending_ttl_seconds
+        stored = await self._kv_ok(
+            "pending.set",
+            self.kv.set(
+                pending_key(pending_id), orjson.dumps(payload), ex=self.cfg.pending_ttl_seconds
+            ),
         )
+        if not stored:
+            # кнопка без снимка состояния — это обещание, которое мы не можем выполнить
+            note = (
+                "Я не могу поставить действие на подтверждение: память сессий недоступна, "
+                "а без неё решение владельца не дойдёт до инструмента. Действие НЕ выполнено."
+            )
+            await self._event(
+                owner_id=ctx.owner_id,
+                event_type="action.confirmation_unavailable",
+                payload={"tools": [p.tool for p in pending]},
+            )
+            return Reply(text=note, degraded=True, trace_id=ctx.trace_id)
         await self._event(
             owner_id=ctx.owner_id,
             event_type="action.confirmation_requested",
@@ -462,8 +486,36 @@ class Supervisor:
             )
         return text
 
+    async def _kv(self, op: str, coro: Any, default: Any) -> Any:
+        """KV — внешний кэш, а не источник истины: сбой = деградация, не потеря сообщения.
+
+        История диалога и pending-подтверждения живут в Redis. При его недоступности
+        ход обязан состояться (модель, инструменты, БД — всё на месте), просто без
+        «памяти про последние реплики». Исключение отсюда нарушило бы принцип 5.
+        """
+        try:
+            return await coro
+        except Exception as exc:  # noqa: BLE001 - любое падение кэша трактуем одинаково
+            log.warning("kv.unavailable", op=op, err=repr(exc)[:200])
+            self.kv_degraded = True
+            return default
+
+    async def _kv_ok(self, op: str, coro: Any) -> bool:
+        """Удалась ли операция KV. Значение не смотрим: redis-`SET` без flags отвечает None.
+
+        Нужен именно этот различимый ответ, потому что «подтверждение» без снимка состояния
+        невыполнимо — и честнее отказать, чем показать кнопку, которая в никуда.
+        """
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001 - любое падение кэша трактуем одинаково
+            log.warning("kv.unavailable", op=op, err=repr(exc)[:200])
+            self.kv_degraded = True
+            return False
+        return True
+
     async def _history(self, owner_id: int) -> list[dict[str, Any]]:
-        raw = await self.kv.get(history_key(owner_id))
+        raw = await self._kv("history.get", self.kv.get(history_key(owner_id)), None)
         if not raw:
             return []
         try:
@@ -490,10 +542,14 @@ class Supervisor:
             clean.append({"role": str(msg["role"]), "content": content[:8000]})
         if final_text.strip():
             clean.append({"role": "assistant", "content": final_text[:8000]})
-        await self.kv.set(
-            history_key(owner_id),
-            orjson.dumps(clean[-self.cfg.history_limit :]),
-            ex=self.cfg.history_ttl_seconds,
+        await self._kv(
+            "history.set",
+            self.kv.set(
+                history_key(owner_id),
+                orjson.dumps(clean[-self.cfg.history_limit :]),
+                ex=self.cfg.history_ttl_seconds,
+            ),
+            None,
         )
 
     # ------------------------------------------------ observability

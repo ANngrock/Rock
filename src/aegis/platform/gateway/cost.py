@@ -19,7 +19,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import structlog
+
 from aegis.platform.kv import KV
+
+log = structlog.get_logger(__name__)
 
 __all__ = ["BudgetExceeded", "CostGovernor"]
 
@@ -46,6 +50,9 @@ class CostGovernor:
         self.limit = float(daily_limit_usd)
         self._tz = timezone
         self._prefix = key_prefix
+        #: локальный подсчёт на время недоступного кэша: день + сумма
+        self._fallback_day: str | None = None
+        self._fallback_spent = 0.0
 
     # --- ключи ---
 
@@ -66,15 +73,39 @@ class CostGovernor:
     # --- учёт ---
 
     async def spent(self) -> float:
-        raw = await self._redis.get(self._key)
-        if raw is None:
-            return 0.0
-        return float(raw.decode() if isinstance(raw, bytes) else raw)
+        """Потрачено за день; при недоступном кэше — то, что насчитали сами.
+
+        Иначе «Redis переводил дух 20 секунд» означало бы либо падение каждого запроса,
+        либо (хуже) обнуление бюджета и бесконтрольный расход.
+        """
+        try:
+            raw = await self._redis.get(self._key)
+        except Exception as exc:  # noqa: BLE001 - кэш не должен влиять на доступность
+            log.warning("cost.redis_unavailable", op="spent", err=repr(exc)[:160])
+            return self._fallback_today()
+        remote = 0.0
+        if raw is not None:
+            remote = float(raw.decode() if isinstance(raw, bytes) else raw)
+        return max(remote, self._fallback_today())
+
+    def _fallback_today(self) -> float:
+        today = self._today
+        if self._fallback_day != today:
+            self._fallback_day = today
+            self._fallback_spent = 0.0
+        return self._fallback_spent
 
     async def record(self, cost_usd: float) -> float:
         key = self._key
-        total = await self._redis.incrbyfloat(key, max(cost_usd, 0.0))
-        await self._redis.expire(key, 60 * 60 * 24 * 3)
+        amount = max(cost_usd, 0.0)
+        self._fallback_today()  # синхронизируем «день» локального счётчика
+        self._fallback_spent += amount
+        try:
+            total = await self._redis.incrbyfloat(key, amount)
+            await self._redis.expire(key, 60 * 60 * 24 * 3)
+        except Exception as exc:  # noqa: BLE001 - остаёмся в локальном счётчике, учёт не теряем
+            log.warning("cost.redis_unavailable", op="record", err=repr(exc)[:160])
+            return self._fallback_spent
         return float(total)
 
     async def check(self, estimate_usd: float = 0.01) -> None:

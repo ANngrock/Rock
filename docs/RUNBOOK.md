@@ -47,6 +47,7 @@ docker compose -f deploy/docker-compose.yml logs -f bot
 | `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4/` | основной провайдер |
 | `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | переопределение имён моделей без правки кода |
 | `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | пусто | резервный провайдер при 5xx/лимите |
+| `KV_BACKEND` | `redis` | `memory` — запуск вообще без Redis: демо/CI/первое «пощупать». Состояние живёт только в процессе, в `ENV=prod` запрещено |
 | `DATABASE_URL` | `postgresql+asyncpg://aegis:aegis@postgres:5432/aegis` | хост = `postgres` (имя сервиса) вне контейнера заменить на `localhost` |
 | `REDIS_URL` | `redis://redis:6379/0` | история, pending_actions, счётчик бюджета |
 | `SEARXNG_URL` | `http://searxng:8080` | self-hosted поиск |
@@ -120,7 +121,7 @@ Cron-вариант (если systemd не ваш случай — тогда с
 |---|---|---|
 | LLM недоступен (429/5xx, все провайдеры) | ответ деградирует: «модель недоступна», команды и парсеры работают | `make logs`; проверить `GLM_API_KEY`, при необходимости включить `FALLBACK_*` |
 | Postgres лёг | события/аудит не пишутся, память недоступна; бот отвечает детерминированно | проверить контейнер, `make migrate` не нужен; после поднятия всё пишется дальше |
-| Redis лёг | история диалога и pending-кнопки обнуляются, бюджет «начинается с нуля» | `docker compose restart redis`; AOF должен вернуть ключи |
+| Redis лёг | **бот продолжает отвечать**: история хода теряется, подтверждения честно отказываются («память сессий недоступна»), бюджет считается локальным счётчиком процесса | `docker compose restart redis`; AOF вернёт ключи; в `/status` виден флаг `kv_degraded` |
 | Исчерпан дневной бюджет | thinking выключается, затем только `fast`; после 100 % — отказ с текстом про `/cost` | `make psql` → `SELECT * FROM platform.v_cost_daily` ; поднять `DAILY_BUDGET_USD` |
 | Нужна экстренная остановка записей | `/halt` (kill switch): write-действия запрещены, чтение живёт | `/resume` — снять |
 | Подтверждение не нажато вовремя | `pending_actions` протухает по TTL, действие не выполнено | повторить запрос |

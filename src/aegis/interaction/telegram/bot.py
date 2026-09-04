@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import html as html_lib
+import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -38,6 +39,7 @@ from aegis.agents.tools import builtin  # noqa: F401  — импорт реги�
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
 from aegis.interaction.telegram.render import render_for_telegram
+from aegis.platform.config import ConfigError
 from aegis.runtime import App, build_app
 
 __all__ = ["OwnerOnly", "build_dispatcher", "main"]
@@ -322,13 +324,30 @@ def build_dispatcher(app: App) -> tuple[Bot, Dispatcher]:
 async def main() -> None:
     from aegis.agents.tools.registry import registry
 
-    app = build_app(registry=registry)
-    app.cfg.require_runtime()
+    try:
+        app = build_app(registry=registry)
+        app.cfg.require_runtime()
+    except ConfigError as exc:
+        # это самый частый «бот не стартует»: конфиг. Трейсбек тут только мешает
+        print(f"! конфигурация неполная: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
     bot, dp = build_dispatcher(app)
     log.info("bot.start", owner_id=app.cfg.telegram_owner_id, tools=len(app.registry.names()))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    except Exception as exc:  # noqa: BLE001 - стартовый сбой сети/токена: нужен диагноз
+        name = type(exc).__name__
+        hints = {
+            "TelegramUnauthorized": "токен неверный или отозван — сверь TELEGRAM_BOT_TOKEN",
+            "TelegramNetworkError": "нет связи с api.telegram.org: проверь прокси/файрвол и то, "
+            "что TLS не перехватывается (песочницы и корпоративный прокси так умеют)",
+            "TelegramServerError": "Telegram 5xx — обычно проходит само, рестарт через минуту",
+        }
+        hint = hints.get(name, "стартовое обращение к Telegram не удалось")
+        print(f"! {name}: {hint}", file=sys.stderr)
+        raise SystemExit(3) from exc
     finally:
         await app.aclose()
 

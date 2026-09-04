@@ -35,6 +35,7 @@ from aegis.platform.gateway.client import ModelGateway
 from aegis.platform.gateway.cost import CostGovernor
 from aegis.platform.gateway.dlp import DLP
 from aegis.platform.kv import KV
+from aegis.platform.kv_memory import MemoryKV
 from aegis.platform.logging import setup_logging
 
 __all__ = ["App", "build_app"]
@@ -45,7 +46,7 @@ log = structlog.get_logger(__name__)
 @dataclass(slots=True)
 class App:
     cfg: Settings
-    #: настоящий клиент redis-py (шире порта KV): нужен для aclose/ping в CLI и shutdown
+    #: клиент KV (redis-py или MemoryKV): нужен для aclose/ping в CLI и на shutdown
     redis: Any
     cost: CostGovernor
     gateway: ModelGateway
@@ -57,9 +58,13 @@ class App:
     audit: AuditLog
     registry: ToolRegistry
     db_ready: bool
+    #: свой ли KV-клиент: чужой (инжектированный тестом) не закрываем
+    owns_kv: bool = True
 
     async def aclose(self) -> None:
         await self.gateway.aclose()
+        if not self.owns_kv:
+            return
         try:
             await self.redis.aclose()
         except Exception as exc:  # noqa: BLE001 - закрытие не должно ронять shutdown
@@ -99,11 +104,22 @@ def build_app(
     if configure_logging:
         setup_logging(cfg.log_level, json_output=cfg.log_json)
 
-    raw_kv = (
-        redis if redis is not None else aioredis.from_url(cfg.redis_url, decode_responses=False)
-    )
-    # redis-py шире нашего порта (десятки методов); сужаем осознанно — приложение видит только KV
-    kv: KV = cast(KV, raw_kv)
+    own_kv: Any = None
+    if redis is not None:
+        kv = cast(KV, redis)
+    elif cfg.kv_backend == "memory":
+        # демо/CI: тот же узкий порт, только в памяти процесса (см. модуль kv_memory)
+        own_kv = MemoryKV()
+        kv = cast(KV, own_kv)
+        log.warning(
+            "kv.in_memory",
+            note="история, pending и дневной бюджет живут только в этом процессе",
+        )
+    else:
+        own_kv = aioredis.from_url(cfg.redis_url, decode_responses=False)
+        # redis-py шире нашего порта (десятки методов); сужаем осознанно — приложение
+        # видит только KV, и моки в тестах обязаны тому же
+        kv = cast(KV, own_kv)
     cost = CostGovernor(kv, cfg.daily_budget_usd, timezone=cfg.timezone)
     db_ready = _probe_db()
     events: EventSink = BestEffortEventSink(OutboxEventSink()) if db_ready else NullEventSink()
@@ -125,6 +141,7 @@ def build_app(
     log.info(
         "app.built",
         db_ready=db_ready,
+        owns_kv=own_kv is not None,
         budget=cfg.daily_budget_usd,
         models=gateway.describe()["models"],
     )

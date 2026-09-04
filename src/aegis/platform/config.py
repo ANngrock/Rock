@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Self
+from typing import Any, Literal, Self
 from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://aegis:aegis@localhost:5432/aegis"
     db_pool_size: int = Field(default=10, ge=1, le=100)
     redis_url: str = "redis://localhost:6379/0"
+    #: "memory" — история диалога, pending-подтверждения и счётчик дневного бюджета живут
+    #: только в этом процессе: для демо, CI и первого «пощупать», когда Redis поднимать лень.
+    #: В prod запрещено: два процесса (бот и будущий воркер) увидят разные миры, а рестарт
+    #: обнулить бюджет — то есть ровно то, за чем Redis тут и нужен.
+    kv_backend: Literal["redis", "memory"] = "redis"
     nats_url: str = "nats://nats:4222"
     searxng_url: str = "http://localhost:8888"
     searxng_timeout_s: float = Field(default=20.0, ge=1.0, le=120.0)
@@ -134,6 +139,12 @@ class Settings(BaseSettings):
                 "не хватает настроек: "
                 + ", ".join(missing)
                 + ". Скопируйте .env.example в .env и заполните."
+            )
+        if self.is_production and self.kv_backend != "redis":
+            raise ConfigError(
+                "ENV=prod не может работать с kv_backend="
+                + self.kv_backend
+                + ": состояние сессий и дневной бюджет обязаны переживать рестарт процесса"
             )
         return self
 

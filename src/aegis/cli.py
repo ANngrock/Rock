@@ -76,8 +76,15 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
             }
 
         try:
-            pong = await app.redis.ping()
-            report["checks"]["redis"] = {"ok": bool(pong)}
+            if cfg.kv_backend == "memory":
+                report["checks"]["redis"] = {
+                    "ok": True,
+                    "backend": "memory",
+                    "note": "не персистентно: история/pending/бюджет живут только в этом процессе",
+                }
+            else:
+                pong = await app.redis.ping()
+                report["checks"]["redis"] = {"ok": bool(pong), "backend": "redis"}
         except Exception as exc:  # noqa: BLE001
             report["checks"]["redis"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
