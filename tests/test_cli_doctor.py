@@ -112,3 +112,57 @@ async def test_model_probe_survices_provider_failure() -> None:
     assert report["ok"] is False
     assert "401" in report["hint"]
     assert "SECRET" not in report["error"] + report["hint"]
+
+
+async def test_models_report_names_unknown_model() -> None:
+    from types import SimpleNamespace
+
+    from aegis.cli import _models_report
+    from aegis.platform.config import Settings
+    from aegis.platform.gateway.client import ModelUnavailable
+
+    class Gateway:
+        async def chat(self, role: str, *args: object, **kwargs: object) -> object:
+            if role == "brain":
+                raise ModelUnavailable(
+                    "нет", cause="BadRequestError: Error code: 400 - Model Not Found api_key=SECRET"
+                )
+
+            class Res:
+                model = "glm-4.5-air"
+                latency_ms = 42
+
+            return Res()
+
+        async def embed(self, texts: object, **kwargs: object) -> list[list[float]]:
+            return [[0.1, 0.2]]
+
+    cfg = Settings(_env_file=None, glm_api_key="k", embedding_dims=2)
+    report = await _models_report(SimpleNamespace(gateway=Gateway()), cfg)
+    assert report["ok"] is False
+    assert "не знает такую модель" in report["hint"]
+    assert "SECRET" not in report["error"]
+    assert report["roles"]["embed"]["ok"] is True
+
+
+async def test_models_report_flags_dimension_mismatch() -> None:
+    from types import SimpleNamespace
+
+    from aegis.cli import _models_report
+    from aegis.platform.config import Settings
+
+    class Gateway:
+        async def chat(self, role: str, *args: object, **kwargs: object) -> object:
+            class Res:
+                model = "glm-4.6"
+                latency_ms = 10
+
+            return Res()
+
+        async def embed(self, texts: object, **kwargs: object) -> list[list[float]]:
+            return [[0.0] * 1024]
+
+    cfg = Settings(_env_file=None, glm_api_key="k", embedding_dims=2048)
+    report = await _models_report(SimpleNamespace(gateway=Gateway()), cfg)
+    assert report["ok"] is False
+    assert "1024" in report["roles"]["embed"]["hint"]

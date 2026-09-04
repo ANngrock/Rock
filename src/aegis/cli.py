@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="проверить конфигурацию и связности")
     doctor.add_argument("--json", action="store_true", help="машинный вывод (для HEALTHCHECK)")
     doctor.add_argument("--quick", action="store_true", help="не ходить в сеть (только конфиг)")
+    doctor.add_argument(
+        "--models",
+        action="store_true",
+        help="живой прогон по всем ролям (brain/fast/vision/embed), ~по токену на роль",
+    )
 
     ask = sub.add_parser("ask", help="одиночный запрос к supervisor без Telegram")
     ask.add_argument("text", nargs="+", help="текст сообщения")
@@ -123,7 +128,53 @@ async def _model_report(app: Any, cfg: Any) -> dict[str, Any]:
     return out
 
 
-async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
+async def _models_report(app: Any, cfg: Any) -> dict[str, Any]:
+    """По одному крошечному запросу на роль: ловит и «ключа нет», и «такой модели нет»."""
+    from aegis.platform.gateway.diagnose import diagnose, redact_secrets
+
+    out: dict[str, Any] = {"ok": True, "roles": {}}
+    for role in ("brain", "fast", "vision"):
+        try:
+            res = await app.gateway.chat(
+                role, [{"role": "user", "content": "ping"}], max_tokens=8, thinking=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw = f"{type(exc).__name__}: {getattr(exc, 'cause', '') or exc}"
+            out["roles"][role] = {
+                "ok": False,
+                "error": redact_secrets(raw)[:160],
+                "hint": diagnose(raw, timeout_s=cfg.llm_timeout_s),
+            }
+            out["ok"] = False
+            continue
+        out["roles"][role] = {"ok": True, "model": res.model, "latency_ms": res.latency_ms}
+    try:
+        vecs = await app.gateway.embed(["ping"])
+        dims = len(vecs[0]) if vecs else 0
+        out["roles"]["embed"] = {"ok": dims > 0, "dims": dims}
+        if dims and dims != cfg.embedding_dims:
+            out["roles"]["embed"]["hint"] = (
+                f"провайдер отдаёт {dims} измерений, а колонка на {cfg.embedding_dims} — "
+                "нужна миграция либо dimensions=... в запросе"
+            )
+            out["ok"] = False
+    except Exception as exc:  # noqa: BLE001
+        raw = f"{type(exc).__name__}: {exc}"
+        out["roles"]["embed"] = {"ok": False, "error": redact_secrets(raw)[:160]}
+        out["ok"] = False
+    out["note"] = " · ".join(
+        f"{role}:{'ok' if r.get('ok') else 'FAIL'}" for role, r in out["roles"].items()
+    )
+    first_hint = next((r.get("hint") for r in out["roles"].values() if r.get("hint")), None)
+    first_error = next((r.get("error") for r in out["roles"].values() if r.get("error")), None)
+    if not out["ok"]:
+        # человек читает плоский вывод, а не JSON: первая подсказка идёт наружу целиком
+        out["error"] = str(first_error or "часть ролей недоступна")
+        out["hint"] = str(first_hint or "смотри --json")
+    return out
+
+
+async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> int:
     from aegis.agents.tools import builtin  # noqa: F401  (регистрирует инструменты)
     from aegis.agents.tools.registry import registry
     from aegis.platform.config import settings
@@ -180,7 +231,10 @@ async def _cmd_doctor(*, as_json: bool, quick: bool) -> int:
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}"[:200],
                 }
-            report["checks"]["model"] = await _model_report(app, cfg)
+            if models:
+                report["checks"]["models"] = await _models_report(app, cfg)
+            else:
+                report["checks"]["model"] = await _model_report(app, cfg)
     finally:
         await app.aclose()
 
@@ -253,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "bot":
             return asyncio.run(_cmd_bot())
         if args.command == "doctor":
-            return asyncio.run(_cmd_doctor(as_json=args.json, quick=args.quick))
+            return asyncio.run(_cmd_doctor(as_json=args.json, quick=args.quick, models=args.models))
         if args.command == "ask":
             return asyncio.run(_cmd_ask(" ".join(args.text), args.owner_id))
         if args.command == "tools":

@@ -59,6 +59,12 @@ _RULES: tuple[tuple[str, str], ...] = (
     ("content_filter", "провайдер отклонил запрос по файлу содержимого (модерация z.ai)"),
     ("insufficient_balance", "на балансе key'а нет средств — пополни аккаунт z.ai"),
     ("insufficient_quota", "квота ключа исчерпана"),
+    (
+        "model not found",
+        "провайдер не знает такую модель — сверь MODEL_BRAIN/MODEL_FAST/MODEL_VISION с его списком",
+    ),
+    ("invalid model", "провайдер не знает такую модель — сверь MODEL_* с его списком"),
+    ("1210", "провайдер не знает такую модель — сверь MODEL_* с его списком"),
     ("badrequesterror", "400 — провайдер отклонил состав запроса (сообщения/TOOLS/параметры)"),
     (
         "unprocessableentityerror",
