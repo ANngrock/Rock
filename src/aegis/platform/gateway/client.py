@@ -293,6 +293,13 @@ class ModelGateway:
         )
         return [list(item.embedding) for item in resp.data]
 
+    def _thinking_style(self) -> str:
+        """openrouter|zai — как реально пойдёт запрос: auto читает хост GLM_BASE_URL."""
+        style = self.cfg.llm_thinking_style
+        if style != "auto":
+            return style
+        return "openrouter" if host_of(self.cfg.glm_base_url).endswith("openrouter.ai") else "zai"
+
     def _thinking_body(self, enabled: bool) -> dict[str, Any]:
         """Тело параметра размышления: у z.ai и OpenRouter разные имена и форма.
 
@@ -300,13 +307,16 @@ class ModelGateway:
         это 400 на каждом запросе (или молча проигнорированный параметр), поэтому стиль
         определяется по хосту, а `LLM_THINKING_STYLE` перебивает автоопределение.
         """
-        style = self.cfg.llm_thinking_style
-        if style == "auto":
-            host = host_of(self.cfg.glm_base_url)
-            style = "openrouter" if host.endswith("openrouter.ai") else "zai"
-        if style == "openrouter":
-            return {"reasoning": {"enabled": enabled}}
-        return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+        effort = self.cfg.llm_reasoning_effort
+        if self._thinking_style() == "openrouter":
+            reasoning: dict[str, Any] = {"enabled": enabled}
+            if enabled and effort:
+                reasoning["effort"] = effort
+            return {"reasoning": reasoning}
+        body: dict[str, Any] = {"thinking": {"type": "enabled" if enabled else "disabled"}}
+        if enabled and effort:
+            body["reasoning_effort"] = effort
+        return body
 
     def auth_hint(self) -> str:
         """«Ключ выдан не этим сервисом» — детерминированно, без обращения в сеть.
@@ -334,9 +344,9 @@ class ModelGateway:
             .split("//")[-1]
             .split("/")[0],
             "fallback_model": self.cfg.fallback_model,
-            "thinking_style": (
-                "auto" if self.cfg.llm_thinking_style == "auto" else self.cfg.llm_thinking_style
-            ),
+            # не «auto», а то, что реально уйдёт в запрос: `/status` должен врать меньше
+            "thinking_style": self._thinking_style(),
+            "reasoning_effort": self.cfg.llm_reasoning_effort or None,
             "dlp": "on",
         }
 

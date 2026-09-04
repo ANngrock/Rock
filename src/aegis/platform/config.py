@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     #: Форма нестандартного параметра размышления: z.ai ждёт `thinking: {type: enabled|disabled}`,
     #: OpenRouter — `reasoning: {enabled: bool}`. auto выбирает по хосту GLM_BASE_URL.
     llm_thinking_style: Literal["auto", "zai", "openrouter"] = "auto"
+    #: Глубина рассуждения, если провайдер её принимает (GLM 5.x: low/medium/high/max). Пусто =
+    #: параметр не отправляется вовсе. Смысл менять только вместе с thinking=true: при деградации
+    #: уровня 1 размышление выключается, и глубина не нужна.
+    llm_reasoning_effort: Literal["", "low", "medium", "high", "max"] = ""
     llm_retries_per_client: int = Field(default=2, ge=0, le=6)
     llm_backoff_s: float = Field(default=1.5, ge=0.05, le=30.0)
 

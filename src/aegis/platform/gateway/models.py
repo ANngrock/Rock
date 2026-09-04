@@ -78,7 +78,9 @@ PRICES: dict[str, tuple[float, float]] = {
     "openrouter.ai/z-ai/glm-5.2": (1.4, 4.4),  # у части хостов сейчас скидка 70 %
     "openrouter.ai/z-ai/glm-4.7-flash": (0.06, 0.4),
     "openrouter.ai/z-ai/glm-4.6v": (0.3, 0.9),
-    # z.ai напрямую (https://docs.z.ai/guides/overview/pricing, срез 05.09.2026)
+    # z.ai напрямую (https://docs.z.ai/guides/overview/pricing, срез 05.09.2026; у
+    # open.bigmodel.cn те же модели, но биллинг в юанях и отдельный баланс)
+    "glm-5.2": (1.4, 4.4),
     "glm-4.7": (0.6, 2.2),
     "glm-4.7-flash": (0.0, 0.0),  # free-тиер
     "glm-4.7-flashx": (0.07, 0.4),

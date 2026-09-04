@@ -376,7 +376,9 @@ async def test_auth_hint_reports_foreign_key() -> None:
 
     cfg = Settings(
         _env_file=None,
-        glm_api_key="sk-ai-v1-abcdef0123",
+        # ключ z.ai/bigmodel (<32 hex>.<16 символов>) на адресе ZenMux — ровно та же путаница
+        # классом выше: соседний сервис, а не «плохой ключ»
+        glm_api_key="0f1e2d3c4b5a69788796a5b4c3d2e1f0.SECRETtailabcdef",
         glm_base_url="https://zenmux.ai/api/v1/",
         kv_backend="memory",
     )
@@ -386,8 +388,35 @@ async def test_auth_hint_reports_foreign_key() -> None:
     describe = gateway.describe()
     assert describe["endpoint"] == "zenmux.ai"
     assert describe["auth_hint"] == hint
-    assert "abcdef0123" not in hint, "наружу уходит только префикс"
+    assert "abcdef0123" not in hint, "наружу уходит только форма ключа"
+    assert "open.bigmodel.cn" in hint, "у z.ai две зоны: без них подсказка неполная"
     await gateway.aclose()
+
+
+async def test_auth_hint_accepts_zenmux_payg_key_on_zenmux() -> None:
+    """sk-ai-v1- — это ZenMux pay-as-you-go. На zenmux.ai всё верно; на api.z.ai — чужой ключ."""
+    from aegis.platform.config import Settings
+    from aegis.platform.gateway.client import ModelGateway
+
+    mine = Settings(
+        _env_file=None,
+        glm_api_key="sk-ai-v1-abcdef0123",
+        glm_base_url="https://zenmux.ai/api/v1/",
+        kv_backend="memory",
+    )
+    gateway = ModelGateway(mine, None)  # type: ignore[arg-type]
+    assert gateway.auth_hint() == "", "свой ключ не надо ругать"
+    await gateway.aclose()
+
+    foreign = Settings(
+        _env_file=None,
+        glm_api_key="sk-ai-v1-abcdef0123",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+        kv_backend="memory",
+    )
+    gateway2 = ModelGateway(foreign, None)  # type: ignore[arg-type]
+    assert "ZenMux" in gateway2.auth_hint()
+    await gateway2.aclose()
 
 
 async def test_auth_hint_quiet_when_key_matches_endpoint() -> None:
@@ -519,3 +548,53 @@ async def test_openrouter_request_carries_reasoning_not_thinking() -> None:
     gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
     await gateway.chat("brain", [{"role": "user", "content": "план"}], thinking=True)
     assert primary.requests[0]["extra_body"] == {"reasoning": {"enabled": True}}
+
+
+async def test_reasoning_effort_reaches_the_request_in_provider_shape() -> None:
+    """GLM 5.x принимает глубину рассуждения; у роутеров она живёт внутри `reasoning`."""
+    from aegis.platform.config import Settings as _S
+
+    zai = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+        model_brain="glm-5.2",
+        llm_reasoning_effort="max",
+    )
+    gateway, _kv, primary, _rec, meta = make_gateway([response("ок")], cfg=zai)
+    await gateway.chat("brain", [{"role": "user", "content": "план"}], thinking=True)
+    assert primary.requests[0]["extra_body"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+    assert meta["primary"].requests[0]["extra_body"]["reasoning_effort"] == "max"
+
+    router = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        llm_thinking_style="openrouter",
+        llm_reasoning_effort="low",
+    )
+    gateway2, *_rest = make_gateway([response("ок")], cfg=router)
+    assert gateway2._thinking_body(True) == {"reasoning": {"enabled": True, "effort": "low"}}
+    # деградация уровня 1: глубина не нужна, когда размышление выключено
+    assert gateway2._thinking_body(False) == {"reasoning": {"enabled": False}}
+
+
+async def test_describe_reports_the_resolved_thinking_style() -> None:
+    """auto — это намерение; владельцу нужно то, что реально уйдёт в запрос."""
+    from aegis.platform.config import Settings as _S
+
+    cfg = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="0f1e2d3c4b5a69788796a5b4c3d2e1f0.SECRETtail000001",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+    )
+    gateway, *_rest = make_gateway([response("ок")], cfg=cfg)
+    described = gateway.describe()
+    assert described["thinking_style"] == "zai"
+    assert described["auth_hint"] == "", "ключ z.ai на адресе z.ai — противоречия нет"

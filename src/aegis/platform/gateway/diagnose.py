@@ -38,9 +38,39 @@ _AUTH_401 = (
     "одному сервису; после правки .env контейнер нужно пересоздать"
 )
 
+#: Бизнес-коды z.ai/bigmodel (docs.bigmodel.cn/cn/api/api-code): они конкретнее HTTP-статуса,
+#: поэтому идут первыми — «429» само по себе не отличает «кончился баланс» от «слишком быстро».
+_ZAI_CODES: tuple[tuple[str, str], ...] = (
+    ("1000", "аутентификация не прошла: ключ неверный/отозван или в нём пробел"),
+    ("1001", "запрос ушёл без заголовка Authorization: GLM_API_KEY пуст"),
+    ("1002", "ключ передан неверно: проверь, что в GLM_API_KEY нет кавычек и переноса строки"),
+    ("1003", "ключ просрочен — перевыпусти его в консоли провайдера"),
+    ("1004", "проверка ключа не пройдена: перевыпусти ключ и пересоздай контейнер"),
+    ("1110", "аккаунт провайдера неактивен: проверь статус консоли"),
+    (
+        "1113",
+        "на балансе нет средств — пополни счёт провайдера (у Coding Plan кошелёк отдельный)",
+    ),
+    ("1211", "провайдер не знает такую модель — сверь MODEL_* с его списком"),
+    ("1210", "провайдер отверг параметры запроса: сообщения, TOOLS или нестандартный параметр"),
+    ("1261", "промпт длиннее лимита модели: сократи контекст/историю"),
+    ("1301", "вход или ответ отклонены модерацией провайдера"),
+    ("1302", "слишком много одновременных запросов: снизь параллельность"),
+    ("1303", "частота запросов выше лимита: пауза или другой ключ"),
+    ("1304", "дневной лимит вызовов исчерпан"),
+    ("1305", "сработал flow control провайдера: подожди"),
+    ("1308", "достигнут лимит окна использования — сбросится по расписанию"),
+    ("1310", "недельный/месячный лимит исчерпан: лимит сбросится позже"),
+    ("1311", "текущий тариф/план не даёт доступа к этой модели — сними её в MODEL_*"),
+    ("1312", "модель перегружена у провайдера: попробуй позже или другую роль"),
+    ("1313", "fair-use: провайдер ограничил частоту для этого аккаунта"),
+)
+
 #: Порядок важен: от специфичного к общему. Ключ — подстрока в repr исключения: openai-ошибки
-#: приходят как 'AuthenticationError: Error code: 401 - {...}'.
+#: приходят как 'AuthenticationError: Error code: 401 - {...}'. Числовые коды сопоставляются по
+#: границе числа, иначе «1000» ловится на «max_tokens: 10000».
 _RULES: tuple[tuple[str, str], ...] = (
+    *_ZAI_CODES,
     (
         "authenticationerror",
         _AUTH_401,
@@ -78,7 +108,6 @@ _RULES: tuple[tuple[str, str], ...] = (
         "провайдер не знает такую модель — сверь MODEL_BRAIN/MODEL_FAST/MODEL_VISION с его списком",
     ),
     ("invalid model", "провайдер не знает такую модель — сверь MODEL_* с его списком"),
-    ("1210", "провайдер не знает такую модель — сверь MODEL_* с его списком"),
     (
         "valid model",
         "провайдер не знает такое имя: у OpenRouter id с префиксом автора (z-ai/glm-5.2), "
@@ -123,20 +152,48 @@ _RULES: tuple[tuple[str, str], ...] = (
 )
 
 
-#: Префиксы, по которым ключ однозначно привязан к сервису. Проверка нужна потому, что текст
-#: ответа провайдера об этом молчит, а «ключ не принят» при валидном ключе — почти всегда
-#: ключ от соседнего сервиса (z.ai и роутеры живут разными учётками).
-_ISSUERS: tuple[tuple[str, str, str], ...] = (
-    ("sk-ai-v1-", "z.ai", "https://api.z.ai/api/paas/v4/"),
-    ("sk-or-v1-", "OpenRouter", "https://openrouter.ai/api/v1/"),
-    ("sk-ss-v1-", "ZenMux", "https://zenmux.ai/api/v1/"),
-    ("sk-cs-v1-", "ZenMux", "https://zenmux.ai/api/v1/"),
+#: Формат ключа говорит, кто его выдал. Проверка нужна, потому что текст ответа провайдера об
+#: этом молчит, а «ключ не принят» при живом ключе — почти всегда ключ от соседнего сервиса:
+#: ZenMux выдаёт sk-ai-v1-/sk-ss-v1-/sk-cs-v1-, OpenRouter — sk-or-v1-, а z.ai/bigmodel — пару
+#: <32 hex>.<16 символов>. Путаница дорогая: sk-ai-v1- выглядит как «ключ AI от z.ai», но это
+#: именно ZenMux — на api.z.ai с таким ключом 401.
+_ISSUER_PREFIXES: tuple[tuple[str, str, str, str], ...] = (
+    ("sk-ai-v1-", "ZenMux", "https://zenmux.ai/api/v1/", ""),
+    ("sk-ss-v1-", "ZenMux", "https://zenmux.ai/api/v1/", "ключи подписки и pay-as-you-go разные"),
+    ("sk-cs-v1-", "ZenMux", "https://zenmux.ai/api/v1/", ""),
+    (
+        "sk-or-v1-",
+        "OpenRouter",
+        "https://openrouter.ai/api/v1/",
+        "нужны кредиты на балансе OpenRouter",
+    ),
 )
+#: Ключ z.ai / bigmodel.cn: 32 hex-символа, точка, 16 алфавитно-цифровых.
+_ZAI_KEY = re.compile(r"^[0-9a-f]{32}\.[A-Za-z0-9]{16}$")
+_ZAI_URL = "https://api.z.ai/api/paas/v4/"
+_ZAI_NOTE = (
+    "у z.ai два раздельных аккаунта: api.z.ai (международный) и open.bigmodel.cn (Китай) — "
+    "ключ от одного к другому не переносится"
+)
+
 _ISSUER_HOSTS = {
-    "z.ai": ("api.z.ai",),
+    "z.ai": ("api.z.ai", "open.bigmodel.cn", "bigmodel.cn"),
     "ZenMux": ("zenmux.ai",),
     "OpenRouter": ("openrouter.ai",),
 }
+
+
+def issuer_of(api_key: str) -> tuple[str, str, str, str] | None:
+    """(издатель, ожидаемый base_url, подсказка, форма ключа) по префиксу или маске."""
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    for prefix, issuer, url, note in _ISSUER_PREFIXES:
+        if key.startswith(prefix):
+            return issuer, url, note, f"префиксом {prefix}…"
+    if _ZAI_KEY.match(key):
+        return "z.ai", _ZAI_URL, _ZAI_NOTE, "форматом <32 hex>.<16 символов>"
+    return None
 
 
 def _host_of(base_url: str) -> str:
@@ -145,17 +202,17 @@ def _host_of(base_url: str) -> str:
 
 def auth_hint_for(*, base_url: str, api_key: str) -> str:
     """«Ключ выдан не этим сервисом» — одна строка, без сети. Пусто, если сказать нечего."""
-    key, host = (api_key or "").strip(), _host_of(base_url)
-    if not key or not host:
+    host = _host_of(base_url)
+    known = issuer_of(api_key)
+    if not host or known is None:
         return ""
-    row = next((r for r in _ISSUERS if key.startswith(r[0])), None)
-    if row is None or any(needle in host for needle in _ISSUER_HOSTS[row[1]]):
+    issuer, expected_url, note, shape = known
+    if any(needle in host for needle in _ISSUER_HOSTS[issuer]):
         return ""
-    prefix, issuer, issuer_url = row
+    extra = f" {note}." if note else ""
     return (
-        f"ключ с префиксом {prefix}… выдан {issuer}, а запрос уходит на {host}: это разные "
-        f"сервисы. Подставь ключ {issuer} в GLM_API_KEY либо верни "
-        f"GLM_BASE_URL={issuer_url}"
+        f"ключ с {shape} выдан {issuer}, а запрос уходит на {host}: это разные сервисы."
+        f"{extra} Подставь ключ {issuer} в GLM_API_KEY либо укажи GLM_BASE_URL={expected_url}"
     )
 
 
@@ -165,6 +222,16 @@ def gateway_auth_hint(gateway: object) -> str:
     if not callable(fn):
         return ""
     return str(fn() or "")
+
+
+_DIGITS = re.compile(r"^\d+$")
+
+
+def _matches(text: str, needle: str) -> bool:
+    """Подстрока для слов, граница числа — для кодов ошибок."""
+    if _DIGITS.match(needle):
+        return re.search(rf"(?<!\d){needle}(?!\d)", text) is not None
+    return needle in text
 
 
 def diagnose(error: str, *, timeout_s: float = 60.0, context: str = "") -> str:
@@ -179,7 +246,7 @@ def diagnose(error: str, *, timeout_s: float = 60.0, context: str = "") -> str:
         return "провайдер не дал деталей; смотри `aegis doctor`" + extra
     low = clean.lower()
     for needle, remedy in _RULES:
-        if needle in low:
+        if _matches(low, needle):
             return remedy.format(timeout_s=timeout_s) + extra
     # классифицировать нечем, но текст может быть полезен: отдаём замаскированный кусок
     return f"ошибка провайдера: {clean[:120]}" + extra

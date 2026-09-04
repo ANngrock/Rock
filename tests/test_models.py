@@ -165,3 +165,14 @@ def test_embed_price_follows_embed_endpoint_host() -> None:
 
     assert host_of("https://api.z.ai/api/paas/v4/") == "api.z.ai"
     assert host_of("https://OPENROUTER.AI/api/v1/") == "openrouter.ai"
+
+
+def test_glm_5_2_is_priced_on_its_home_provider() -> None:
+    """MODEL_BRAIN=glm-5.2 без префикса: цены обязаны быть, иначе бюджет — фикция (0 × N)."""
+    from aegis.platform.gateway.models import price_for, resolve_spec
+
+    assert price_for("glm-5.2", host="api.z.ai") == (1.4, 4.4)
+    cfg = Settings(_env_file=None, _env_prefix="T_", model_brain="glm-5.2")
+    spec = resolve_spec("brain", cfg)
+    assert (spec.in_usd_per_m, spec.out_usd_per_m) == (1.4, 4.4)
+    assert spec.thinking_always_on is False, "у 5.2 размышление выключается — деградация работает"

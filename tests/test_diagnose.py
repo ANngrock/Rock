@@ -69,19 +69,37 @@ def test_redact_is_idempotent_on_clean_text() -> None:
 # ------------------------------- ключ и endpoint: один сервис или нет — видно сразу
 
 
+#: Ключ z.ai/bigmodel настоящего образца: <32 hex>.<16 алфавитно-цифровых>.
+ZAI_KEY = "0f1e2d3c4b5a69788796a5b4c3d2e1f0.SECRETtail000001"
+
+
 def test_auth_hint_names_the_mismatch() -> None:
-    hint = auth_hint_for(base_url="https://zenmux.ai/api/v1/", api_key="sk-ai-v1-SECRETVALUE")
+    hint = auth_hint_for(base_url="https://zenmux.ai/api/v1/", api_key=ZAI_KEY)
     assert "выдан z.ai" in hint and "zenmux.ai" in hint
-    assert "SECRETVALUE" not in hint, "префикс — не секрет, сам ключ наружу не уходит"
+    assert "SECRETtail000001" not in hint, "секретная половина ключа наружу не уходит"
     assert "GLM_BASE_URL=https://api.z.ai/api/paas/v4/" in hint
+    assert "open.bigmodel.cn" in hint, "у z.ai две зоны с раздельным балансом — надо сказать"
+
+
+def test_sk_ai_v1_belongs_to_zenmux_not_z_ai() -> None:
+    """Префикс sk-ai-v1- выглядит как «AI-ключ z.ai» и годами вводил в заблуждение: это ZenMux."""
+    hint = auth_hint_for(base_url="https://api.z.ai/api/paas/v4/", api_key="sk-ai-v1-SECRETVALUE")
+    assert "выдан ZenMux" in hint and "api.z.ai" in hint
+    assert "SECRETVALUE" not in hint
+    assert "GLM_BASE_URL=https://zenmux.ai/api/v1/" in hint
 
 
 @pytest.mark.parametrize(
     ("base_url", "api_key"),
     [
-        ("https://api.z.ai/api/paas/v4/", "sk-ai-v1-abc"),  # ключ и адрес совпадают
+        # ключ и адрес совпадают: обе зоны z.ai считаются «своими» для этого формата
+        ("https://api.z.ai/api/paas/v4/", ZAI_KEY),
+        ("https://open.bigmodel.cn/api/paas/v4", ZAI_KEY),
+        ("https://api.z.ai/api/coding/paas/v4", ZAI_KEY),
         ("https://zenmux.ai/api/v1/", "sk-ss-v1-abc"),
         ("https://zenmux.ai/api/v1/", "sk-cs-v1-abc"),
+        ("https://zenmux.ai/api/v1/", "sk-ai-v1-abc"),
+        ("https://openrouter.ai/api/v1/", "sk-or-v1-abc"),
         ("https://api.z.ai/api/paas/v4/", "zzz-неизвестный-ключ"),  # не угадываем
         ("", "sk-ai-v1-abc"),
         ("https://zenmux.ai/api/v1/", ""),
@@ -124,3 +142,31 @@ def test_openrouter_key_is_recognised() -> None:
     assert "выдан OpenRouter" in hint and "api.z.ai" in hint
     assert "SECRET" not in hint
     assert auth_hint_for(base_url="https://openrouter.ai/api/v1/", api_key="sk-or-v1-abc") == ""
+
+
+# ------------------------------------------- z.ai/bigmodel: бизнес-код конкретнее HTTP-статуса
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Error code: 429 - {'code': '1113'}", "пополни счёт"),
+        ("Error code: 401 - {'code': '1003'}", "перевыпусти его в консоли"),
+        ("Error code: 400 - {'code': '1211', 'message': 'model not exists'}", "сверь MODEL_*"),
+        ("Error code: 400 - {'code': '1210', 'message': 'bad params'}", "отверг параметры"),
+        ("Error code: 400 - {'code': '1261'}", "промпт длиннее лимита"),
+        ("Error code: 429 - {'code': '1304'}", "дневной лимит"),
+        ("Error code: 403 - {'code': '1311'}", "не даёт доступа"),
+    ],
+)
+def test_zai_business_codes_are_read_from_the_body(raw: str, expected: str) -> None:
+    """«429» не отличает «нет денег» от «слишком быстро» — у z.ai в ответе есть код, читаем его."""
+    out = diagnose(raw)
+    assert expected in out, out
+
+
+def test_numeric_codes_match_on_digit_boundaries() -> None:
+    """`1000` не должно срабатывать на `max_tokens: 10000`, иначе диагноз врёт."""
+    out = diagnose("Error code: 400 - max_tokens: 10000 exceeds limit")
+    assert "аутентификация" not in out, out  # «1000» внутри «10000» — не код ошибки
+    assert "аутентификация не прошла" in diagnose("Error code: 401 - {'code': '1000'}")
