@@ -124,3 +124,44 @@ def test_vision_role_stays_on_a_vision_model() -> None:
     assert CATALOG["brain"].supports_vision is False
     assert "v" in CATALOG["vision"].name, CATALOG["vision"].name
     assert CATALOG["vision"].supports_vision is True
+
+
+# ------------------------------------------------- один id у двух роутеров стоит разных денег
+
+
+def test_router_price_is_scoped_by_host() -> None:
+    """`z-ai/glm-4.6v` на OpenRouter дороже, чем на ZenMux: голое имя тут врёт в 2 раза."""
+    from aegis.platform.gateway.models import price_for
+
+    assert price_for("z-ai/glm-4.6v", "openrouter.ai") == (0.3, 0.9)
+    assert price_for("z-ai/glm-4.6v", "zenmux.ai") == (0.15, 0.44)
+    assert price_for("z-ai/glm-4.6v") == (0.15, 0.44), "без хоста — голое имя"
+    assert price_for("glm-4.7-flash", "api.z.ai") == (0.0, 0.0), "нет scoped-строки = прайс имени"
+
+
+def test_resolve_spec_uses_host_of_the_configured_endpoint() -> None:
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        model_vision="z-ai/glm-4.6v",
+    )
+    spec = resolve_spec("vision", cfg)
+    assert (spec.in_usd_per_m, spec.out_usd_per_m) == (0.3, 0.9)
+    same_name_zenmux = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://zenmux.ai/api/v1/",
+        model_vision="z-ai/glm-4.6v",
+    )
+    assert resolve_spec("vision", same_name_zenmux).in_usd_per_m == 0.15
+
+
+def test_embed_price_follows_embed_endpoint_host() -> None:
+    """Векторы могут жить у другого сервиса — и цену надо брать по его хосту, не по чатному."""
+    from aegis.platform.gateway.models import host_of
+
+    assert host_of("https://api.z.ai/api/paas/v4/") == "api.z.ai"
+    assert host_of("https://OPENROUTER.AI/api/v1/") == "openrouter.ai"

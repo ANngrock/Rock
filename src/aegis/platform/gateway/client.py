@@ -32,6 +32,7 @@ from aegis.platform.gateway.dlp import DLP
 from aegis.platform.gateway.models import (
     ChatRole,
     ModelSpec,
+    host_of,
     resolve_spec,
     spec_for_name,
 )
@@ -183,14 +184,19 @@ class ModelGateway:
             model_name = spec.name
             if provider == "fallback" and self.cfg.fallback_model:
                 model_name = self.cfg.fallback_model
-                spec_used = spec_for_name(model_name, spec)
+                spec_used = spec_for_name(
+                    model_name,
+                    spec,
+                    host=host_of(self.cfg.fallback_base_url or self.cfg.glm_base_url),
+                )
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
             # нестандартные параметры (thinking) провайдер fallback может не понимать
             if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
-                # у thinking-always-on моделей «disabled» — не настройка, а ошибка 400:
+                # у thinking-always-on моделей «выключить» — не настройка, а ошибка 400:
                 # экономия на деградации не должна ломать сам запрос
-                mode = "enabled" if (thinking or spec.thinking_always_on) else "disabled"
-                kwargs["extra_body"] = {"thinking": {"type": mode}}
+                kwargs["extra_body"] = self._thinking_body(
+                    bool(thinking) or spec.thinking_always_on
+                )
             for retry in range(self.cfg.llm_retries_per_client + 1):
                 attempt += 1
                 started = time.perf_counter()
@@ -287,6 +293,21 @@ class ModelGateway:
         )
         return [list(item.embedding) for item in resp.data]
 
+    def _thinking_body(self, enabled: bool) -> dict[str, Any]:
+        """Тело параметра размышления: у z.ai и OpenRouter разные имена и форма.
+
+        `thinking.type` OpenRouter не знает, а `reasoning.enabled` не знает z.ai: неверная форма —
+        это 400 на каждом запросе (или молча проигнорированный параметр), поэтому стиль
+        определяется по хосту, а `LLM_THINKING_STYLE` перебивает автоопределение.
+        """
+        style = self.cfg.llm_thinking_style
+        if style == "auto":
+            host = host_of(self.cfg.glm_base_url)
+            style = "openrouter" if host.endswith("openrouter.ai") else "zai"
+        if style == "openrouter":
+            return {"reasoning": {"enabled": enabled}}
+        return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+
     def auth_hint(self) -> str:
         """«Ключ выдан не этим сервисом» — детерминированно, без обращения в сеть.
 
@@ -313,6 +334,9 @@ class ModelGateway:
             .split("//")[-1]
             .split("/")[0],
             "fallback_model": self.cfg.fallback_model,
+            "thinking_style": (
+                "auto" if self.cfg.llm_thinking_style == "auto" else self.cfg.llm_thinking_style
+            ),
             "dlp": "on",
         }
 

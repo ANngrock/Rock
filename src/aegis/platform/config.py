@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     #: Некоторые роутеры отклоняют нестандартный параметр thinking в теле запроса (400). Если после
     #: смены провайдера ответы пропали, а `doctor --models` показывает 400 — выставьте false.
     llm_thinking_param: bool = True
+    #: Форма нестандартного параметра размышления: z.ai ждёт `thinking: {type: enabled|disabled}`,
+    #: OpenRouter — `reasoning: {enabled: bool}`. auto выбирает по хосту GLM_BASE_URL.
+    llm_thinking_style: Literal["auto", "zai", "openrouter"] = "auto"
     llm_retries_per_client: int = Field(default=2, ge=0, le=6)
     llm_backoff_s: float = Field(default=1.5, ge=0.05, le=30.0)
 

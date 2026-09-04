@@ -451,3 +451,71 @@ async def test_fallback_call_is_costed_by_fallback_model() -> None:
     assert meta["fallback"].requests[0]["model"] == "glm-4.7-flashx"
     ok = [r for r in records if r.ok]
     assert len(ok) == 1 and ok[0].provider == "fallback" and ok[0].cost_usd > 0
+
+
+# --------------------------------------------------------------- форма thinking-параметра
+
+
+async def test_thinking_body_shape_follows_the_provider() -> None:
+    """z.ai ждёт `thinking.type`, OpenRouter — `reasoning.enabled`: неверная форма = 400."""
+    from aegis.platform.config import Settings as _S
+
+    or_cfg = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        model_brain="z-ai/glm-5.2",
+    )
+    gateway, *_rest = make_gateway([response("ок")], cfg=or_cfg)
+    assert gateway._thinking_body(True) == {"reasoning": {"enabled": True}}
+    assert gateway._thinking_body(False) == {"reasoning": {"enabled": False}}
+
+    zai_cfg = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+        model_brain="glm-5.3-flash",
+    )
+    gateway2, _kv2, primary2, _rec2, _meta2 = make_gateway([response("ок")], cfg=zai_cfg)
+    await gateway2.chat("brain", [{"role": "user", "content": "го"}], thinking=False)
+    # 5.3-серия не выключается: вместо «disabled» шлём «enabled», иначе провайдер отвечает 400
+    assert primary2.requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+
+    forced = _S(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        llm_thinking_style="zai",
+    )
+    gateway3, *_rest3 = make_gateway([response("ок")], cfg=forced)
+    assert gateway3._thinking_body(True) == {"thinking": {"type": "enabled"}}
+
+
+async def test_openrouter_never_disables_always_on_models() -> None:
+    """На роутере тоже: thinking-always-on модель не должна получить reasoning.enabled=false."""
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        model_brain="z-ai/glm-5.3-flash",
+    )
+    gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
+    await gateway.chat("brain", [{"role": "user", "content": "го"}], thinking=False)
+    assert primary.requests[0]["extra_body"] == {"reasoning": {"enabled": True}}
+
+
+async def test_openrouter_request_carries_reasoning_not_thinking() -> None:
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        glm_base_url="https://openrouter.ai/api/v1/",
+        model_brain="z-ai/glm-5.2",
+    )
+    gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
+    await gateway.chat("brain", [{"role": "user", "content": "план"}], thinking=True)
+    assert primary.requests[0]["extra_body"] == {"reasoning": {"enabled": True}}

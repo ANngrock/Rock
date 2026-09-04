@@ -98,3 +98,29 @@ def test_context_is_appended_to_the_remedy() -> None:
 
 def test_gateway_without_auth_hint_method_is_fine() -> None:
     assert gateway_auth_hint(object()) == ""
+
+
+# ------------------------------------------------- OpenRouter: кредиты, имена, reasoning
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Error code: 402 - Insufficient credits", "402"),
+        ("PaymentRequiredError: This request requires more credits", "402"),
+        ("Error code: 400 - 'glm-5.2' is not a valid model ID", "префиксом автора"),
+        ("Error code: 400 - Reasoning is mandatory for this endpoint", "LLM_THINKING_PARAM=false"),
+        ("Error code: 403 - input flagged by moderation", "модерация"),
+        ("NotFoundError: Error code: 404 - Not Found", "имя модели"),
+    ],
+)
+def test_openrouter_specific_remedies(raw: str, expected: str) -> None:
+    out = diagnose(raw)
+    assert expected in out, out
+
+
+def test_openrouter_key_is_recognised() -> None:
+    hint = auth_hint_for(base_url="https://api.z.ai/api/paas/v4/", api_key="sk-or-v1-SECRET")
+    assert "выдан OpenRouter" in hint and "api.z.ai" in hint
+    assert "SECRET" not in hint
+    assert auth_hint_for(base_url="https://openrouter.ai/api/v1/", api_key="sk-or-v1-abc") == ""

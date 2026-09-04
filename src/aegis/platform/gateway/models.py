@@ -20,6 +20,8 @@ log = structlog.get_logger(__name__)
 __all__ = [
     "CATALOG",
     "ChatRole",
+    "host_of",
+    "price_for",
     "ModelSpec",
     "PRICES",
     "THINKING_ALWAYS_ON",
@@ -64,11 +66,18 @@ _OVERRIDES: dict[ChatRole, str] = {
 }
 
 
-#: Цена (за 1M токенов, in/out) по конкретному имени модели. Имена с префиксом провайдера —
-#: это роутеры (ZenMux), где и ценник, и схема именования свои; без этой таблицы переопределение
+#: Цена (за 1M токенов, in/out). Ключ — имя модели; если у разных провайдеров одно и то же имя
+#: стоит по-разному, ключ — строка `хост/имя`, и она выигрывает у голого имени: `z-ai/glm-4.6v`
+#: на OpenRouter $0.30/$0.90, на ZenMux $0.15/$0.44. Без этой таблицы переопределение
 #: MODEL_BRAIN=z-ai/glm-4.6 молча считало бы расходы по прайсу z.ai (~2x).
-#: Ступенчатые цены взяты по нижнему слою контекста (<32k) — для личных запросов он основной.
+#: Ступенчатые цены взяты по нижнему слою контекста — для личных запросов он основной.
+#: Промо и скидки внутри провайдера не учитываем: держим лист, потому что недооценённый бюджет
+#: ломает SLO «стоимость ≤ дневного лимита» молча, а переоценённый лишь раньше посадит thinking.
 PRICES: dict[str, tuple[float, float]] = {
+    # OpenRouter (страницы моделей openrouter.ai/<id>, срез 05.09.2026; +5.5 % на пополнение)
+    "openrouter.ai/z-ai/glm-5.2": (1.4, 4.4),  # у части хостов сейчас скидка 70 %
+    "openrouter.ai/z-ai/glm-4.7-flash": (0.06, 0.4),
+    "openrouter.ai/z-ai/glm-4.6v": (0.3, 0.9),
     # z.ai напрямую (https://docs.z.ai/guides/overview/pricing, срез 05.09.2026)
     "glm-4.7": (0.6, 2.2),
     "glm-4.7-flash": (0.0, 0.0),  # free-тиер
@@ -84,7 +93,7 @@ PRICES: dict[str, tuple[float, float]] = {
     "z-ai/glm-4.7": (0.35, 1.54),
     "z-ai/glm-4.5": (0.35, 1.54),
     "z-ai/glm-4.5-air": (0.12, 0.29),
-    "z-ai/glm-4.6v": (0.15, 0.44),
+    "z-ai/glm-4.6v": (0.15, 0.44),  # ZenMux; на OpenRouter то же имя дороже (scoped-строка выше)
     "z-ai/glm-4.6v-flash": (0.022, 0.22),
     "z-ai/embedding-3": (0.05, 0.0),
     # GLM-5.3-Flash (26.08.2026): 320B/18B MoE, 1M контекста, нативно text+image+video.
@@ -105,28 +114,51 @@ PRICES: dict[str, tuple[float, float]] = {
 THINKING_ALWAYS_ON = frozenset({"glm-5.3", "glm-5.3-flash", "z-ai/glm-5.3", "z-ai/glm-5.3-flash"})
 
 
-def _named(spec: ModelSpec, name: str) -> ModelSpec:
-    """Тот же контур, но с другим именем модели: цена и flags — по имени, роль — прежняя.
+def host_of(url: str | None) -> str:
+    """Хост из base_url — он же ключ скоупинга цен в PRICES."""
+    return (url or "").split("//")[-1].split("/")[0].casefold()
+
+
+def price_for(name: str, host: str = "") -> tuple[float, float] | None:
+    """Цена имени у конкретного хоста: `хост/имя` важнее голого имени."""
+    if host:
+        scoped = PRICES.get(f"{host}/{name}")
+        if scoped is not None:
+            return scoped
+    return PRICES.get(name)
+
+
+def _named(spec: ModelSpec, name: str, *, host: str = "") -> ModelSpec:
+    """Тот же контур, но с другим именем (и у другого хоста): цена — по имени, роль — прежняя.
 
     Возможности привязаны к ИМЕНИ, а не к роли: glm-5.3-flash закрывает и текст, и картинки,
-    но думает всегда — помнить об этом надо на любом уровне деградации.
+    но думает всегда. Хост тут потому, что у роутеров одно и то же имя стоит других денег:
+    дефолт каталога, не сменив имени, на чужом хосте обязан дорожать — иначе бюджет врёт.
     """
-    if name == spec.name:
-        return spec
+    price = price_for(name, host)
     always_on = name in THINKING_ALWAYS_ON
+    thinking = spec.supports_thinking or always_on
+    same_price = price is None or price == (spec.in_usd_per_m, spec.out_usd_per_m)
+    if (
+        name == spec.name
+        and same_price
+        and always_on == spec.thinking_always_on
+        and thinking == spec.supports_thinking
+    ):
+        return spec
     updated = replace(
         spec,
         name=name,
-        supports_thinking=spec.supports_thinking or always_on,
+        supports_thinking=thinking,
         thinking_always_on=always_on,
     )
-    price = PRICES.get(name)
     if price is None:
         # незнакомое имя: считаем по прайсу роли и предупреждаем — иначе бюджет молча врёт
         log.warning(
             "models.unknown_price",
             model=name,
             role=spec.role,
+            host=host,
             hint="допишите цену в platform/gateway/models.py:PRICES (RUNBOOK §8)",
         )
         return updated
@@ -134,18 +166,20 @@ def _named(spec: ModelSpec, name: str) -> ModelSpec:
 
 
 def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
-    """Спека роли с учётом переопределения имени из конфигурации (и цены этого имени)."""
+    """Спека роли с учётом имени из конфигурации — и цены этого имени у этого провайдера."""
     spec = CATALOG[role]
     if cfg is None:
         from aegis.platform.config import settings
 
         cfg = settings()
+    if role == "embed":
+        host = host_of(cfg.embed_base_url or cfg.glm_base_url)
+    else:
+        host = host_of(cfg.glm_base_url)
     override = getattr(cfg, _OVERRIDES[role], None)
-    if not override:
-        return spec
-    return _named(spec, override)
+    return _named(spec, override or spec.name, host=host)
 
 
-def spec_for_name(name: str, base: ModelSpec) -> ModelSpec:
+def spec_for_name(name: str, base: ModelSpec, *, host: str = "") -> ModelSpec:
     """Спека под реально отправленное имя (fallback-модель называется иначе, чем роль)."""
-    return _named(base, name)
+    return _named(base, name, host=host)
