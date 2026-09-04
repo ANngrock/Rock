@@ -113,6 +113,17 @@ class ModelGateway:
             if cfg.fallback_api_key and cfg.fallback_base_url
             else None
         )
+        #: Отдельный клиент для эмбеддингов, когда чат-роутер их не проксирует. None = основной
+        #: эндпоинт: у роутеров embeddings есть не везде, а за векторами иногда нужно ходить
+        #: напрямую к провайдеру — для этого EMBED_BASE_URL/EMBED_API_KEY.
+        self.embed_client: AsyncOpenAI | None = (
+            self._client(
+                cfg.embed_api_key or cfg.glm_api_key,
+                cfg.embed_base_url or cfg.glm_base_url,
+            )
+            if cfg.embed_base_url or cfg.embed_api_key
+            else None
+        )
 
     # ---------------- public ----------------
 
@@ -159,7 +170,10 @@ class ModelGateway:
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
             # нестандартные параметры (thinking) провайдер fallback может не понимать
             if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
-                kwargs["extra_body"] = {"thinking": {"type": "enabled" if thinking else "disabled"}}
+                # у thinking-always-on моделей «disabled» — не настройка, а ошибка 400:
+                # экономия на деградации не должна ломать сам запрос
+                mode = "enabled" if (thinking or spec.thinking_always_on) else "disabled"
+                kwargs["extra_body"] = {"thinking": {"type": mode}}
             for retry in range(self.cfg.llm_retries_per_client + 1):
                 attempt += 1
                 started = time.perf_counter()
@@ -218,7 +232,8 @@ class ModelGateway:
         await self.cost.check(len(joined) / 3.5 * spec.in_usd_per_m / 1_000_000 + 1e-6)
         started = time.perf_counter()
         try:
-            resp = await self.primary.embeddings.create(model=spec.name, input=list(texts))
+            client = self.embed_client or self.primary
+            resp = await client.embeddings.create(model=spec.name, input=list(texts))
         except openai.OpenAIError as exc:
             await self.recorder(
                 LLMCallRecord(
@@ -264,12 +279,15 @@ class ModelGateway:
                 for role in ("brain", "vision", "fast", "embed")
             },
             "fallback_enabled": self.fallback is not None,
+            "embed_endpoint": (self.cfg.embed_base_url or self.cfg.glm_base_url or "")
+            .split("//")[-1]
+            .split("/")[0],
             "fallback_model": self.cfg.fallback_model,
             "dlp": "on",
         }
 
     async def aclose(self) -> None:
-        for client in (self.primary, self.fallback):
+        for client in (self.primary, self.fallback, self.embed_client):
             if client is not None:
                 await client.close()
 

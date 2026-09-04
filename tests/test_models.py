@@ -55,3 +55,35 @@ def test_base_url_is_normalized(raw: str, expected: str) -> None:
     """Открытый URL эндпоинта из чата — обычное дело; клиент дописывает путь сам."""
     cfg = Settings(_env_file=None, _env_prefix="T_", glm_base_url=raw, glm_api_key="k")
     assert cfg.glm_base_url == expected
+
+
+def test_glm_5_3_flash_price_and_flags_by_name() -> None:
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        model_brain="z-ai/glm-5.3-flash",
+        model_vision="z-ai/glm-5.3-flash",
+        glm_api_key="k",
+    )
+    brain = resolve_spec("brain", cfg)
+    assert (brain.in_usd_per_m, brain.out_usd_per_m) == (0.15, 0.5)
+    assert brain.supports_thinking is True
+    assert brain.thinking_always_on is True, "у 5.3-серии reasoning не выключается"
+    vision = resolve_spec("vision", cfg)
+    assert vision.supports_vision is True, "та же модель нативно мультимодальная"
+    assert vision.thinking_always_on is True
+
+
+def test_model_without_price_entry_keeps_role_price() -> None:
+    cfg = Settings(_env_file=None, _env_prefix="T_", model_brain="glm-4.6", glm_api_key="k")
+    spec = resolve_spec("brain", cfg)
+    assert spec.thinking_always_on is False, "glm-4.6 умеет думать по запросу, а не всегда"
+
+
+def test_every_price_key_is_a_real_model_name() -> None:
+    """Ключ PRICES — имя для провайдера: опечатка здесь = «model not found» в бою."""
+    from aegis.platform.gateway.models import CATALOG
+
+    for role, spec in CATALOG.items():
+        assert spec.name in PRICES, f"{role}: у имени каталога нет цены"
+        assert " " not in spec.name and spec.name == spec.name.strip()

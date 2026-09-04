@@ -17,7 +17,14 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["CATALOG", "ChatRole", "ModelSpec", "PRICES", "resolve_spec"]
+__all__ = [
+    "CATALOG",
+    "ChatRole",
+    "ModelSpec",
+    "PRICES",
+    "THINKING_ALWAYS_ON",
+    "resolve_spec",
+]
 
 ChatRole = Literal["brain", "vision", "fast", "embed"]
 
@@ -30,6 +37,9 @@ class ModelSpec:
     out_usd_per_m: float
     supports_thinking: bool = False
     supports_vision: bool = False
+    #: Модель умеет только думать: `thinking.type: disabled` не поддерживается, провайдер
+    #: отвечает 400. Ставится по имени модели (THINKING_ALWAYS_ON), а не по роли.
+    thinking_always_on: bool = False
     max_output_tokens: int | None = None
 
 
@@ -66,9 +76,23 @@ PRICES: dict[str, tuple[float, float]] = {
     "z-ai/glm-4.5-air": (0.12, 0.29),
     "z-ai/glm-4.6v": (0.15, 0.44),
     "z-ai/glm-4.6v-flash": (0.022, 0.22),
-    "z-ai/glm-4.6v-flash-free": (0.0, 0.0),
     "z-ai/embedding-3": (0.05, 0.0),
+    # GLM-5.3-Flash (26.08.2026): 320B/18B MoE, 1M контекста, нативно text+image+video.
+    # Промо $0.075/$0.25 действовало до 09.09.2026, прайс лист — $0.15/$0.50: держим лист,
+    # потому что недооценённый бюджет ломает SLO «стоимость ≤ дневного лимита» молча.
+    "glm-5.3-flash": (0.15, 0.5),
+    "z-ai/glm-5.3-flash": (0.15, 0.5),
+    "glm-5.3": (1.4, 4.4),
+    "z-ai/glm-5.3": (1.4, 4.4),
+    "z-ai/glm-5": (0.58, 2.6),
+    "z-ai/glm-4.7-flashx": (0.0728, 0.4367),
+    "z-ai/glm-4.7-flash-free": (0.0, 0.0),
 }
+
+#: Имена, у которых reasoning нельзя выключить (доки z.ai по 5.3-серии: принимается только
+#: thinking.type=enabled). Список по имени, а не по роли: одна и та же модель может стоять
+#: и в brain, и в vision.
+THINKING_ALWAYS_ON = frozenset({"glm-5.3", "glm-5.3-flash", "z-ai/glm-5.3", "z-ai/glm-5.3-flash"})
 
 
 def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
@@ -81,6 +105,10 @@ def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
     override = getattr(cfg, _OVERRIDES[role], None)
     if not override or override == spec.name:
         return spec
+    # возможности и цена привязаны к ИМЕНИ: glm-5.3-flash закрывает и текст, и картинки,
+    # но думает всегда — помнить об этом надо на любом уровне деградации
+    always_on = override in THINKING_ALWAYS_ON
+    thinking = spec.supports_thinking or always_on
     price = PRICES.get(override)
     if price is None:
         # незнакомое имя: считаем по прайсу роли и предупреждаем — иначе бюджет молча врёт
@@ -90,5 +118,14 @@ def resolve_spec(role: ChatRole, cfg: Settings | None = None) -> ModelSpec:
             role=role,
             hint="допишите цену в platform/gateway/models.py:PRICES (RUNBOOK §8)",
         )
-        return replace(spec, name=override)
-    return replace(spec, name=override, in_usd_per_m=price[0], out_usd_per_m=price[1])
+        return replace(
+            spec, name=override, supports_thinking=thinking, thinking_always_on=always_on
+        )
+    return replace(
+        spec,
+        name=override,
+        supports_thinking=thinking,
+        thinking_always_on=always_on,
+        in_usd_per_m=price[0],
+        out_usd_per_m=price[1],
+    )

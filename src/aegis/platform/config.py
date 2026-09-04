@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     model_vision: str | None = None
     model_fast: str | None = None
     model_embed: str | None = None
+    #: Отдельный эндпоинт/ключ для эмбеддингов. Роутеры часто проксируют только chat, поэтому
+    #: индексатор (шаг 2) должен уметь ходить за векторами напрямую в z.ai, не меняя провайдера
+    #: всего остального. Пусто = используем основной glm_api_key/glm_base_url.
+    embed_api_key: SecretStr | None = None
+    embed_base_url: str | None = None
     fallback_api_key: SecretStr | None = None
     fallback_base_url: str | None = None
     fallback_model: str | None = None

@@ -46,7 +46,8 @@ docker compose -f deploy/docker-compose.yml logs -f bot
 | `GLM_API_KEY` | — | ключ OpenAI-совместимого провайдера: z.ai **или** роутера (ZenMux и т. п.) |
 | `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4/` | базовый URL **без** `/chat/completions` (хвост эндпоинта срезается автоматически, OpenAI-клиент дописывает сам) |
 | `LLM_THINKING_PARAM` | `true` | `false` — не слать нестандартный `thinking` в теле: роутеры, которые его не знают, отвечают 400 |
-| `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | переопределение имён моделей без правки кода |
+| `MODEL_BRAIN` / `MODEL_VISION` / `MODEL_FAST` / `MODEL_EMBED` | каталог | имена моделей; цена **и возможности** берутся по имени (`PRICES`, `THINKING_ALWAYS_ON`) |
+| `EMBED_BASE_URL` / `EMBED_API_KEY` | пусто = основной провайдер | куда ходить за векторами: чат-роутеры часто эмбеддинги не проксируют |
 | `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | пусто | резервный провайдер при 5xx/лимите |
 | `KV_BACKEND` | `redis` | `memory` — запуск вообще без Redis: демо/CI/первое «пощупать». Состояние живёт только в процессе, в `ENV=prod` запрещено |
 | `DATABASE_URL` | `postgresql+asyncpg://aegis:aegis@postgres:5432/aegis` | хост = `postgres` (имя сервиса) вне контейнера заменить на `localhost` |
@@ -164,14 +165,27 @@ SearXNG требует явного включения JSON-ответов: `dep
 прайс роли и в лог уходит `models.unknown_price` с подсказкой — молча врать про бюджет хуже, чем
 попросить дописать строчку.
 
+Сверять цены и id удобно у самого роутера: `GET https://zenmux.ai/api/v1/models` отдаёт
+публичный список `id / input_modalities / context_length / pricings` — оттуда и взяты строки для
+`z-ai/glm-5.3-flash` (текст+картинки+видео, 1M контекста, промо $0.075/$0.25 до 09.09.2026,
+лист $0.15/$0.50). В каталоге держим **листовую** цену: недооценённый бюджет ломает SLO молча, а
+переоценённый лишь раньше посадит thinking в режим экономии.
+
+Отдельная ловушка 5.3-серии: `thinking.type: "disabled"` не поддерживается (только `enabled`).
+Раньше деградация бюджета именно так и экономила токены — на 5.3 это стало бы 400 на каждом
+сообщении. Поэтому у имён из `THINKING_ALWAYS_ON` мы никогда не просим выключить reasoning, а
+экономим сменой роли на `fast`.
+
 Смена провайдера целиком:
 
 ```ini
 GLM_BASE_URL=https://zenmux.ai/api/v1/
-MODEL_BRAIN=z-ai/glm-4.6
-MODEL_VISION=z-ai/glm-4.6v
-MODEL_FAST=z-ai/glm-4.5-air
+MODEL_BRAIN=z-ai/glm-5.3-flash
+MODEL_VISION=z-ai/glm-5.3-flash   # 5.3-flash нативно мультимодальный: одна модель на обе роли
+MODEL_FAST=z-ai/glm-4.7-flashx
 LLM_THINKING_PARAM=false   # только если роутер отвечает 400 на thinking
+EMBED_BASE_URL=            # пусто = векторы через тот же роутер; при 404 — https://api.z.ai/api/paas/v4/
+EMBED_API_KEY=             # и тогда же — ключ z.ai отдельно
 ```
 
 Префикс `z-ai/` обязателен: без него роутер не знает модель. Проверка после правки —

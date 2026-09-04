@@ -289,3 +289,75 @@ async def test_thinking_param_can_be_switched_off_for_routers() -> None:
     gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
     await gateway.chat("brain", [{"role": "user", "content": "привет"}], thinking=True)
     assert "extra_body" not in primary.requests[0]
+
+
+async def test_thinking_always_on_model_never_asks_to_disable_it() -> None:
+    """Деградация бюджета не должна превращаться в 400 «thinking.type disabled unsupported»."""
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        llm_backoff_s=0.05,
+        model_brain="z-ai/glm-5.3-flash",
+    )
+    gateway, _kv, primary, _records, _meta = make_gateway([response("ок")], cfg=cfg)
+    await gateway.chat("brain", [{"role": "user", "content": "привет"}], thinking=False)
+    assert primary.requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert primary.requests[0]["model"] == "z-ai/glm-5.3-flash"
+
+
+async def test_embeddings_use_their_own_client() -> None:
+    """Роутер может не проксировать эмбеддинги: для них отдельный эндпоинт и ключ."""
+    cfg = Settings(
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        llm_backoff_s=0.05,
+        embed_base_url="https://api.z.ai/api/paas/v4/",
+    )
+    gateway, _kv, _primary, _records, _meta = make_gateway([], cfg=cfg)
+    used: list[str] = []
+
+    async def embed_create(**kwargs: Any) -> Any:  # noqa: ANN401
+        used.append("embed")
+
+        class Item:
+            embedding = [0.0] * 4
+
+        class Resp:
+            data = [Item()]
+            usage = SimpleNamespace(total_tokens=3)
+
+        return Resp()
+
+    async def primary_create(**kwargs: Any) -> Any:  # noqa: ANN401
+        used.append("primary")
+        raise AssertionError("primary не должен использоваться для эмбеддингов")
+
+    gateway.embed_client = SimpleNamespace(  # type: ignore[assignment]
+        embeddings=SimpleNamespace(create=embed_create)
+    )
+    gateway.primary = SimpleNamespace(  # type: ignore[assignment]
+        embeddings=SimpleNamespace(create=primary_create), close=_noop
+    )
+    assert await gateway.embed(["текст"]) == [[0.0] * 4]
+    assert used == ["embed"]
+
+
+async def test_embeddings_fall_back_to_primary_endpoint() -> None:
+    """Без EMBED_BASE_URL векторы просим у основного провайдера — ничего не ломаем."""
+    gateway, _kv, _primary, _records, _meta = make_gateway([])
+
+    async def create(**kwargs: Any) -> Any:  # noqa: ANN401
+        class Item:
+            embedding = [0.1] * 2
+
+        class Resp:
+            data = [Item()]
+            usage = SimpleNamespace(total_tokens=1)
+
+        return Resp()
+
+    gateway.primary = SimpleNamespace(embeddings=SimpleNamespace(create=create), close=_noop)  # type: ignore[assignment]
+    gateway.embed_client = gateway.primary
+    assert await gateway.embed(["текст"]) == [[0.1] * 2]
