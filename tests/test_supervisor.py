@@ -487,3 +487,105 @@ async def test_model_unavailable_does_not_leak_keys() -> None:
     reply = await h.handle("что нового?")
     assert "sk-REALKEY123456" not in reply.text
     assert "соединение" in reply.text.lower()
+
+
+# ------------------------------------------- детерминированный путь: курс без модели и без токенов
+
+
+async def test_rate_question_never_reaches_the_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Вопрос с точным ответом в первоисточнике не должен зависеть от модели и бюджета."""
+    from aegis.agents import intents
+    from aegis.web.rates import RateAnswer, RateQuestion, RateQuote
+
+    answer = RateAnswer(
+        question=RateQuestion(base="USD", quote="UAH"),
+        quotes=[
+            RateQuote(
+                source="ПриватБанк · безналичный",
+                url="https://api.privatbank.ua/x",
+                base="USD",
+                quote="UAH",
+                buy=41.3,
+                sell=41.75,
+                kind="bank_cashless",
+            ),
+            RateQuote(
+                source="НБУ · официальный",
+                url="https://bank.gov.ua/x",
+                base="USD",
+                quote="UAH",
+                buy=41.4,
+                sell=41.4,
+                kind="official",
+            ),
+        ],
+        verdict="agreed",
+        deviation_pct=0.2,
+        fetched_at="2026-09-05T01:13:00+03:00",
+    )
+
+    async def fake(question: RateQuestion, **_kwargs: object) -> RateAnswer:
+        return answer
+
+    monkeypatch.setattr(intents, "fetch_rates", fake)
+    # пустой скрипт ответов: если модель всё-таки дёрнется, FakeGateway упадёт с AssertionError
+    h = harness([])
+    reply = await h.handle("скажи мне актуальный курс доллара в приватбанке")
+    assert reply.model == "deterministic:rates"
+    assert reply.cost_usd == 0.0 and reply.iterations == 0
+    assert "41." in reply.text
+    assert h.gateway.calls == [], "LLM не участвует там, где есть первоисточник"
+    events = h.events_of("intent.answered")
+    assert events and events[0]["payload"]["sources"], "след ответа — в event store (принцип 4)"
+    assert h.history(), (
+        "история диалога всё равно пополняется: следующий «а наличный?» — про то же»"
+    )
+
+
+async def test_failed_sources_do_not_silently_become_a_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Классика прошлой недели: отказ инструмента превращался в «попробуйте уточнить запрос»."""
+    from aegis.agents import intents
+    from aegis.web.rates import RateAnswer, RateQuestion
+
+    async def dead(question: RateQuestion, **_kwargs: object) -> RateAnswer:
+        return RateAnswer(
+            question=question,
+            verdict="unavailable",
+            causes=["privatbank: ConnectError"],
+            fetched_at="2026-09-05T01:13:00+03:00",
+        )
+
+    monkeypatch.setattr(intents, "fetch_rates", dead)
+    h = harness([make_chat_result("Похоже, 41.3")])
+    reply = await h.handle("курс доллара")
+    assert "⚠️" in reply.text and "privatbank" in reply.text, "причина доходит текстом, а не тоном"
+    assert "Похоже, 41.3" in reply.text, "ответ модели остаётся, замечание — сверху к нему"
+
+
+async def test_notices_are_deduplicated_in_the_answer() -> None:
+    """Один и тот же отказ, повторённый в трёх строках ответа, — уже шум."""
+
+    class Mark(BaseModel):
+        note: str = ""
+
+    h = harness(
+        [
+            make_chat_result(None, tool_calls=[("c1", "mark", {"note": "поиск лежит"})]),
+            make_chat_result("отвечаю по данным"),
+        ]
+    )
+
+    @h.registry.register("mark", "тестовый инструмент", Mark)
+    async def handler(args: Mark, ctx: ToolContext) -> str:
+        notices = ctx.extras.setdefault("notices", [])
+        notices.append(args.note)
+        notices.append(args.note)
+        return "готово"
+
+    reply = await h.handle("что там")
+    assert reply.text.count("поиск лежит") == 1, reply.text
+    assert "⚠️" in reply.text

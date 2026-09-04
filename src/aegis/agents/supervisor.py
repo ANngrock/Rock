@@ -26,6 +26,7 @@ from typing import Any, Literal
 import orjson
 import structlog
 
+from aegis.agents.intents import try_answer
 from aegis.agents.prompts.system import PROMPT_VERSION, build_system_prompt
 from aegis.agents.services import Services
 from aegis.agents.tools.registry import Attachment, ToolContext, ToolRegistry, UnknownTool
@@ -44,6 +45,9 @@ from aegis.platform.logging import bind_contextvars
 __all__ = ["Inbound", "PendingAction", "Reply", "Route", "Supervisor"]
 
 log = structlog.get_logger(__name__)
+
+#: Потолок длины ответа: Telegram-лимит с запасом на разметку (см. interaction.telegram.render).
+MAX_MESSAGE_CHARS = 4000
 
 CONFIRM_PLACEHOLDER = "[ожидает подтверждения владельца]"
 
@@ -159,6 +163,9 @@ class Supervisor:
             services=self.services,
             source_trust=msg.source_trust,
             attachments=list(msg.attachments),
+            # инструменты ходят в тот же KV за кэшем курсов: свой ответ на «повтори» дешевле,
+            # чем новый запрос в банк, но кэш не должен пережить смену вопроса
+            extras={"kv": self.kv, "notices": []},
         )
         await self._event(
             owner_id=msg.owner_id,
@@ -172,7 +179,15 @@ class Supervisor:
                 "source_trust": msg.source_trust,
             },
         )
+        # Детерминированный путь раньше модели: там, где есть первоисточник, LLM не нужен —
+        # ответ не зависит ни от дневного бюджета, ни от живости провайдера (принцип 5).
+        fast = await self._try_intent(msg, ctx)
+        if fast is not None:
+            await self._save_history(msg.owner_id, messages, final_text=fast.text)
+            fast.trace_id = trace_id
+            return fast
         reply = await self._guarded_loop(messages, ctx, route=route)
+        _append_notices(reply, ctx)
         await self._save_history(msg.owner_id, messages, final_text=reply.text)
         reply.trace_id = trace_id
         return reply
@@ -269,6 +284,37 @@ class Supervisor:
         thinking = bool(THINK_HINT.search(text)) and not CHEAP_HINT.search(text)
         return Route("brain", True, thinking and level < 1, "рабочий режим")
 
+    async def _try_intent(self, msg: Inbound, ctx: ToolContext) -> Reply | None:
+        """Ответ без LLM, если вопрос покрыт парсером. None — «отвечает модель»."""
+        if msg.attachments:
+            return None
+        try:
+            answer = await try_answer(
+                msg.text,
+                services=self.services,
+                kv=self.kv,
+                cfg=self.cfg,
+                notices=ctx.extras.get("notices"),
+            )
+        except Exception as exc:  # noqa: BLE001 - кривой парсер не имеет права ронять ход
+            log.warning("supervisor.intent_failed", err=repr(exc)[:200])
+            return None
+        if answer is None:
+            return None
+        await self._event(
+            owner_id=msg.owner_id,
+            event_type="intent.answered",
+            payload={"intent": answer.intent, "trace_id": ctx.trace_id, **answer.meta},
+        )
+        log.info("supervisor.intent", intent=answer.intent, meta=len(answer.meta))
+        return Reply(
+            text=answer.text,
+            trace_id=ctx.trace_id,
+            model=f"deterministic:{answer.intent}",
+            cost_usd=0.0,
+            iterations=0,
+        )
+
     async def _degradation_level(self) -> int:
         cost = self.services.gateway.cost
         return cost.degradation_level(await cost.spent())
@@ -283,7 +329,7 @@ class Supervisor:
             return await self._loop(messages, ctx, route=route)
         except BudgetExceeded as exc:
             redacted = self.services.gateway.dlp.redact(str(exc))
-            return Reply(
+            reply = Reply(
                 text=(
                     "Дневной бюджет LLM исчерпан — умная часть на паузе.\n"
                     f"{redacted}\n"
@@ -292,6 +338,8 @@ class Supervisor:
                 trace_id=ctx.trace_id,
                 degraded=True,
             )
+            _append_notices(reply, ctx)
+            return reply
         except ModelUnavailable as exc:
             # Владелец должен увидеть ПРИЧИНУ, а не «попробуй позже»: читать логи контейнера
             # ради 401 — не тот уровень сервиса для личного инструмента.
@@ -303,7 +351,7 @@ class Supervisor:
             log.warning("supervisor.model_unavailable", err=reason[:200])
             # Только переносы строк, никакой разметки: этот текст обязан дойти целиком даже
             # тогда, когда Telegram не принял HTML и слой отправки ушёл в запасной путь.
-            return Reply(
+            reply = Reply(
                 text=(
                     "Модели сейчас недоступны — провайдер не ответил.\n"
                     f"Причина: {reason}\n"
@@ -313,6 +361,8 @@ class Supervisor:
                 trace_id=ctx.trace_id,
                 degraded=True,
             )
+            _append_notices(reply, ctx)
+            return reply
 
     async def _loop(
         self, messages: list[dict[str, Any]], ctx: ToolContext, *, route: Route
@@ -623,6 +673,19 @@ class Supervisor:
 
 
 # --------------------------------------------------------------- helpers
+
+
+def _append_notices(reply: Reply, ctx: ToolContext) -> None:
+    """Причины отказа инструментов доходят до владельца текстом, а не обещанием модели.
+
+    Модель может пересказать находку как угодно; «поиск лежит» не имеет права превратиться в
+    «попробуйте уточнить запрос» — для этого и есть отдельная строка, которую добавляем мы сами.
+    """
+    notices = [str(note) for note in (ctx.extras.get("notices") or []) if str(note).strip()]
+    if not notices:
+        return
+    tail = "\n\n⚠️ " + "; ".join(dict.fromkeys(notices))[:400]
+    reply.text = (reply.text + tail)[:MAX_MESSAGE_CHARS]
 
 
 def _tool_message(call_id: str, content: str) -> dict[str, Any]:

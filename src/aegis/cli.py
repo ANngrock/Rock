@@ -13,7 +13,11 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from aegis.platform.config import Settings
 
 __all__ = ["main"]
 
@@ -214,6 +218,62 @@ async def _models_report(app: Any, cfg: Any) -> dict[str, Any]:
     return out
 
 
+async def _bounded_probe(
+    label: str, make: Callable[[], Awaitable[dict[str, Any]]]
+) -> dict[str, Any]:
+    """Одна живая проба с жёстким потолком: висящий внешний сервис не должен вешать doctor."""
+    try:
+        return await asyncio.wait_for(make(), timeout=_PROBE_TIMEOUT_S)
+    except TimeoutError:
+        return {
+            "ok": False,
+            "error": f"TimeoutError: проба «{label}» не завершилась за {_PROBE_TIMEOUT_S:.0f} c",
+            "hint": "внешний сервис держит соединение: проверь VPN/прокси контейнера",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _search_report(cfg: Settings) -> dict[str, Any]:
+    """Поиск: вердикт и причины по каждому движку — ровно то, что иначе тонет в логах контейнера."""
+    from aegis.web.search import WebSearch
+
+    outcome = await WebSearch(cfg=cfg).outcome("курс евро к доллару", 3)
+    return {
+        "ok": outcome.verdict != "unavailable",
+        "verdict": outcome.verdict,
+        "hits": len(outcome.hits),
+        "engines": [report.as_text() for report in outcome.engines],
+        "note": f"движки: {cfg.search_engines}",
+        "hint": None
+        if outcome.verdict == "ok"
+        else (
+            "SearXNG отвечает, но пусто — смотри unresponsive_engines в ответе движка; "
+            "второй движок (zai) включается списком SEARCH_ENGINES"
+            if outcome.verdict == "empty"
+            else "адрес SearXNG из контейнера — http://searxng:8080, а не localhost"
+        ),
+    }
+
+
+async def _rates_report(cfg: Settings) -> dict[str, Any]:
+    """Курсы: детерминированный путь обязан работать и при выключенных моделях — проверяем его."""
+    from aegis.web.rates import RateQuestion, fetch_rates
+
+    question = RateQuestion(base="USD", quote=cfg.rate_home_currency, mode="pair", raw="doctor")
+    answer = await fetch_rates(question, cfg=cfg)
+    ok = answer.verdict != "unavailable"
+    return {
+        "ok": ok,
+        "verdict": answer.verdict,
+        "sources": [quote.render_line() for quote in answer.quotes][:4],
+        "note": (
+            f"расхождение {answer.deviation_pct:.2f} % при допуске {cfg.rate_tolerance_pct:.2f} %"
+        ),
+        "hint": None if ok else "; ".join(answer.causes[:2]) or "источники курсов не ответили",
+    }
+
+
 async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> int:
     from aegis.agents.tools import builtin  # noqa: F401  (регистрирует инструменты)
     from aegis.agents.tools.registry import registry
@@ -250,27 +310,10 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
             report["checks"]["redis"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
         if not quick:
-            try:
-                import httpx
-
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(
-                        f"{cfg.searxng_url.rstrip('/')}/search",
-                        params={"q": "test", "format": "json"},
-                    )
-                    ok = resp.status_code == 200
-                    report["checks"]["searxng"] = {
-                        "ok": ok,
-                        "status": resp.status_code,
-                        "hint": None
-                        if ok
-                        else "включи formats: [html, json] в deploy/searxng/settings.yml",
-                    }
-            except Exception as exc:  # noqa: BLE001
-                report["checks"]["searxng"] = {
-                    "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}"[:200],
-                }
+            # поиск и курсы проверяются так же, как они устроены: по движкам и по источникам.
+            # «ok» здесь = «хотя бы один путь даёт данные», а не «контейнер SearXNG отвечает».
+            report["checks"]["search"] = await _bounded_probe("search", lambda: _search_report(cfg))
+            report["checks"]["rates"] = await _bounded_probe("rates", lambda: _rates_report(cfg))
             if models:
                 report["checks"]["models"] = await _models_report(app, cfg)
             else:

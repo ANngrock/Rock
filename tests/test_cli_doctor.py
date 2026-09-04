@@ -250,3 +250,70 @@ async def test_model_hint_names_key_provider_mismatch(monkeypatch: pytest.Monkey
     cfg = Settings(_env_file=None, glm_api_key="k")
     report = await cli._model_report(SimpleNamespace(gateway=Gateway()), cfg)
     assert "выдан z.ai" in report["hint"]
+
+
+async def test_search_probe_reports_every_engine_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`doctor` обязан показывать то же, что бот: не «поиск сломан», а кто именно и почему."""
+    from aegis import cli
+    from aegis.web.search import EngineReport, SearchHit, SearchOutcome
+
+    async def fake_outcome(
+        self: object, query: str, count: int = 5, **_kw: object
+    ) -> SearchOutcome:
+        return SearchOutcome(
+            query=query,
+            hits=[SearchHit(title="x", url="https://a.example/1", snippet="…")],
+            engines=[
+                EngineReport(engine="searxng", status="empty", note="не ответили: google→timeout"),
+                EngineReport(engine="zai", status="ok", hits=1),
+            ],
+            verdict="ok",
+        )
+
+    from aegis.web.search import WebSearch
+
+    monkeypatch.setattr(WebSearch, "outcome", fake_outcome)
+    report = await cli._search_report(_doctor_cfg())
+    assert report["ok"] is True
+    assert any("google→timeout" in line for line in report["engines"])
+    assert "zai: 1" in " | ".join(report["engines"])
+
+
+async def test_rates_probe_says_which_source_is_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aegis import cli
+    from aegis.web.rates import RateAnswer, RateQuestion
+
+    async def dead(question: RateQuestion, **_kw: object) -> RateAnswer:
+        return RateAnswer(
+            question=question,
+            verdict="unavailable",
+            causes=["privatbank: ConnectError"],
+            fetched_at="2026-09-05T01:13:00+03:00",
+        )
+
+    monkeypatch.setattr("aegis.web.rates.fetch_rates", dead)
+    report = await cli._rates_report(_doctor_cfg())
+    assert report["ok"] is False and "privatbank" in report["hint"]
+
+
+async def test_bounded_probe_never_hangs_the_doctor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Висящий внешний сервис не имеет права превращать doctor в «ничего не выводится»."""
+    import asyncio
+
+    from aegis import cli
+
+    async def forever() -> dict[str, object]:
+        await asyncio.sleep(5)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "_PROBE_TIMEOUT_S", 0.01)
+    report = await cli._bounded_probe("search", forever)
+    assert report["ok"] is False and "TimeoutError" in report["error"]
+
+
+def _doctor_cfg() -> Any:
+    from aegis.platform.config import Settings
+
+    return Settings(_env_file=None, _env_prefix="T_", search_engines="searxng,zai")

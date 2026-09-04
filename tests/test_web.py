@@ -84,11 +84,27 @@ def transport(handler) -> httpx.AsyncClient:  # type: ignore[no-untyped-def]
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+def _searx(payload: dict[str, object]) -> httpx.MockTransport:
+    """Один transport на оба движка: searxng отвечает на GET /search, z.ai — на POST /web_search."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/web_search"):
+            return httpx.Response(200, json={"search_result": []})
+        return httpx.Response(200, json=payload)
+
+    return httpx.MockTransport(handler)
+
+
 async def test_search_parses_json_results() -> None:
     payload = {
         "results": [
-            {"title": "Первый", "url": "https://one.example/", "content": "сниппет"},
-            {"title": "Второй", "url": "https://two.example/", "content": "x" * 900},
+            {
+                "title": "Первый",
+                "url": "https://one.example/",
+                "content": "сниппет",
+                "publishedDate": "2026-09-04T10:00:00+00:00",
+            },
+            {"title": "Второй", "url": "https://two.example/", "content": "x" * 2000},
             {"title": "Третий", "url": "https://three.example/", "content": "нет"},
         ]
     }
@@ -98,19 +114,22 @@ async def test_search_parses_json_results() -> None:
         assert request.url.params["q"] == "новости"
         return httpx.Response(200, json=payload)
 
-    with override_settings(searxng_url="http://searxng:8080"):
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
         search = WebSearch(client=transport(handler))
         hits = await search.search("новости", 2)
     assert [h.title for h in hits] == ["Первый", "Второй"]
-    assert len(hits[1].snippet) <= 400
+    assert len(hits[1].snippet) <= 600, "сниппет режется: промпт не должен глотать страницы целиком"
+    assert hits[0].published == "2026-09-04", "дата источника — часть ответа, а не украшение"
+    assert hits[0].engine == "searxng", "видно, откуда число: у движков разные гарантии"
     assert "1. Первый" in hits[0].as_line(1)
+    assert "движок: searxng" in hits[0].as_line(1)
 
 
 async def test_search_requires_json_format_enabled() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="<html>включи json</html>")
 
-    with override_settings(searxng_url="http://searxng:8080"):
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
         with pytest.raises(WebSearchUnavailable, match="formats"):
             await WebSearch(client=transport(handler)).search("q")
 
@@ -119,8 +138,8 @@ async def test_search_reports_connection_failure() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    with override_settings(searxng_url="http://searxng:8080"):
-        with pytest.raises(WebSearchUnavailable, match="недоступен"):
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
+        with pytest.raises(WebSearchUnavailable, match="ни один движок не ответил"):
             await WebSearch(client=transport(handler)).search("q")
 
 
@@ -194,3 +213,151 @@ async def test_non_article_pages_fall_back_to_visible_text() -> None:
     result = await WebFetch(client=transport(handler)).fetch("http://93.184.216.34/plain")
     assert "Просто текст без семантической разметки" in result.text
     assert "var spy" not in result.text
+
+
+# ---------------------------------- вердикты: «пусто» и «сломано» — это разные диагнозы
+
+
+async def test_empty_results_are_not_reported_as_failure() -> None:
+    """Движок жив, совпадений нет: verdict=empty. Иначе «уточните запрос» станет ложью."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
+        outcome = await WebSearch(client=transport(handler)).outcome("квиркел")
+    assert outcome.verdict == "empty"
+    assert outcome.engines[0].status == "empty"
+    assert "совпадений нет" in outcome.summary()
+
+
+async def test_unresponsive_engines_are_surfaced() -> None:
+    """SearXNG отвечает 200 и пустотой, а причину прячет в unresponsive_engines — её видно."""
+    payload = {"results": [], "unresponsive_engines": [["google", "timeout"], ["ddg", "blocked"]]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
+        outcome = await WebSearch(client=transport(handler)).outcome("курс евро")
+    assert "google→timeout" in outcome.engines_text
+    assert "неполный" in outcome.engines_text
+
+
+async def test_second_engine_answers_when_first_is_silent() -> None:
+    """Резерв не декоративный: SearXNG молчит — ответ приходит с web_search того же z.ai."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/web_search"):
+            calls.append(str(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "search_result": [
+                        {
+                            "title": "Кросс-курс EUR/USD",
+                            "link": "https://bank.example/eur-usd",
+                            "content": "1 EUR = 1.09 USD",
+                            "media": "bank.example",
+                            "publish_date": "2026-09-04",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(500, text="oops")
+
+    with override_settings(
+        searxng_url="http://searxng:8080",
+        glm_api_key="k",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+    ):
+        search = WebSearch(client=transport(handler))
+        outcome = await search.outcome("курс евро к доллару", 3)
+    assert outcome.verdict == "ok"
+    assert outcome.hits[0].engine == "zai"
+    assert outcome.hits[0].source == "bank.example"
+    assert calls, "запрос в web_search ушёл"
+    assert "search-prime" in calls[0]
+    assert "unavailable" in outcome.engines[0].as_text().casefold() or "500" in outcome.engines_text
+
+
+async def test_zai_business_error_becomes_a_readable_cause() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"code": 1210, "message": "bad request"})
+
+    with override_settings(
+        searxng_url="",
+        glm_api_key="k",
+        glm_base_url="https://api.z.ai/api/paas/v4/",
+        search_engines="zai",
+    ):
+        outcome = await WebSearch(client=transport(handler)).outcome("что угодно")
+    assert outcome.verdict == "unavailable"
+    assert "1210" in outcome.engines_text
+
+
+async def test_freshness_window_applies_first_and_lifts_on_retry() -> None:
+    """«Актуальный курс» ищем за сутки; пусто — второй заход без окна, а не «ничего нет»."""
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        payload = (
+            {"results": []}
+            if len(seen) == 1
+            else {"results": [{"title": "есть", "url": "https://a.example/1", "content": "ок"}]}
+        )
+        return httpx.Response(200, json=payload)
+
+    with override_settings(searxng_url="http://searxng:8080", glm_api_key=None):
+        outcome = await WebSearch(client=transport(handler)).outcome("актуальный курс")
+    assert seen[0]["time_range"] == "day"
+    assert "time_range" not in seen[1]
+    assert outcome.verdict == "ok"
+    assert any("повтор" in note for note in outcome.refinements)
+
+
+async def test_query_refinement_is_deterministic_and_visible() -> None:
+    from aegis.web.search import normalize_query, refine_query
+
+    with override_settings(search_freshness_first=True):
+        text, fresh, notes = refine_query("скажи мне актуальный курс доллара, пожалуйста")
+    assert "USD" in text and "UAH" not in text, "одна валюта — вторую не выдумываем"
+    assert fresh is True
+    assert "убрал служебные слова" in notes
+    assert normalize_query("  Курс Доллара?! ") == normalize_query("курс доллара")
+
+
+async def test_engine_order_and_unknown_engine_are_reported() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    with override_settings(
+        searxng_url="http://searxng:8080", glm_api_key=None, search_engines="bing,searxng"
+    ):
+        outcome = await WebSearch(client=transport(handler)).outcome("что-то")
+    assert outcome.engines[0].status == "skipped"
+    assert "неизвестный движок" in outcome.engines[0].note
+
+
+async def test_identical_document_from_two_engines_counts_once() -> None:
+    payload_searx = {"results": [{"title": "Раз", "url": "https://a.example/x/", "content": "…"}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/web_search"):
+            return httpx.Response(
+                200,
+                json={
+                    "search_result": [
+                        {"title": "Раз", "link": "https://a.example/x", "content": "…"}
+                    ]
+                },
+            )
+        return httpx.Response(200, json=payload_searx)
+
+    with override_settings(
+        searxng_url="http://searxng:8080", glm_api_key="k", search_engines="searxng,zai"
+    ):
+        outcome = await WebSearch(client=transport(handler)).outcome("раз", 5)
+    assert len(outcome.hits) == 1, "хвостовой слэш — не новый документ"

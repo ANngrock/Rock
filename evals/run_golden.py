@@ -254,8 +254,31 @@ def check_render_chunks(case: Case) -> str | None:
     return None
 
 
+def check_intent(case: Case) -> str | None:
+    """Что перехватывает детерминированный путь — офлайн, без источников и без моделей.
+
+    Отдельный kind именно потому, что здесь важен сам факт: «это вопрос с точным ответом в
+    первоисточнике» решает код, а не настроение модели.
+    """
+    from aegis.web.rates import parse_rate_question
+
+    question = parse_rate_question(str(case.payload.get("input", "")))
+    expect = case.payload.get("expect", {})
+    got: dict[str, object] = {
+        "mode": question.mode if question else None,
+        "base": question.base if question else None,
+        "quote": question.quote if question else None,
+        "cash": question.cash if question else None,
+    }
+    for key, want in expect.items():
+        if got.get(key) != want:
+            return f"{key}: ожидалось {want!r}, получилось {got.get(key)!r}"
+    return None
+
+
 CHECKERS = {
     "routing": check_routing,
+    "intent": check_intent,
     "policy": check_policy,
     "dlp": check_dlp,
     "dlp_roundtrip": check_dlp_roundtrip,

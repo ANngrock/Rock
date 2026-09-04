@@ -87,6 +87,36 @@ class Settings(BaseSettings):
     fetch_max_chars: int = Field(default=6000, ge=500, le=40000)
     fetch_allow_private: bool = False  # только для отладки против локальных сервисов
 
+    # --- поиск и курсы (внешний мир) ---
+    #: Порядок движков веб-поиска через запятую: searxng,zai. Пусто = поиск выключен, и бот скажет
+    #: об этом прямо. SearXNG идёт первым по ADR-007 (запросы не уходят наружу), zai — резерв тем же
+    #: ключом, что и модели: когда Google режет датацентровые IP, SearXNG отвечает 200 и нулём
+    #: результатов, и без второго движка владелец получает «уточните запрос» вместо ответа.
+    search_engines: str = "searxng,zai"
+    search_timeout_s: float = Field(default=15.0, ge=1.0, le=120.0)
+    #: «сегодня/курс/новости» сначала ищем с суточным окном; если пусто — второй заход без него.
+    search_freshness_first: bool = True
+    #: Одна повторная попытка исходной формулировкой: наша «оптимизация» запроса иногда и портит.
+    search_refine: bool = True
+    #: Движок z.ai (POST {base}/web_search). search-prime — премиум-индекс; список допустимых имён
+    #: отдаёт docs.z.ai/api-reference/tools/web-search.
+    search_zai_engine: str = "search-prime"
+    search_zai_base_url: str | None = None
+    #: Цена вызова поиска: у z.ai в прайсе она не указана — заведите число, и вызовы поиска пойдут
+    #: в дневной бюджет. 0 = не учитывать (тогда SearXNG-дефолт бесплатен честно).
+    search_cost_usd_per_call: float = Field(default=0.0, ge=0.0, le=5.0)
+
+    #: Курсы валют — детерминированный путь без LLM (принцип «парсеры работают всегда»).
+    #: Источники без ключей: privatbank (касса+безналичный), nbu (официальный), erapi (агрегатор).
+    rate_sources: str = "privatbank,nbu,erapi"
+    rates_timeout_s: float = Field(default=10.0, ge=1.0, le=60.0)
+    #: Сколько минут ответ о курсе считается годным для повтора. Истина всё равно в источнике.
+    rate_cache_ttl_s: int = Field(default=300, ge=0, le=3600)
+    #: Расхождение между источниками в пределах допуска = «согласуются»; выше — показываем разброс.
+    rate_tolerance_pct: float = Field(default=1.5, ge=0.05, le=25.0)
+    #: Валюта, к которой котируют банки (UAH для Привата/НБУ). Не путать с BASE_CURRENCY учёта.
+    rate_home_currency: str = "UAH"
+
     # --- деньги / приватность / поведение агента ---
     timezone: str = "Europe/Moscow"
     base_currency: str = "RUB"
@@ -114,7 +144,7 @@ class Settings(BaseSettings):
             raise ValueError(f"неизвестная TZ '{v}' (см. zoneinfo)")
         return v
 
-    @field_validator("glm_base_url", "fallback_base_url")
+    @field_validator("glm_base_url", "fallback_base_url", "search_zai_base_url")
     @classmethod
     def _normalize_base_url(cls, v: str | None) -> str | None:
         """Открытый чат с собой: в .env регулярно прилетает полный URL эндпоинта.
@@ -131,6 +161,25 @@ class Settings(BaseSettings):
                 cleaned = cleaned[: -len(suffix)]
                 break
         return f"{cleaned}/"
+
+    @field_validator("search_engines", "rate_sources")
+    @classmethod
+    def _check_csv(cls, v: str) -> str:
+        """Список через запятую: пробелы, регистр и повторы не должны менять поведение."""
+        parts: list[str] = []
+        for item in (v or "").split(","):
+            name = item.strip().casefold()
+            if name and name not in parts:
+                parts.append(name)
+        return ",".join(parts)
+
+    @field_validator("rate_home_currency")
+    @classmethod
+    def _check_rate_home(cls, v: str) -> str:
+        v = v.strip().upper()
+        if len(v) != 3 or not v.isalpha():
+            raise ValueError("RATE_HOME_CURRENCY должен быть ISO-4217, напр. UAH")
+        return v
 
     @field_validator("base_currency")
     @classmethod

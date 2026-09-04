@@ -21,3 +21,12 @@
 {"id":"render-script","kind":"render","input":"<script>alert(1)</script>текст","expect_contains":["alert(1)"],"expect_absent":["<script>"]}
 {"id":"render-unclosed","kind":"render","input":"<b>не закрыто","expect_contains":["</b>"]}
 {"id":"render-long","kind":"render_chunks","input_repeat":5000,"expect":{"max_chunk":4096,"all_balanced":true}}
+{"id": "intent-rate-privat", "kind": "intent", "input": "скажи мне актуальный курс доллара в приватбанке", "expect": {"mode": "pair", "base": "USD", "quote": "UAH", "cash": null}}
+{"id": "intent-rate-explicit", "kind": "intent", "input": "курс доллара к гривне", "expect": {"mode": "pair", "base": "USD", "quote": "UAH"}}
+{"id": "intent-rate-cross", "kind": "intent", "input": "курс евро к доллару в германии", "expect": {"mode": "pair", "base": "EUR", "quote": "USD"}}
+{"id": "intent-rate-cash", "kind": "intent", "input": "наличный курс доллара в кассе", "expect": {"mode": "pair", "base": "USD", "quote": "UAH", "cash": true}}
+{"id": "intent-rate-card", "kind": "intent", "input": "курс доллара по карте", "expect": {"mode": "pair", "base": "USD", "quote": "UAH", "cash": false}}
+{"id": "intent-enumeration-is-table", "kind": "intent", "input": "курс доллара и евро", "expect": {"mode": "table", "base": "USD"}}
+{"id": "intent-not-a-rate", "kind": "intent", "input": "столица германии", "expect": {"mode": null, "base": null}}
+{"id": "intent-memory-is-not-a-rate", "kind": "intent", "input": "запомни: рост 182", "expect": {"mode": null}}
+{"id": "intent-spend-is-not-a-rate", "kind": "intent", "input": "добавь расход 12 евро за такси", "expect": {"mode": null}}

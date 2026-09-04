@@ -11,16 +11,17 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from aegis.agents.tools.images import prepare_image
 from aegis.agents.tools.registry import ToolContext, registry
 from aegis.governance.policy import Risk
-from aegis.platform.config import settings
+from aegis.platform.config import Settings, settings
 from aegis.web.fetch import PageFetchError
-from aegis.web.search import WebSearchUnavailable, wrap_untrusted
+from aegis.web.rates import RateQuestion, fetch_rates, parse_rate_question
+from aegis.web.search import SearchOutcome, wrap_untrusted
 
 _WEEKDAYS_RU = (
     "понедельник",
@@ -179,15 +180,80 @@ class WebSearchArgs(BaseModel):
     count: int = Field(default=5, ge=1, le=10)
 
 
-@registry.register("web_search", "Поиск в интернете: заголовки, ссылки, сниппеты.", WebSearchArgs)
+@registry.register(
+    "web_search",
+    "Поиск в интернете: заголовки, ссылки, сниппеты. Первая строка ответа — вердикт движков: "
+    "её пересказывай владельцу дословно, это не «мнение», а состояние источника.",
+    WebSearchArgs,
+)
 async def web_search(args: WebSearchArgs, ctx: ToolContext) -> str:
-    try:
-        hits = await ctx.services.search.search(args.query, args.count)
-    except WebSearchUnavailable as exc:
-        return f"ПОИСК НЕДОСТУПЕН: {exc}. Так и скажи владельцу, не выдумывай результаты."
-    if not hits:
-        return "Ничего не нашлось."
-    return wrap_untrusted("web_search", "\n\n".join(h.as_line(i + 1) for i, h in enumerate(hits)))
+    """Отчёт по движкам обязана увидеть и модель, и владелец.
+
+    Иначе «SearXNG лежит» и «в интернете нет такой страницы» выглядят для владельца одинаково —
+    «уточните запрос». Именно так однажды и потеряли неделю отладки.
+    """
+    cfg = settings()
+    outcome: SearchOutcome = await ctx.services.search.outcome(args.query, args.count)
+    live = [report for report in outcome.engines if report.status in {"ok", "empty"}]
+    if live and cfg.search_cost_usd_per_call > 0:
+        # платный движок = расход: бюджет обязан его видеть, а не только токены модели
+        await ctx.services.gateway.cost.record(cfg.search_cost_usd_per_call * len(live))
+    if outcome.verdict == "unavailable":
+        ctx.extras.setdefault("notices", []).append(f"веб-поиск недоступен: {outcome.engines_text}")
+        return (
+            f"ПОИСК НЕДОСТУПЕН: {outcome.engines_text}. "
+            "Так и скажи владельцу дословно, с причиной; не выдумывай результаты и не предлагай "
+            "«уточнить запрос» — дело не в запросе."
+        )
+    return outcome.as_tool_text()
+
+
+class ExchangeRateArgs(BaseModel):
+    base: str = Field(
+        default="", max_length=40, description="Валюта котировки: USD, доллар, евро — как скажешь"
+    )
+    quote: str = Field(
+        default="", max_length=40, description="К чем мерить (по умолчанию — гривна)"
+    )
+    cash: Literal["any", "cash", "card"] = Field(
+        default="any", description="any = оба курса, cash = наличные в кассе, card = безналичный"
+    )
+
+
+@registry.register(
+    "exchange_rate",
+    "Точный курс валют из первоисточника (ПриватБанк, официальный НБУ, агрегатор) со сверкой "
+    "между ними. Для вопросов «сколько стоит доллар/евро» — это правильный инструмент, а не поиск.",
+    ExchangeRateArgs,
+)
+async def exchange_rate(args: ExchangeRateArgs, ctx: ToolContext) -> str:
+    cfg = settings()
+    question = _rate_question(args, cfg)
+    if question is None:
+        return (
+            "Не понял, какую валюту мерить: назови код (USD, EUR, PLN) или скажи «сколько стоит "
+            "доллар»."
+        )
+    answer = await fetch_rates(question, cfg=cfg, kv=ctx.extras.get("kv"))
+    if answer.verdict == "unavailable":
+        ctx.extras.setdefault("notices", []).append(
+            "курсы не получены: " + "; ".join(answer.causes[:3])
+        )
+        return f"КУРСА НЕТ: {answer.render(home=cfg.rate_home_currency)}"
+    return answer.render(home=cfg.rate_home_currency)
+
+
+def _rate_question(args: ExchangeRateArgs, cfg: Settings) -> RateQuestion | None:
+    """Вопрос из аргументов собирает тот же парсер, что и реплику владельца: одна логика."""
+    wanted = " ".join(part for part in (args.base, args.quote) if part).strip()
+    if not wanted:
+        wanted = f"курс {cfg.rate_home_currency}"
+    phrase = f"курс {wanted}"
+    if args.cash == "cash":
+        phrase += " наличные"
+    elif args.cash == "card":
+        phrase += " карта"
+    return parse_rate_question(phrase, home=cfg.rate_home_currency)
 
 
 class FetchArgs(BaseModel):

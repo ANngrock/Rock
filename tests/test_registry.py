@@ -110,3 +110,12 @@ def test_json_schema_defaults_do_not_leak_mutable_state() -> None:
     second = Note()
     first.tags.append("мусор")
     assert second.tags == []
+
+
+def test_step1_19_added_the_external_data_tools() -> None:
+    """Курсы — отдельный инструмент: для них есть первоисточник, поиск тут лишний."""
+    assert {"exchange_rate"} <= set(builtin.registry.names())
+    spec = builtin.registry.get("exchange_rate")
+    assert spec.writes is False and spec.risk == Risk.NONE, (
+        "чтение не должно требовать подтверждения"
+    )

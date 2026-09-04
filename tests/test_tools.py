@@ -14,20 +14,47 @@ from aegis.agents.tools.registry import Attachment, ToolContext
 from aegis.knowledge.notes import Note, NoteHit
 from aegis.platform.config import override_settings
 from aegis.web.fetch import PageFetchError
-from aegis.web.search import SearchHit, WebSearchUnavailable
+from aegis.web.rates import RateQuestion
+from aegis.web.search import EngineReport, SearchHit, SearchOutcome
 
 
 class SearchStub:
-    def __init__(self, hits: list[SearchHit] | None = None, error: Exception | None = None) -> None:
+    """Двойник поиска: говорит то же, что настоящий WebSearch, — вердиктом по движкам."""
+
+    def __init__(
+        self,
+        hits: list[SearchHit] | None = None,
+        error: Exception | None = None,
+        *,
+        verdict: str | None = None,
+        engines: list[EngineReport] | None = None,
+    ) -> None:
         self.hits = hits or []
         self.error = error
         self.queries: list[str] = []
+        self._verdict = verdict
+        self.engines = engines or [
+            EngineReport(
+                engine="searxng", status="ok" if self.hits else "empty", hits=len(self.hits)
+            )
+        ]
 
     async def search(self, query: str, count: int = 5, *, language: str = "ru") -> list[SearchHit]:
         self.queries.append(query)
         if self.error:
             raise self.error
         return self.hits[:count]
+
+    async def outcome(self, query: str, count: int = 5, *, language: str = "ru") -> SearchOutcome:
+        self.queries.append(query)
+        if self.error:
+            raise self.error
+        return SearchOutcome(
+            query=query,
+            hits=self.hits[:count],
+            engines=list(self.engines),
+            verdict=self._verdict or ("ok" if self.hits else "empty"),
+        )
 
 
 class FetchStub:
@@ -149,17 +176,143 @@ async def test_search_notes_falls_back_to_text_when_embeddings_fail() -> None:
 async def test_web_search_wraps_results_as_untrusted() -> None:
     search = SearchStub([SearchHit(title="Заголовок", url="https://e.com/1", snippet="Кратко")])
     out = await builtin.web_search(builtin.WebSearchArgs(query="новости"), ctx(search=search))
-    assert out.startswith('<untrusted source="web_search"')
+    assert '<untrusted source="web_search">' in out
     assert out.rstrip().endswith("</untrusted>")
     assert "https://e.com/1" in out
 
 
 async def test_web_search_unavailable_is_reported_honestly() -> None:
-    out = await builtin.web_search(
-        builtin.WebSearchArgs(query="что-то"),
-        ctx(search=SearchStub(error=WebSearchUnavailable("SearXNG недоступен"))),
+    search = SearchStub(
+        verdict="unavailable",
+        engines=[EngineReport(engine="searxng", status="unavailable", note="SearXNG не отвечает")],
     )
+    context = ctx(search=search)
+    out = await builtin.web_search(builtin.WebSearchArgs(query="что-то"), context)
     assert "ПОИСК НЕДОСТУПЕН" in out and "не выдумывай" in out
+    assert "SearXNG не отвечает" in out, "причина обязана быть в тексте, а не в логе контейнера"
+    assert context.extras["notices"], "владелец получит причину и отдельной строкой в ответе"
+
+
+async def test_web_search_keeps_the_verdict_outside_the_untrusted_block() -> None:
+    """Вердикт — наши данные о движках. Внутри <untrusted> ему не место: там всё подозрительно."""
+    search = SearchStub(
+        [SearchHit(title="Т", url="https://e.com/1", snippet="…")],
+        engines=[EngineReport(engine="searxng", status="ok", hits=1)],
+    )
+    out = await builtin.web_search(builtin.WebSearchArgs(query="тест"), ctx(search=search))
+    assert out.startswith("РЕЗУЛЬТАТ ПОИСКА:")
+    assert out.index("РЕЗУЛЬТАТ ПОИСКА") < out.index("<untrusted")
+
+
+async def test_web_search_empty_is_not_called_failure() -> None:
+    search = SearchStub(
+        [], engines=[EngineReport(engine="searxng", status="empty", note="нет совпадений")]
+    )
+    context = ctx(search=search)
+    out = await builtin.web_search(builtin.WebSearchArgs(query="квиркел"), context)
+    assert "совпадений нет" in out
+    assert "ПОИСК НЕДОСТУПЕН" not in out
+    assert not context.extras.get("notices")
+
+
+async def test_paid_search_engines_count_into_the_daily_budget() -> None:
+    """Платный движок = расход. Бюджет, который видит только токены, врёт про стоимость."""
+
+    class Cost:
+        def __init__(self) -> None:
+            self.recorded: list[float] = []
+
+        async def record(self, cost_usd: float) -> float:
+            self.recorded.append(cost_usd)
+            return sum(self.recorded)
+
+    class Gateway:
+        cost = Cost()
+
+    search = SearchStub(
+        [SearchHit(title="Т", url="https://e.com/1", snippet="…")],
+        engines=[
+            EngineReport(engine="searxng", status="ok", hits=1),
+            EngineReport(engine="zai", status="ok", hits=1),
+        ],
+    )
+    with override_settings(search_cost_usd_per_call=0.01):
+        await builtin.web_search(
+            builtin.WebSearchArgs(query="тест"), ctx(search=search, gateway=Gateway())
+        )
+    assert Gateway.cost.recorded != [0.0]  # заглушка выше фиксирует сам факт начисления
+    assert len(Gateway.cost.recorded) == 1 and Gateway.cost.recorded[0] == 0.02
+
+
+async def test_exchange_rate_answers_from_the_source_not_from_the_search() -> None:
+    from aegis.web.rates import RateAnswer, RateQuote
+
+    answer = RateAnswer(
+        question=RateQuestion(base="USD", quote="UAH", mode="pair", raw="курс доллара"),
+        quotes=[
+            RateQuote(
+                source="ПриватБанк · безналичный",
+                url="https://api.privatbank.ua/x",
+                base="USD",
+                quote="UAH",
+                buy=41.3,
+                sell=41.75,
+                kind="bank_cashless",
+            ),
+            RateQuote(
+                source="НБУ · официальный",
+                url="https://bank.gov.ua/x",
+                base="USD",
+                quote="UAH",
+                buy=41.4,
+                sell=41.4,
+                kind="official",
+            ),
+        ],
+        verdict="agreed",
+        deviation_pct=0.2,
+        fetched_at="2026-09-05T01:13:00+03:00",
+    )
+    seen: list[RateQuestion] = []
+
+    async def fake_fetch_rates(question: RateQuestion, **_kwargs: object) -> RateAnswer:
+        seen.append(question)
+        return answer
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(builtin, "fetch_rates", fake_fetch_rates)
+    try:
+        out = await builtin.exchange_rate(
+            builtin.ExchangeRateArgs(base="доллар"), ctx(search=SearchStub())
+        )
+    finally:
+        monkeypatch.undo()
+    assert seen and seen[0].base == "USD" and seen[0].quote == "UAH"
+    assert "ПриватБанк" in out and "НБУ" in out and "согласуются" in out
+
+
+async def test_exchange_rate_without_numbers_says_so() -> None:
+    from aegis.web.rates import RateAnswer
+
+    answer = RateAnswer(
+        question=RateQuestion(base="USD", quote="UAH"),
+        verdict="unavailable",
+        causes=["privatbank: ConnectError"],
+        fetched_at="2026-09-05T01:13:00+03:00",
+    )
+
+    async def fake_fetch_rates(question: RateQuestion, **_kwargs: object) -> RateAnswer:
+        return answer
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(builtin, "fetch_rates", fake_fetch_rates)
+    context = ctx(search=SearchStub())
+    try:
+        out = await builtin.exchange_rate(builtin.ExchangeRateArgs(base="USD"), context)
+    finally:
+        monkeypatch.undo()
+    assert "КУРСА НЕТ" in out
+    assert "privatbank" in context.extras["notices"][0]
 
 
 async def test_web_search_neutralizes_early_untrusted_close() -> None:
