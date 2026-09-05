@@ -925,6 +925,36 @@ async def test_budget_pressure_drops_polish_first() -> None:
 # ------------------------------------------------------------------ живой ответ (2.3)
 
 
+async def test_status_reads_the_note_index_queue() -> None:
+    """`/status` обязан отличать «очередь есть» от «магазин не умеет считать» — иначе владельцу
+    непонятно, почему семантический поиск молчит."""
+    from conftest import FakeNotes
+
+    h = harness([make_chat_result("ок")])
+    h.services.notes = FakeNotes(pending=7)  # type: ignore[assignment]
+    status = await h.supervisor.status(1)
+    assert status["notes"] == {"available": True, "pending": 7}
+
+    class Blind:
+        async def recent(self, limit: int = 50) -> list[str]:
+            return []
+
+        async def search(self, query: str, embedding: Any = None, limit: int = 5) -> list[Any]:
+            return []
+
+    h.services.notes = Blind()  # type: ignore[assignment]
+    assert (await h.supervisor.status(1))["notes"] == {"available": False}
+
+    class Broken(FakeNotes):
+        async def count_pending(self) -> int:
+            raise OSError("connection refused")
+
+    h.services.notes = Broken()  # type: ignore[assignment]
+    status = await h.supervisor.status(1)
+    assert status["notes"]["available"] is False
+    assert "connection refused" in status["notes"]["error"], "причина должна читаться, а не молчать"
+
+
 async def test_streaming_pushes_deltas_and_keeps_the_same_reply() -> None:
     """Куски уходят в интерфейс, а ответ остаётся тем же, что и без стриминга.
 

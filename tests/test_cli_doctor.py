@@ -199,9 +199,15 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_models_report", forbidden)
     monkeypatch.setattr(cli, "_postgres_report", ok)
     monkeypatch.setattr(cli, "_reminders_report", ok)
+    monkeypatch.setattr(cli, "_notes_index_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert set(report["checks"]) == {"postgres", "redis", "reminders"}, report["checks"]
+    assert set(report["checks"]) == {
+        "postgres",
+        "redis",
+        "reminders",
+        "notes_index",
+    }, report["checks"]
     assert report["checks"]["redis"]["backend"] == "memory"
 
 
@@ -275,6 +281,73 @@ async def test_reminders_probe_says_when_the_feature_is_off(
     monkeypatch.setattr(cli, "_scalar", _FakeSession({"to_regclass": True}))
     report = await cli._reminders_report(cfg)
     assert report["state"] == "выключено" and "REMINDERS_ENABLED" in report["note"]
+
+
+async def test_notes_index_probe_names_the_queue_and_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Отстающая индексация — это `note` + `hint`, а не `ok=false`.
+
+    Пока заметки ищутся по тексту, бот здоров; «162 заметки ждут эмбеддинга» должно читаться как
+    очередь, а не как падение, иначе HEALTHCHECK снова станет шумом.
+    """
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(
+        cli,
+        "_scalar",
+        _FakeSession(
+            {
+                "to_regclass": True,
+                "WHERE embedding IS NULL": 162,
+                "SELECT count(*) FROM knowledge.notes": 400,
+            }
+        ),
+    )
+    report = await cli._notes_index_report(cfg)
+    assert report["ok"] is True
+    assert report["pending"] == 162 and report["total"] == 400
+    assert "162 из 400" in report["note"]
+    assert "aegis index notes" in report["hint"]
+
+
+async def test_notes_index_probe_when_everything_is_indexed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(
+        cli,
+        "_scalar",
+        _FakeSession({"to_regclass": True, "WHERE embedding IS NULL": 0, "count(*)": 12}),
+    )
+    report = await cli._notes_index_report(cfg)
+    assert report["pending"] == 0
+    assert "всё" in report["note"] and "hint" not in report
+
+
+async def test_notes_index_probe_survives_missing_schema_and_dead_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(cli, "_scalar", _FakeSession({"to_regclass": False}))
+    report = await cli._notes_index_report(cfg)
+    assert report["ok"] is True and report["state"] == "нет таблицы"
+    assert "0001" in report["hint"]
+
+    async def boom(sql: str) -> Any:
+        raise OSError("[Errno 111] Connect call failed")
+
+    monkeypatch.setattr(cli, "_scalar", boom)
+    report = await cli._notes_index_report(cfg)
+    assert report["ok"] is True and "не проверялось" in report["note"]
 
 
 async def test_live_probe_cannot_hang_doctor(monkeypatch: pytest.MonkeyPatch) -> None:

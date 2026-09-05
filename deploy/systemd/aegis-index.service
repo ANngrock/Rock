@@ -1,0 +1,21 @@
+[Unit]
+Description=aegis: построить эмбеддинги для новых заметок (шаг 2)
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь под свой клон; WorkingDir нужен, чтобы compose нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+EnvironmentFile=-/srv/aegis/.env
+# проход идемпотентен: очередь — это «embedding IS NULL», поэтому повторный запуск не перебивает
+# уже проиндексированное и не требует аренды строк (в отличие от доставки напоминаний)
+ExecStart=/usr/bin/docker compose -f /srv/aegis/deploy/docker-compose.yml run --rm bot aegis index notes
+# если docker недоступен (машина без контейнеров), тот же шаг локальным окружением:
+# ExecStart=/srv/aegis/.venv/bin/aegis index notes
+TimeoutStartSec=600
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

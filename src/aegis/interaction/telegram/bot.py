@@ -186,6 +186,7 @@ async def cmd_status(message: Message, app: App) -> None:
         _polish_line(status),
         _reminders_line(status),
         f"Живой ответ: {_stream_label(app.cfg)}",
+        _notes_line(status),
         f"История в контексте: {status['history_messages']} реплик",
         f"Инструментов: {len(status['tools'])}",
     ]
@@ -414,6 +415,21 @@ def _stream_label(cfg: Any) -> str:
         return "выключен (ответ одним сообщением)"
     ms = int(getattr(cfg, "stream_edit_interval_ms", 900))
     return f"включён, правка раз в {ms} мс"
+
+
+def _notes_line(status: dict[str, Any]) -> str:
+    """Очередь эмбеддингов заметок.
+
+    Строка нужна, потому что «поиск находит не то» имеет две причины с одинаковым симптомом: индекс
+    отстаёт (лечится тиком) и индекс работать не должен (Null-магазин, БД без pgvector).
+    """
+    notes = status.get("notes") or {}
+    if not notes.get("available"):
+        return "Заметки: счётчик индекса недоступен"
+    pending = int(notes.get("pending") or 0)
+    if not pending:
+        return "Заметки: эмбеддинги построены для всех"
+    return f"Заметки: {pending} ждут эмбеддинга — поиск по тексту (aegis index notes)"
 
 
 def _polish_line(status: dict[str, Any]) -> str:

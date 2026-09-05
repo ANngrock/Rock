@@ -86,6 +86,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="показать, что ушло бы, — не отправляя и не трогая БД",
     )
+    index = sub.add_parser("index", help="эмбеддинги заметок: очередь и проход индексации")
+    index_actions = index.add_subparsers(dest="index_action", required=True)
+    notes = index_actions.add_parser(
+        "notes", help="проиндексировать заметки, у которых ещё нет эмбеддинга"
+    )
+    notes.add_argument("--limit", type=int, default=None, help="сколько заметок за проход")
+    notes.add_argument(
+        "--batch", type=int, default=None, help="текстов в одном запросе к /embeddings"
+    )
+    notes.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="только сказать, сколько ждёт индексации — не трогая БД и модель",
+    )
     return parser
 
 
@@ -139,6 +153,50 @@ async def _reminders_report(cfg: Any) -> dict[str, Any]:
     )
     if out["overdue"]:
         out["hint"] = "ждут тика: systemctl status aegis-reminders.timer"
+    return out
+
+
+async def _notes_index_report(cfg: Any) -> dict[str, Any]:
+    """Очередь эмбеддингов: сколько заметок ждут индексации.
+
+    Проба всегда `ok=True` — по той же причине, что и напоминания: заметки без эмбеддинга не делают
+    бота больным, поиск просто деградирует до text-match. Здесь важно не «жив ли», а «успевает ли
+    индексация за потоком сохранённых страниц» — поэтому это `note`/`hint`, а не `ok=false`.
+    """
+    out: dict[str, Any] = {"ok": True}
+    try:
+        ready = await _scalar("SELECT to_regclass('knowledge.notes') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - настоящая ошибка БД уже в проверке postgres
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        out["hint"] = "детали — в проверке postgres"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = (
+            "docker compose -f deploy/docker-compose.yml run --rm bot alembic upgrade head"
+            " (миграция 0001)"
+        )
+        return out
+    pending = int(
+        await _scalar("SELECT count(*) FROM knowledge.notes WHERE embedding IS NULL") or 0
+    )
+    total = int(await _scalar("SELECT count(*) FROM knowledge.notes") or 0)
+    out["pending"] = pending
+    out["total"] = total
+    try:
+        from aegis.platform.gateway.models import resolve_spec
+
+        out["model"] = resolve_spec("embed", cfg).name
+    except Exception:  # noqa: BLE001 - имя модели здесь справка, а не предмет проверки
+        out["model"] = cfg.model_embed or "по роли embed"
+    if not pending:
+        out["note"] = f"проиндексировано всё ({total} замет.)"
+        return out
+    out["note"] = f"{pending} из {total} ждут эмбеддинга · проход ≤ {cfg.embed_index_limit}"
+    out["hint"] = (
+        "поиску это не мешает (он уходит в text-match); индексация: aegis index notes "
+        "или aegis-index.timer"
+    )
     return out
 
 
@@ -386,6 +444,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
     try:
         report["checks"]["postgres"] = await _postgres_report()
         report["checks"]["reminders"] = await _reminders_report(cfg)
+        report["checks"]["notes_index"] = await _notes_index_report(cfg)
 
         try:
             if cfg.kv_backend == "memory":
@@ -555,6 +614,59 @@ async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
     return 2
 
 
+async def _cmd_index(action: str, args: argparse.Namespace) -> int:
+    """Индексация заметок: очередь эмбеддингов, которую ведёт фоновый проход (ADR-0012).
+
+    Отдельная команда, а не «встроить при сохранении»: путь записи принадлежит владельцу, а
+    `EMBED_*`-настройки имеют смысл только тогда, когда их можно применить к пачке сразу. При этом
+    `--dry-run` не трогает ни модель, ни БД — «посмотреть, сколько накопилось» не должно стоить
+    запроса к провайдеру.
+    """
+    from aegis.knowledge.index import index_pending
+    from aegis.knowledge.notes import NotesRepo
+    from aegis.platform.config import ConfigError, settings
+
+    if action != "notes":
+        return 2
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    repo = NotesRepo()
+
+    if args.dry_run:
+        try:
+            pending = await repo.count_pending()
+        except Exception as exc:  # noqa: BLE001 - CLI обязан объяснить, а не показать стек
+            print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+            return 1
+        print(
+            f"{pending} замет. ждут эмбеддинга; за один проход берём {cfg.embed_index_limit}, "
+            f"пакетами по {cfg.embed_batch_size} (ничего не изменено)"
+        )
+        return 0
+
+    from aegis.agents.tools.registry import ToolRegistry
+    from aegis.runtime import build_app
+
+    app = build_app(registry=ToolRegistry(), cfg=cfg, configure_logging=False)
+    try:
+        report = await index_pending(
+            repo,
+            app.services.gateway.embed,
+            limit=args.limit or cfg.embed_index_limit,
+            batch=args.batch or cfg.embed_batch_size,
+            max_chars=cfg.embed_max_chars,
+        )
+    finally:
+        await app.aclose()
+    print(report.summary())
+    # ненулевой выход нужен systemd: «провайдер лёг, ничего не проиндексировано» и «всё чисто»
+    # должны различаться в `systemctl status`, а не в чтении логов
+    return 0 if report.ok else 1
+
+
 async def _cmd_ask(text: str, owner_id: int) -> int:
     from aegis.agents.supervisor import Inbound
     from aegis.agents.tools import load_builtin_tools
@@ -715,6 +827,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_repro(args.repro_action, args))
         if args.command == "remind":
             return asyncio.run(_cmd_remind(args.remind_action, args))
+        if args.command == "index":
+            return asyncio.run(_cmd_index(args.index_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

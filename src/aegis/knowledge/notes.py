@@ -1,8 +1,9 @@
 """Знания: заметки, сохранённые страницы/файлы (шаг 1) и RAG поверх них.
 
 Поиск — гибрид: вектор по pgvector (если эмбеддинг построен) + детерминированный текстовый
-фолбэк (принцип 5: работает всегда, даже при недоступных эмбеддингах). Индексацией эмбеддингов
-займётся фоновый подписчик outbox на шаге 2; до него поиск остаётся полезным за счёт text-match.
+фолбэк (принцип 5: работает всегда, даже при недоступных эмбеддингах). Эмбеддинги строит фоновый
+проход `aegis index notes` (`knowledge.index`) — он обязан успевать за потоком сохранённых страниц,
+и поиск от его отсутствия только теряет семантику, но не становится бессильным.
 """
 
 from __future__ import annotations
@@ -153,8 +154,17 @@ class NotesRepo:
             r = row.first()
             return Note(id=r[0], title=r[1], body=r[2], tags=list(r[3])) if r else None
 
+    async def count_pending(self) -> int:
+        """Сколько заметок ждут эмбеддинга — для `/status`, doctor'а и отчёта индексатора."""
+        sm = self._sm or session
+        async with sm() as s:
+            return int(
+                await s.scalar(text("SELECT count(*) FROM knowledge.notes WHERE embedding IS NULL"))
+                or 0
+            )
+
     async def pending_embeddings(self, limit: int = 50) -> list[Note]:
-        """Для будущего индексатора (шаг 2): заметки без эмбеддинга."""
+        """Для индексатора (`knowledge.index`): заметки без эмбеддинга, старые первыми."""
         sm = self._sm or session
         async with sm() as s:
             rows = await s.execute(

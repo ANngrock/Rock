@@ -327,6 +327,7 @@ class Supervisor:
     async def status(self, owner_id: int) -> dict[str, Any]:
         """Для ``/status``: режим, бюджет, инструменты. Секретов здесь нет по построению."""
         return {
+            "notes": await self._notes_index_state(),
             "prompt_version": PROMPT_VERSION,
             "gateway": self.services.gateway.describe(),
             "cost": await self.services.gateway.cost.snapshot(),
@@ -904,6 +905,20 @@ class Supervisor:
         )
 
     # ------------------------------------------------ observability
+
+    async def _notes_index_state(self) -> dict[str, Any]:
+        """Сколько заметок ждут эмбеддинга — строка для `/status`, а не диагностика.
+
+        Счётчик читается у магазина, если он умеет: у Null/тестовых магазинов его нет, и это честно
+        означает «не видно», без попытки сходить в базу, которой может не быть.
+        """
+        count = getattr(self.services.notes, "count_pending", None)
+        if count is None:
+            return {"available": False}
+        try:
+            return {"available": True, "pending": int(await count())}
+        except Exception as exc:  # noqa: BLE001 - статус не имеет права падать из-за отчёта
+            return {"available": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
 
     async def _kill_switch_active(self) -> bool:
         state = await self._kill_switch_state()

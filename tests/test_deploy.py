@@ -52,6 +52,23 @@ def test_reminder_timer_fires_more_often_than_a_day() -> None:
     assert "--dry-run" not in service, "таймер не должен работать вхолостую"
 
 
+def test_index_timer_runs_a_batch_and_is_calm_about_its_schedule() -> None:
+    """Индексация — не сервис здоровья: редкий таймер, низкий приоритет, «догнать после простоя».
+
+    Полчаса между проходами здесь важнее, чем у напоминаний: очередь эмбеддингов не обязана быть
+    мгновенной (поиск работает и без неё), а вызовы к провайдеру — платные.
+    """
+    timer = (DEPLOY / "systemd" / "aegis-index.timer").read_text(encoding="utf-8")
+    service = (DEPLOY / "systemd" / "aegis-index.service").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:00/15:00" in timer, "интервал съехал — очередь будет отставать"
+    assert "Persistent=true" in timer, "ночь без сервера = дневная пачка заметок без индекса"
+    assert "aegis index notes" in service
+    assert "Nice=10" in service and "IOSchedulingClass=idle" in service, (
+        "индекс не должен мешать боту"
+    )
+    assert "--dry-run" not in service, "таймер обязан работать, а не докладывать"
+
+
 def test_compose_bot_delegates_health_to_image() -> None:
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
     bot_block = compose.split("  bot:")[1].split("\n  ")[0]

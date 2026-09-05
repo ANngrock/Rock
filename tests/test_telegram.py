@@ -193,6 +193,18 @@ def test_status_reminders_line_names_the_reason_for_silence() -> None:
     assert "счётчик не читается" in broken and "connection refused" in broken
 
 
+def test_status_notes_line_distinguishes_lag_from_absence() -> None:
+    """«Поиск находит не то» — это очередь индексации или её отсутствие: разные ответы владельцу."""
+    from aegis.interaction.telegram.bot import _notes_line
+
+    assert "счётчик индекса недоступен" in _notes_line({})
+    assert "счётчик индекса недоступен" in _notes_line({"notes": {"available": False}})
+    clean = _notes_line({"notes": {"available": True, "pending": 0}})
+    assert "построены для всех" in clean and "⚠️" not in clean
+    late = _notes_line({"notes": {"available": True, "pending": 162}})
+    assert "162 ждут эмбеддинга" in late and "aegis index notes" in late
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

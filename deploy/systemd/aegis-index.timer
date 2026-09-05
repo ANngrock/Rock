@@ -1,0 +1,13 @@
+[Unit]
+Description=aegis: каждые 15 минут догонять эмбеддинги заметок
+
+[Timer]
+# 15 минут: заметки читают не в ту же секунду, как сохранили, а эмбеддинги — единственный
+# платный шаг этого цикла. Persistent=true догонит всё, что накопилось за ночь/отпуск
+OnCalendar=*-*-* *:00/15:00
+AccuracySec=1min
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

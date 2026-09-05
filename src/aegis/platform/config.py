@@ -134,6 +134,14 @@ class Settings(BaseSettings):
     # 2048 — потому что embedding-3 без parameters отдаёт именно столько; ANN-индекс pgvector
     # для такой размерности недоступен (лимит 2000), см. комментарий в миграции.
     embedding_dims: int = Field(default=2048, ge=1)
+    #: заметок за один проход индексатора: очередь может быть длиннее (первый запуск после
+    #: импорта), и лучше несколько проходов по 200, один из которых не съест таймаут сервиса
+    embed_index_limit: int = Field(default=200, ge=1, le=5000)
+    #: текстов в одном запросе к /embeddings — столько же, сколько принимает провайдер
+    embed_batch_size: int = Field(default=32, ge=1, le=128)
+    #: сколько символов заметки уходит в эмбеддинг: хвост длинной сохранённой страницы —
+    #: мусор, а лимит входа у модели конечный
+    embed_max_chars: int = Field(default=2000, ge=100, le=32_000)
     auto_allow_low_risk: bool = True
     pending_ttl_seconds: int = Field(default=3600, ge=30, le=86400)
     history_ttl_seconds: int = Field(default=86400, ge=60)

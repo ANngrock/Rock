@@ -214,9 +214,10 @@ class FakeFacts:
 
 
 class FakeNotes:
-    def __init__(self, hits: list[NoteHit] | None = None) -> None:
+    def __init__(self, hits: list[NoteHit] | None = None, *, pending: int = 0) -> None:
         self.hits = hits or []
         self.added: list[Note] = []
+        self.pending = pending
 
     async def add(
         self, title: str, body: str = "", tags: list[str] | None = None, *, source: str = "owner"
@@ -229,6 +230,9 @@ class FakeNotes:
         self, query: str, embedding: list[float] | None = None, limit: int = 5
     ) -> list[NoteHit]:
         return self.hits[:limit]
+
+    async def count_pending(self) -> int:
+        return self.pending
 
 
 class FakeKV:
