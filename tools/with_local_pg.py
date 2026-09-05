@@ -26,11 +26,22 @@ DATA_DIR = ROOT / ".cache" / "aegis-pg"
 UNAVAILABLE_EXT = ("pg_trgm", "pgcrypto", "gin_trgm_ops")
 
 
-def _alembic(url: str) -> int:
+def _alembic(url: str) -> tuple[int, str]:
+    """`alembic upgrade head` с захваченным stderr.
+
+    Молча печатать чужой трейсесек перед строкой «накатываю SQL без них» нельзя: зелёный прогон с
+    красным трэйсбеком приучает не смотреть на падение. Поэтому stderr сохраняем и показываем
+    только там, где отговорки не помогают — когда запасной путь тоже не сработал.
+    """
     env = {**os.environ, "DATABASE_URL": url}
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT, env=env
-    ).returncode
+    proc = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, proc.stderr.strip()
 
 
 def _migration_sql() -> str:
@@ -163,17 +174,29 @@ def main(argv: list[str]) -> int:
 
     if _schema_present(url):
         print("миграции: схема уже накатана (datadir переиспользуется)", flush=True)
-    elif _alembic(url) != 0:
-        if not ns.strip_ext:
+    else:
+        rc, err = _alembic(url)
+        if rc != 0:
+            if not ns.strip_ext:
+                print(err[-2000:], file=sys.stderr)
+                print(
+                    "! миграции не легли; для переносного Postgres без pg_trgm/pgcrypto добавь "
+                    "--strip-ext",
+                    file=sys.stderr,
+                )
+                return 3
             print(
-                "! миграции не легли; для переносного Postgres без pg_trgm/pgcrypto добавь "
-                "--strip-ext",
-                file=sys.stderr,
+                "миграции: alembic не смог (переносной Postgres без pg_trgm/pgcrypto) — "
+                "накатываю SQL без них",
+                flush=True,
             )
-            return 3
-        print("alembic не смог (нет расширений) — накатываю SQL без них", flush=True)
-        _apply_manual(url)
-        _stamp_head(url)
+            try:
+                _apply_manual(url)
+            except Exception:
+                print("--- его stderr, чтобы было что читать:", file=sys.stderr)
+                print(err[-2000:], file=sys.stderr)
+                raise
+            _stamp_head(url)
 
     env = {
         **os.environ,

@@ -917,3 +917,40 @@ sudo systemctl enable --now aegis-export.timer
 * таблицы «что уже отправлено» — идемпотентность обеспечивает детерминированный id, а не курсор;
 * exactly-once и ретраев внутри прогона: первый отказ транспорта останавливает прогон, следующий тик
   догоняет окно целиком.
+
+## 19. CI не стартует: чем проверить и что чинить в GitHub
+
+Все прогоны этого репозитория (и в `main`, и в рабочих ветках) заканчиваются так:
+
+```
+$ gh run list --limit 3
+completed  startup_failure  …  0s        # джобов 0, аннотаций нет
+$ gh api repos/ANngrock/Rock/actions/runs/<id> --jq '.path'
+BuildFailed
+```
+
+Файл `.github/workflows/ci.yml` при этом валиден (YAML читается, дублей ключей нет, `actions/checkout@v4`,
+`actions/setup-python@v5`, `docker/setup-buildx-action@v3`, `docker/build-push-action@v6` существуют по
+тегам), а `state` workflow — `active`. Значит GitHub отказался **собирать** пайплайн до всяких шагов, и
+это настройка аккаунта/репозитория, а не код. Смотреть по порядку:
+
+1. **Settings → Actions → General → Actions permissions** — должно быть «Allow all actions and reusable
+   workflows». Если выбрано «Allow select actions» без списка (или «local actions only»), все
+   `actions/*` и `docker/*` отсекаются ровно с этим симптомом.
+2. **Settings → Actions → General → Workflow permissions** — «Read and write permissions» (job `image`
+   и любые будущее выгрузка артефактов без этого не работают).
+3. **Billing → Usage**: для приватных репозиториев минуты Actions лимитированы; при исчерпании лимита
+   прогоны падают до запуска джобов.
+4. Страница прогона в браузере показывает настоящую формулировку причины — REST API её не отдаёт
+   (`/actions/permissions` и `/actions/runners` под токеном песочницы отвечают 403, так что изнутри
+   это ни прочитать, ни починить нельзя).
+
+Пока CI не поднят, шлюзы проверяются одной командой — она повторяет те же три job'а:
+
+```bash
+make ci     # статика + юниты + evals, интеграции (portable Postgres), сборка образа
+```
+
+Цель намеренно **не** делает вид, что всё проверено: без Postgres и без Docker соответствующие этапы
+печатают «пропущено», а не «ок». Соответствие workflow держится тестом `tests/test_make_ci.py` — если
+в CI добавят проверку, а в Makefile нет, тест это заметит.

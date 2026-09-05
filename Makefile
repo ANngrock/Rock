@@ -3,7 +3,7 @@ PY ?= python3
 ENVFILE = $(if $(wildcard .env),--env-file .env,)
 COMPOSE = docker compose $(ENVFILE) -f deploy/docker-compose.yml
 
-.PHONY: help check evals up test-live up-durable down restart logs ps migrate test test-all lint fmt type imports doctor backup backup-verify backup-list restore clean
+.PHONY: help ci check evals up test-live up-durable down restart logs ps migrate test test-all lint fmt type imports doctor backup backup-verify backup-list restore clean
 
 help: ## что умеет Makefile
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[1m%-10s\033[0m %s\n", $$1, $$2}'
@@ -38,8 +38,8 @@ psql: ## интерактивный psql в контейнере postgres
 doctor: ## локальная самодиагностика конфигурации и связностей
 	$(PY) -m aegis.cli doctor
 
-test: ## только юнит-тесты (без БД)
-	pytest -q
+test: ## только юнит-тесты (без БД) — тот же отбор, что в job static
+	pytest -q -m "not integration"
 
 test-live: ## интеграции на переносном Postgres (без Docker; база каждый раз чистая)
 	$(PY) tools/with_local_pg.py --strip-ext --fresh -- pytest -q -m integration
@@ -60,8 +60,28 @@ fmt: ## автоформат + автофиксы
 
 lint: ## все статические проверки
 	ruff check src tests migrations evals tools
+	ruff format --check src tests migrations evals tools
+	bash -n deploy/backup.sh
 	$(MAKE) type
 	$(MAKE) imports
+
+ci: ## локальный эквивалент .github/workflows/ci.yml: те же шлюзы одной командой
+	@echo "== 1/3 статика + юниты + evals (job static) =="
+	$(MAKE) check
+	@echo "== 2/3 интеграции (job integration) =="
+	@if [ -n "$$AEGIS_TEST_DATABASE_URL" ]; then \
+		AEGIS_TEST_DATABASE_URL=$$AEGIS_TEST_DATABASE_URL pytest -q -m integration; \
+	elif $(PY) -c "import pgserver" >/dev/null 2>&1; then \
+		$(MAKE) test-live; \
+	else \
+		echo "  пропущено: нет Postgres (make up-core, затем make test-all)"; \
+	fi
+	@echo "== 3/3 образ (job image) =="
+	@if command -v docker >/dev/null 2>&1; then \
+		docker build -f deploy/Dockerfile -t aegis:ci . && docker run --rm aegis:ci aegis tools; \
+	else \
+		echo "  пропущено: нет docker"; \
+	fi
 
 check: ## полный офлайн-контур качества (то, что требует CI)
 	$(MAKE) lint
