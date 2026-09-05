@@ -50,6 +50,8 @@ OTLP_TRACES_PATH = "/api/public/otel/v1/traces"
 INGESTION_VERSION_HEADER = "x-langfuse-ingestion-version"
 #: потолок одного запроса: Langfuse режет тела больше ~3.5-4.5 МБ, мы держимся заметно ниже
 MAX_REQUEST_BYTES = 2_000_000
+#: вес конверта OTLP (`resourceSpans`/`scopeSpans`): сотни байт, учитываем грубо и с запасом
+_ENVELOPE_BYTES = 512
 #: сколько символов input/output уезжает наружу; журнал хранит полное содержимое
 DEFAULT_MAX_CHARS = 6_000
 
@@ -441,14 +443,18 @@ def _batches(traces: Sequence[Sequence[dict[str, Any]]]) -> list[list[list[dict[
     """
     out: list[list[list[dict[str, Any]]]] = []
     current: list[list[dict[str, Any]]] = []
+    size = _ENVELOPE_BYTES
     for trace in traces:
-        candidate = current + [list(trace)]
-        size = len(orjson.dumps(to_otlp(candidate)))
-        if current and size > MAX_REQUEST_BYTES:
+        # размер считаем один раз на трейс: пересобирать всё накопленное на каждой итерации —
+        # квадратичная работа на окне в несколько сотен ходов, ровно там, где экспорт и включают
+        payload = list(trace)
+        weight = len(orjson.dumps(payload))
+        if current and size + weight > MAX_REQUEST_BYTES:
             out.append(current)
-            current = [list(trace)]
+            current, size = [payload], _ENVELOPE_BYTES + weight
         else:
-            current = candidate
+            current.append(payload)
+            size += weight
     if current:
         out.append(current)
     return out
