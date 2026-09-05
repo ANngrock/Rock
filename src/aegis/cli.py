@@ -114,6 +114,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="показать, что ушло бы, — не публикуя и не трогая счётчики",
     )
+    export = sub.add_parser("export", help="выгрузить журнал решений во внешнюю витрину")
+    export_actions = export.add_subparsers(dest="export_action", required=True)
+    lf = export_actions.add_parser("langfuse", help="отправить окно журнала в Langfuse (OTLP/HTTP)")
+    lf.add_argument("--limit", type=int, default=None, help="сколько записей журнала за прогон")
+    lf.add_argument(
+        "--since", default=None, help="ISO-дата начала окна (по умолчанию: LANGFUSE_WINDOW_HOURS)"
+    )
+    lf.add_argument("--trace", default=None, help="выгрузить один ход по trace_id")
+    lf.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="собрать и посчитать, но ничего не отправлять; ключи при этом не нужны",
+    )
     return parser
 
 
@@ -214,6 +227,41 @@ async def _notes_index_report(cfg: Any) -> dict[str, Any]:
     out["hint"] = (
         "поиску это не мешает (он уходит в text-match); индексация: aegis index notes "
         "или aegis-index.timer"
+    )
+    return out
+
+
+async def _langfuse_report(cfg: Any) -> dict[str, Any]:
+    """Langfuse: настроено ли, и что бы уехало из журнала за окно. Справочная проба."""
+    out: dict[str, Any] = {"ok": True, "enabled": bool(cfg.langfuse_enabled)}
+    if not cfg.langfuse_enabled:
+        out["note"] = "выключен: журнал остаётся источником истины, терять нечего"
+        return out
+    from aegis.governance.langfuse import ExportUnavailable, LangfuseTarget
+
+    try:
+        target = LangfuseTarget.from_settings(cfg)
+    except ExportUnavailable as exc:
+        out["ok"] = False
+        out["error"] = str(exc)[:200]
+        out["hint"] = "нужны LANGFUSE_HOST и пара ключей проекта"
+        return out
+    out["host"] = target.describe()
+    try:
+        rows = await _scalar(
+            "SELECT count(*) FROM governance.decision_records "
+            "WHERE created_at >= now() - make_interval(hours => :hours)",
+            hours=int(cfg.langfuse_window_hours),
+        )
+    except Exception as exc:  # noqa: BLE001 - состояние БД уже показывает проба postgres
+        out["note"] = f"журнал не прочитан: {type(exc).__name__}"
+        return out
+    out["records"] = int(rows or 0)
+    out["window_h"] = int(cfg.langfuse_window_hours)
+    out["note"] = (
+        "готово к выгрузке: aegis export langfuse"
+        if out["records"]
+        else "в окне записей нет: выгружать нечего"
     )
     return out
 
@@ -514,6 +562,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["reminders"] = await _reminders_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
+        report["checks"]["langfuse"] = await _langfuse_report(cfg)
 
         try:
             if cfg.kv_backend == "memory":
@@ -733,6 +782,82 @@ async def _cmd_index(action: str, args: argparse.Namespace) -> int:
     print(report.summary())
     # ненулевой выход нужен systemd: «провайдер лёг, ничего не проиндексировано» и «всё чисто»
     # должны различаться в `systemctl status`, а не в чтении логов
+    return 0 if report.ok else 1
+
+
+async def _cmd_export(action: str, args: argparse.Namespace) -> int:
+    """Выгрузка журнала в Langfuse. Коды возврата — те же, что у `outbox tick`."""
+    if action != "langfuse":
+        return 2
+    from aegis.governance.langfuse import (
+        ExportFailed,
+        ExportUnavailable,
+        LangfuseTarget,
+        collect,
+        export_window,
+    )
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+
+    since = None
+    if args.since:
+        from datetime import datetime
+
+        try:
+            since = datetime.fromisoformat(str(args.since))
+        except ValueError:
+            print(f"! --since не читается как ISO-дата: {args.since!r}", file=sys.stderr)
+            return 2
+
+    if args.dry_run:
+        # проба не требует ключей: «сколько накопилось» хотят узнать до того, как заведут витрину
+        try:
+            traces = await collect(
+                since=since,
+                limit=args.limit or cfg.langfuse_limit,
+                trace_id=args.trace or "",
+                max_chars=int(cfg.langfuse_max_chars),
+            )
+        except Exception as exc:  # noqa: BLE001 - без стека в выводе команды
+            print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+            return 1
+        spans = sum(len(trace) for trace in traces)
+        print(
+            f"к выгрузке — записей: {spans - len(traces)}, ходов: {len(traces)} · "
+            f"витрина: {cfg.langfuse_host or 'не задана'} · ничего не отправлено"
+        )
+        return 0
+
+    try:
+        target = LangfuseTarget.from_settings(cfg)
+    except ExportUnavailable as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    try:
+        report = await export_window(
+            target=target,
+            cfg=cfg,
+            since=since,
+            limit=args.limit,
+            trace_id=args.trace or "",
+        )
+    except ExportUnavailable as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except ExportFailed as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - команда не должна ронять стек на пользователя
+        print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
+    print(report.summary())
+    if report.stopped:
+        print(f"  !! {report.stopped}", file=sys.stderr)
     return 0 if report.ok else 1
 
 
@@ -980,6 +1105,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_index(args.index_action, args))
         if args.command == "outbox":
             return asyncio.run(_cmd_outbox(args.outbox_action, args))
+        if args.command == "export":
+            return asyncio.run(_cmd_export(args.export_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

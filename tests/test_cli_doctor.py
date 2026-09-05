@@ -201,6 +201,7 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_reminders_report", ok)
     monkeypatch.setattr(cli, "_notes_index_report", ok)
     monkeypatch.setattr(cli, "_outbox_report", ok)
+    monkeypatch.setattr(cli, "_langfuse_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(report["checks"]) == {
@@ -209,6 +210,7 @@ async def test_quick_skips_every_live_probe(
         "reminders",
         "notes_index",
         "outbox",
+        "langfuse",
     }, report["checks"]
     assert report["checks"]["redis"]["backend"] == "memory"
 
@@ -389,6 +391,78 @@ async def test_outbox_probe_calls_out_exhausted_attempts(monkeypatch: pytest.Mon
     report = await cli._outbox_report(cfg)
     assert report["stuck"] == 5
     assert "aegis outbox tick" in report["hint"] and "attempts = 0" in report["hint"]
+
+
+async def test_langfuse_probe_stays_quiet_while_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Выключенный экспорт — не болезнь: журнал на месте, терять при витрине нечего."""
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+
+    async def forbidden(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        raise AssertionError("выключенный экспорт не имеет права ходить в базу")
+
+    monkeypatch.setattr(cli, "_scalar", forbidden)
+    report = await cli._langfuse_report(cfg)
+    assert set(report) == {"ok", "enabled", "note"}, "выключенная проба не должна ничего читать"
+    assert report["ok"] is True and report["enabled"] is False
+    assert "выключен" in report["note"]
+
+
+async def test_langfuse_probe_counts_the_window_and_asks_for_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        langfuse_enabled=True,
+        langfuse_host="http://langfuse:3000",
+        langfuse_public_key="pk",
+        langfuse_secret_key="sk",
+    )
+    monkeypatch.setattr(cli, "_scalar", _FakeSession({"decision_records": 12}))
+    report = await cli._langfuse_report(cfg)
+    assert report["ok"] is True and report["records"] == 12 and report["window_h"] == 24
+    assert "aegis export langfuse" in report["note"]
+
+    monkeypatch.setattr(cfg, "langfuse_public_key", "")
+    half = await cli._langfuse_report(cfg)
+    assert half["ok"] is False and "PUBLIC_KEY" in half["error"] and "ключей" in half["hint"]
+
+
+async def test_langfuse_probe_survives_a_dead_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Битую базу уже показывает проба postgres: дублировать её отказ в langfuse — значит учить
+    владельца считать, сколько раз ему пожаловались на одну и ту же причину.
+    """
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        _env_prefix="T_",
+        glm_api_key="k",
+        langfuse_enabled=True,
+        langfuse_host="http://langfuse:3000",
+        langfuse_public_key="pk",
+        langfuse_secret_key="sk",
+    )
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(cli, "_scalar", broken)
+    report = await cli._langfuse_report(cfg)
+    assert report["ok"] is True and "не прочитан" in report["note"]
+    assert "langfuse:3000" in report["host"]
 
 
 async def test_outbox_probe_survives_missing_table_and_dead_db(

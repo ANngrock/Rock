@@ -79,7 +79,7 @@ aegis/
 | Шаг | Содержание | Статус |
 |---|---|---|
 | 1. Фундамент | репозиторий, Docker, Postgres+pgvector, Redis, NATS, Temporal, SearXNG; config; event store+outbox; Model Gateway (GLM + fallback + retry + cost + DLP + запись вызовов); tool registry; policy engine; supervisor v1 с tier-роутингом и подтверждениями; Telegram bot с whitelist; память фактов, заметки, web search/fetch, vision-инструмент; миграции; тесты; CI | **сделан, ожидает запуска у владельца** |
-| 2. Ядро агента 2.0 | Temporal workflow сессии, Verifier, dual-LLM для untrusted, стриминг, STT (faster-whisper), напоминания (scheduler), Langfuse, golden datasets v1 (live-режим) | **Verifier + dual-LLM карантин, напоминания, стриминг ответов, индексация эмбеддингов заметок, outbox-relay в NATS и golden datasets v2 сделаны** (ADR-0009…ADR-0013); Temporal, Langfuse и STT (faster-whisper) — ждут |
+| 2. Ядро агента 2.0 | Temporal workflow сессии, Verifier, dual-LLM для untrusted, стриминг, STT (faster-whisper), напоминания (scheduler), Langfuse, golden datasets v1 (live-режим) | **Verifier + dual-LLM карантин, напоминания, стриминг ответов, индексация эмбеддингов заметок, outbox-relay в NATS, golden datasets v2 и экспорт журнала в Langfuse (OTLP) сделаны** (ADR-0009…ADR-0014); Temporal и STT (faster-whisper) — ждут |
 | 3. Finance | ledger двойной записи, счета/валюты, ввод текст/голос, категории+правила, бюджеты, семантический слой метрик, дайджесты, property-тесты | ожидает |
 | 4. Vision 2.0 | чеки/QR ФНС, документы, скриншоты→задачи, ingest в Knowledge, карантинная модель | ожидает |
 | 5. Planning | задачи/календарь, CP-SAT план дня, брифинги, привычки | ожидает |
@@ -107,6 +107,7 @@ aegis/
 | [0011](ADR/0011-streaming-replies.md) | стриминг — транспорт, а не второй путь: `chat_stream` отдаёт тот же `ChatResult`; обрыв после первого куска = неполный ответ, а не повторный запрос; в Telegram итог дописывается в то же сообщение |
 | [0012](ADR/0012-note-embedding-indexing.md) | эмбеддинги заметок строит фоновый проход (`aegis index notes` + таймер), а не путь записи; отказ провайдера оставляет очередь и не делает бота больным; расхождение «N векторов на M текстов» — пакет не пишется |
 | [0013](ADR/0013-outbox-relay.md) | «опубликовано» = ack JetStream, а не отправка: at-least-once с `FOR UPDATE` на время вызова, попытка = один тик, исчерпанные попытки остаются в таблице; исполняет systemd-таймер, стрим создаёт владелец |
+| [0014](ADR/0014-langfuse-over-otlp.md) | Витрина над журналом, а не второй журнал: OTLP вместо устаревшего ingestion-API, детерминированные id вместо курсора прогресса, отказ витрины не касается пути пользователя |
 
 ## 7. Что явно не делаем
 

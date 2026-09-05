@@ -104,6 +104,21 @@ class Settings(BaseSettings):
     #: префикс субъектов: `<prefix>.<stream_type>.<stream_id>.<event_type>`
     nats_subject_prefix: str = "aegis"
     nats_connect_timeout_s: float = Field(default=3.0, ge=0.5, le=30.0)
+
+    # --- Экспорт журнала в Langfuse (OTLP/HTTP): витрина над журналом, а не второй журнал ---
+    #: выключено по умолчанию: наблюдение не обязательно для работы бота, а ключи уезжают наружу
+    langfuse_enabled: bool = False
+    #: базовый адрес без пути: https://cloud.langfuse.com или http://langfuse:3000
+    langfuse_host: str = ""
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_timeout_s: float = Field(default=10.0, ge=0.5, le=120.0)
+    #: символов input/output в спане: журнал хранит полное содержимое, витрина — нет
+    langfuse_max_chars: int = Field(default=6_000, ge=500, le=100_000)
+    #: окно перечитывания: повтор безопасен (id выводятся из записей), поэтому берём с запасом
+    langfuse_window_hours: int = Field(default=24, ge=1, le=24 * 31)
+    #: записей журнала за один прогон
+    langfuse_limit: int = Field(default=500, ge=1, le=5_000)
     searxng_url: str = "http://localhost:8888"
     searxng_timeout_s: float = Field(default=20.0, ge=1.0, le=120.0)
     fetch_timeout_s: float = Field(default=25.0, ge=1.0, le=120.0)

@@ -1,0 +1,21 @@
+[Unit]
+Description=aegis: выгрузить окно журнала решений в Langfuse (шаг 2)
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь под свой клон; WorkingDir нужен, чтобы compose нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+EnvironmentFile=-/srv/aegis/.env
+# экспорт идемпотентен: id трейсов и спанов выводятся из строк журнала, а не из случайности,
+# поэтому перечитать то же окно — значит перезаписать наблюдения, а не задублировать их.
+# Состояния «что уже отправлено» нет намеренно: его потеря выглядела бы как дыра в наблюдении.
+ExecStart=/usr/bin/docker compose -f /srv/aegis/deploy/docker-compose.yml run --rm bot aegis export langfuse
+# если docker недоступен (машина без контейнеров), тот же шаг локальным окружением:
+# ExecStart=/srv/aegis/.venv/bin/aegis export langfuse
+TimeoutStartSec=300
+Nice=15
+
+[Install]
+WantedBy=multi-user.target

@@ -52,6 +52,22 @@ def test_reminder_timer_fires_more_often_than_a_day() -> None:
     assert "--dry-run" not in service, "таймер не должен работать вхолостую"
 
 
+def test_export_timer_is_idempotent_by_contract() -> None:
+    """Юнит выгрузки обязан допускать повтор: состояния «что отправлено» у нас нет и не будет.
+
+    Поэтому в тексте юнита проверяется не только вызов `aegis export langfuse`, но и то, что никто
+    не попытался приписать флагу `--dry-run` роль «отправить на самом деле» и что у прогона есть
+    потолок по времени (Langfuse может отвечать медленно, а висеть юниту незачем).
+    """
+    timer = (DEPLOY / "systemd" / "aegis-export.timer").read_text(encoding="utf-8")
+    service = (DEPLOY / "systemd" / "aegis-export.service").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:07/30:00" in timer
+    assert "Persistent=true" in timer, "пропущенный тик догоняется, а не превращается в дыру"
+    assert "aegis export langfuse" in service
+    assert "--dry-run" not in service
+    assert "TimeoutStartSec=" in service
+
+
 def test_outbox_timer_publishes_and_reports_stuck_rows() -> None:
     """Тик relay'я обязан «гореть» красным, когда попытки исчерпаны: очередь — это не норма.
 

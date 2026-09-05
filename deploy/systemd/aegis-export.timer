@@ -1,0 +1,15 @@
+[Unit]
+Description=aegis: каждые полчаса выгружать окно журнала в Langfuse
+
+[Timer]
+# :07 и :37 — не в одну минуту с outbox/reminders (*:00/5) и не в час пик бэкапа (03:40):
+# все эти юниты поднимают `docker compose run`, и выстраивать их в очередь за одним стартом
+# незачем. Окно перечитывается с запасом (LANGFUSE_WINDOW_HOURS=24), поэтому пропущенный тик
+# не означает дыру: следующий донесёт.
+OnCalendar=*-*-* *:07/30:00
+AccuracySec=1min
+Persistent=true
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target
