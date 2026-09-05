@@ -12,5 +12,5 @@
 {"case":"hash:turn_summary","kind":"hash","value":"50884c9989c14c0e50c05b6b2e53d49e89aca189943b7d137bcd49f88be5b9f5"}
 {"case":"merkle:day","kind":"hash","value":"15b7c3979cd9356c68e5ee1d39697a6fb8b501aa3606fea6c89d8230332005c1"}
 {"case":"merkle:empty-day","kind":"hash","value":"5b3139728bd1a159d632b04050dedc16e2259feb1a0f0b4bd2c4d045ff426d59"}
-{"case":"prompt:repro/judge","kind":"prompt","value":"565f325f7cd7c78507bbde76844c219a54a7cc416485fbd8565e66ac0f8975fa","version":"1.0"}
+{"case":"prompt:repro/judge","kind":"prompt","value":"041959655213c37e38dd5683c06cd483d5ae96fcc3b18970f24b8d5596a72152","version":"1.1"}
 {"case":"prompts:index","kind":"list","value":"repro/judge"}

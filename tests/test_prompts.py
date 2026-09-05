@@ -44,6 +44,37 @@ def test_package_prompt_loads_and_is_described(
     assert len(prompt.sha256) == 64
 
 
+def test_judge_prompt_cannot_demand_what_replay_never_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Версия 1.0 требовала «одинаковый набор вызванных инструментов».
+
+    Replay не исполняет инструменты повторно: их записанные результаты уже в контексте, поэтому
+    такой критерий означал бы «не эквивалентно» на любом ходе — вау-эффект от `/replay` сменился бы
+    вечным красным флагом. Правки в критерии сравнения живут в файле промпта (и его версии), а не в
+    коде судьи, — иначе «что именно считалось эквивалентным» нельзя было бы восстановить по журналу.
+    """
+    monkeypatch.delenv("AEGIS_PROMPTS_DIR", raising=False)
+    text = load("repro/judge").text
+    assert "набор вызванных инструментов" not in text
+    assert "НЕ перевыполняет" in text
+    assert "сравнивай только тексты" in text
+
+
+def test_old_prompt_version_resolves_by_the_sha_in_the_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ход записан с `sha256` промпта v1.0 — значит, v1.0 обязана оставаться загружаемой."""
+    monkeypatch.delenv("AEGIS_PROMPTS_DIR", raising=False)
+    versions = index()["repro/judge"]
+    assert versions == ["1.0", "1.1"]
+    old = load("repro/judge", version=versions[0])
+    current = load("repro/judge")
+    assert old.sha256 != current.sha256
+    with pytest.raises(PromptNotFound, match="версии 9.9 промпта 'repro/judge' нет"):
+        load("repro/judge", version="9.9")
+
+
 def test_env_override_switches_the_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write(tmp_path / "x", "y.v1.0.md", "---\nid: x/y\n---\nТело\n")
     monkeypatch.setenv("AEGIS_PROMPTS_DIR", str(tmp_path))
