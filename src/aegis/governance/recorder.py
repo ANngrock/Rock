@@ -81,7 +81,7 @@ _HASHED_FIELDS: tuple[str, ...] = (
     "prev_hash",
 )
 
-RecordKind = Literal["llm_call", "tool_run", "policy", "turn_summary"]
+RecordKind = Literal["llm_call", "tool_run", "policy", "turn_summary", "verdict"]
 
 #: Сколько незакрытых ходов держим в памяти для корреляции «вызов модели ↔ шаг хода». Личный бот
 #: столько не открывает одновременно, но утечка из-за одного неудачного `finally` была бы хуже.
@@ -275,6 +275,23 @@ class DecisionRecorder(Protocol):
         risk: str = "",
     ) -> None: ...
 
+    async def verdict(
+        self,
+        *,
+        trace_id: str,
+        turn_no: int,
+        owner_id: int,
+        ok: bool,
+        severity: str = "none",
+        checked: Sequence[str] = (),
+        problems: Sequence[str] = (),
+        model: str | None = None,
+        cost_usd: float = 0.0,
+        latency_ms: int = 0,
+        prompt_ids: Sequence[Mapping[str, Any]] = (),
+        payload: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
     async def turn_summary(
         self,
         *,
@@ -336,6 +353,9 @@ class NullDecisionRecorder:
         return None
 
     async def policy(self, **kwargs: Any) -> None:
+        return None
+
+    async def verdict(self, *args: Any, **kwargs: Any) -> None:
         return None
 
     async def turn_summary(self, **kwargs: Any) -> None:
@@ -587,6 +607,58 @@ class SqlDecisionRecorder:
                 "note": None,
             }
         )
+
+    async def verdict(
+        self,
+        *,
+        trace_id: str,
+        turn_no: int,
+        owner_id: int,
+        ok: bool,
+        severity: str = "none",
+        checked: Sequence[str] = (),
+        problems: Sequence[str] = (),
+        model: str | None = None,
+        cost_usd: float = 0.0,
+        latency_ms: int = 0,
+        prompt_ids: Sequence[Mapping[str, Any]] = (),
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Вердикт верификатора — отдельной записью, а не припиской к чужой.
+
+        «Проверено и сошлось» и «проверять было нечем» обязаны различаться одним запросом: иначе
+        через полгода журнал не скажет, был ли у ответа шанс оказаться выдумкой. Что именно сверяли
+        (вопрос, ответ, источники) уходит в блоб, поэтому запись читается по факту, а не только по
+        хэшу. Колонка ``policy`` держит итог: ``ok`` — отвечаем как есть, ``flagged`` —
+        предупреждаем владельца.
+        """
+        if not _is_uuid(trace_id):
+            return
+        record: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "trace_id": trace_id,
+            "turn_no": int(turn_no),
+            "kind": "verdict",
+            "owner_id": int(owner_id),
+            # промпт судьи — здесь: «чем мерили» относится к записи так же, как «чем вооружён ход»
+            "prompt_ids": [dict(item) for item in prompt_ids],
+            "tools_schema_sha": None,
+            "model": model,
+            "params": {"severity": severity, "checked": [c[:120] for c in checked[:12]]},
+            "policy": {
+                "decision": "ok" if ok else "flagged",
+                "reason": "; ".join(item[:200] for item in problems[:6])[:600] or "расхождений нет",
+            },
+            "cost_usd": _money(cost_usd),
+            "latency_ms": int(latency_ms),
+            "truncated": False,
+            "note": None,
+        }
+        if payload is not None:
+            blob = await self.blobs.put(dict(payload))
+            record["input_sha"] = blob.sha256
+            record["truncated"] = blob.truncated
+        await self._append(record)
 
     async def turn_summary(
         self,

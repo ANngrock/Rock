@@ -44,11 +44,19 @@ from aegis.platform.gateway.dlp import DLP  # noqa: E402
 class FakeGateway:
     """Заглушка ModelGateway: скрипт ответов + тот же CostGovernor/DLP, что в проде."""
 
-    def __init__(self, responses: list[ChatResult | Exception], cost: CostGovernor) -> None:
+    def __init__(
+        self,
+        responses: list[ChatResult | Exception],
+        cost: CostGovernor,
+        *,
+        judgements: list[Any] | None = None,
+    ) -> None:
         self._responses = list(responses)
+        self.judgements: list[Any] = list(judgements or [])
         self.cost = cost
         self.dlp = DLP()
         self.calls: list[dict[str, Any]] = []
+        self.json_calls: list[dict[str, Any]] = []
         self.embed_calls = 0
         self.auth_hint_text = ""
 
@@ -71,6 +79,25 @@ class FakeGateway:
         if isinstance(item, Exception):
             raise item
         return item
+
+    async def chat_json(
+        self, role: str, messages: list[dict[str, Any]], schema: Any, **kwargs: Any
+    ) -> Any:
+        """Structured-вызовы (судья сверки, карантинный разборщик) — со своим скриптом.
+
+        Отдельный скрипт, а не общий с ``chat``: иначе тест сверки съедал бы ответ, назначенный
+        мозгу, и падал на пустом скрипте — ровно тот класс ложных падений, из-за которого двойников
+        начинают обходить настоящими сетевыми вызовами.
+        """
+        self.json_calls.append(
+            {"role": role, "messages": messages, "schema": schema.__name__, **kwargs}
+        )
+        if not self.judgements:
+            raise AssertionError("FakeGateway: нет скрипта structured-ответов")
+        item = self.judgements.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item if isinstance(item, schema) else schema.model_validate(item)
 
     async def embed(self, texts: list[str], *, trace_id: str | None = None) -> list[list[float]]:
         self.embed_calls += 1

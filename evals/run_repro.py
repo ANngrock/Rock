@@ -95,6 +95,19 @@ def _records() -> list[dict[str, Any]]:
             },
         ),
         (
+            "verdict_flagged",
+            {
+                "kind": "verdict",
+                "params": {"severity": "critical", "checked": ["43.18", "03.09.2026"]},
+                "policy": {
+                    "decision": "flagged",
+                    "reason": "в ответе есть «99», чего нет в источниках",
+                },
+                "prompt_ids": [{"id": "verify/judge", "version": "1.0", "sha256": "b" * 64}],
+                "cost_usd": "0.000000",
+            },
+        ),
+        (
             "turn_summary",
             {
                 "kind": "turn_summary",

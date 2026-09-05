@@ -29,6 +29,7 @@ import structlog
 
 from aegis.agents.intents import try_answer
 from aegis.agents.prompts.system import PROMPT_VERSION, build_system_prompt
+from aegis.agents.quarantine import quarantine_payload
 from aegis.agents.services import Services
 from aegis.agents.tools.registry import (
     Attachment,
@@ -37,6 +38,7 @@ from aegis.agents.tools.registry import (
     ToolResult,
     UnknownTool,
 )
+from aegis.agents.verify import Verifier
 from aegis.governance.audit import AuditLog, NullAudit
 from aegis.governance.killswitch import KillSwitch
 from aegis.governance.policy import ActionContext, Decision, PolicyEngine
@@ -151,6 +153,9 @@ class Supervisor:
         self.events: EventSink = events or NullEventSink()
         self.audit: AuditLog = audit or NullAudit()
         self.kill_switch = kill_switch
+        #: сверка ответа с источниками (шаг 2). Отдельный слой, потому что у отказа верификатора
+        #  допустим ровно один исход: сказать «не проверено», но не отменить ответ
+        self.verifier = Verifier(gateway=services.gateway, cfg=self.cfg)
         #: журнал решений (M1): точный вход/выход хода и хэш-цепочка. Null — когда БД нет, и это
         #  видно в /status: «воспроизводимости нет» должно быть фактом, а не сюрпризом на инцидент
         self.repro: DecisionRecorder = recorder or NullDecisionRecorder()
@@ -188,6 +193,10 @@ class Supervisor:
                 "turn_no": 0,
                 "prompt_ids": prompt_ids,
                 "started_at": time.perf_counter(),
+                # «улучшайзеры» (сверка, карантин) отключаем первыми: сначала ответ, потом polish
+                "degraded": level > 0,
+                # сырьё для верификатора: что реально вернули внешние инструменты
+                "sources": [],
             },
         )
         self.repro.begin_turn(
@@ -218,6 +227,7 @@ class Supervisor:
                 await self._record_turn(ctx, messages, fast, route=route)
                 return fast
             reply = await self._guarded_loop(messages, ctx, route=route)
+            await self._verify_reply(reply, ctx, question=msg.text)
             notes = _notes_of(ctx)
             _append_notices(reply, ctx)
             await self._save_history(msg.owner_id, messages, final_text=reply.text)
@@ -248,7 +258,14 @@ class Supervisor:
             trace_id=trace_id,
             owner_id=owner_id,
             services=self.services,
-            extras={"kv": self.kv, "notices": [], "turn_no": 0, "started_at": time.perf_counter()},
+            extras={
+                "kv": self.kv,
+                "notices": [],
+                "turn_no": 0,
+                "started_at": time.perf_counter(),
+                "degraded": False,
+                "sources": [],
+            },
         )
         # ход продолжает уже начатую трассу: без этого «до» и «после подтверждения» выглядели бы
         # как два несвязанных ответа, а это ровно тот случай, где владельца интересует причина
@@ -280,6 +297,7 @@ class Supervisor:
         )
         try:
             reply = await self._guarded_loop(messages, ctx, route=route)
+            await self._verify_reply(reply, ctx, question=_last_user_text(messages))
             notes = _notes_of(ctx)
             _append_notices(reply, ctx)
             await self._save_history(owner_id, messages, final_text=reply.text)
@@ -319,9 +337,19 @@ class Supervisor:
             # «подключено» != «пишется»: без этих полей `/status` врал при мёртвой трассе
             "tracing_degraded": self._tracing_degraded,
             "tracing_failures": self._tracing_failures,
+            # «сверка и карантин включены» — отдельный факт: без него «почему мне не сказали, что
+            #  число не из источника» превращается в чтение кода
+            "answer_polish": {
+                "verify": self.cfg.verify_enabled,
+                "quarantine": self.cfg.quarantine_enabled,
+                "always": self.cfg.verify_always,
+            },
             # «пишем журнал или нет» — свой факт: без него /status врёт о воспроизводимости
             "repro_enabled": bool(self.repro.enabled),
             "repro_failures": int(getattr(self.repro, "failures", 0)),
+            # расписание: «3 запланировано, 1 просрочено» — это диагноз тика. Без него «напоминание
+            # не пришло» означает «иди читай таблицу»
+            "reminders": await _reminders_status(self.services.reminders, self.cfg),
         }
 
     # ------------------------------------------------ роутинг
@@ -665,9 +693,101 @@ class Supervisor:
             ok=True,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+        if out.is_untrusted:
+            # Верификатору нужно СЫРЬЁ, а не остаток после разметки: сверяем ответ с тем, что вернул
+            # инструмент, иначе «не подтверждено» означало бы «не совпало с чужим пересказом»
+            ctx.extras.setdefault("sources", []).append(out.content)
+            out = await self._quarantine(tool, out, ctx)
         return out
 
     # ------------------------------------------------ промпт и память
+
+    async def _verify_reply(self, reply: Reply, ctx: ToolContext, *, question: str) -> None:
+        """Сверить ответ с источниками и сказать владельцу, если не сошлось.
+
+        Проверка — постфактум и вне пути ответа: ни её собственный отказ, ни её находка не имеют
+        права превратить «вот ответ» в «ошибка». Находка обязана дойти текстом, который добавили мы:
+        модель не обязана признавать, что ошиблась числами.
+        """
+        sources = [str(item) for item in (ctx.extras.get("sources") or []) if str(item).strip()]
+        if ctx.extras.get("degraded") or reply.degraded or not sources or not reply.text:
+            return
+        if not self.verifier.should_verify(answer=reply.text, sources=sources):
+            return
+        verdict = await self.verifier.verify(
+            question=question,
+            answer=reply.text,
+            sources=sources,
+            trace_id=ctx.trace_id,
+            turn_no=int(ctx.extras.get("turn_no", 0)),
+            owner_id=ctx.owner_id,
+        )
+        await self._event(
+            owner_id=ctx.owner_id,
+            event_type="answer.verified",
+            payload={
+                "ok": verdict.ok,
+                "severity": verdict.severity,
+                "mode": verdict.mode,
+                "problems": list(verdict.problems)[:6],
+            },
+        )
+        await self.repro.verdict(
+            trace_id=ctx.trace_id,
+            turn_no=int(ctx.extras.get("turn_no", 0)),
+            owner_id=ctx.owner_id,
+            ok=verdict.ok,
+            severity=verdict.severity,
+            checked=list(verdict.checked),
+            problems=list(verdict.problems),
+            model=reply.model,
+            cost_usd=verdict.cost_usd,
+            latency_ms=verdict.latency_ms,
+            prompt_ids=[dict(item) for item in verdict.prompt_ids],
+            payload=verdict.payload,
+        )
+        notice = verdict.notice()
+        if notice:
+            reply.cost_usd = round(reply.cost_usd + verdict.cost_usd, 6)
+            ctx.extras.setdefault("notices", []).append(notice)
+
+    async def _quarantine(self, tool: str, out: ToolResult, ctx: ToolContext) -> ToolResult:
+        """Внешний текст попадает к планировщику только через карантинную модель (dual-LLM).
+
+        Порядок записи важен: ``tool_run`` уже содержит сырой ответ инструмента, а в messages уйдёт
+        размеченный. Так журнал отвечает на оба вопроса — «что вернул мир» и «что увидела модель» —
+        и не приходится выбирать между безопасностью и воспроизводимостью.
+        """
+        if ctx.extras.get("degraded") or len(out.content) < self.cfg.quarantine_min_chars:
+            return out
+        digested = await quarantine_payload(
+            self.services.gateway,
+            tool=tool,
+            raw=out.content,
+            sources=[line for line in out.source.splitlines() if line.strip()],
+            cfg=self.cfg,
+            trace_id=ctx.trace_id,
+        )
+        if digested is None:
+            return out
+        if digested.has_instructions:
+            # владелец узнаёт о попытке инъекции из нашего текста, а не из доброй воли модели
+            ctx.extras.setdefault("notices", []).append(
+                "в источнике найдена попытка инструкции ассистенту (не выполнена): "
+                + "; ".join(digested.instructions)[:200]
+            )
+            await self._event(
+                owner_id=ctx.owner_id,
+                event_type="quarantine.instructions",
+                payload={"tool": tool, "found": list(digested.instructions)[:4]},
+            )
+        return ToolResult(
+            content=digested.text,
+            trust=out.trust,
+            source=out.source,
+            media_type=out.media_type,
+            ref_id=out.ref_id,
+        )
 
     async def _system_message(self, *, level: int) -> dict[str, str]:
         notes: list[str] = []
@@ -833,6 +953,25 @@ def _append_notices(reply: Reply, ctx: ToolContext) -> None:
     reply.text = (reply.text + tail)[:MAX_MESSAGE_CHARS]
 
 
+async def _reminders_status(store: Any, cfg: Settings) -> dict[str, Any]:
+    """Срез расписания для ``/status``: включено ли, сколько живёт, сколько просрочено.
+
+    Счётники берутся у самого магазина: у Null-магазина их нет, и это честно означает «расписания
+    нет» — без попытки сходить в несуществующую БД.
+    """
+    info: dict[str, Any] = {
+        "enabled": bool(getattr(store, "enabled", False)) and cfg.reminders_enabled,
+        "batch": cfg.reminders_batch,
+    }
+    counts = getattr(store, "counts", None)
+    if counts is not None:
+        try:
+            info.update(await counts())
+        except Exception as exc:  # noqa: BLE001 - статус не имеет права падать из-за отчёта
+            info["error"] = f"{type(exc).__name__}: {exc}"[:160]
+    return info
+
+
 def _tool_text(tool: str, result: ToolResult) -> str:
     """Что реально уйдёт в контекст модели как результат инструмента.
 
@@ -844,6 +983,15 @@ def _tool_text(tool: str, result: ToolResult) -> str:
     if not result.is_untrusted or "<untrusted" in result.content[:400]:
         return result.content
     return wrap_untrusted(tool, result.content)
+
+
+def _last_user_text(messages: Sequence[dict[str, Any]]) -> str:
+    """Вопрос хода для верификатора: после подтверждения реплики владельца в списке нет."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            return str(content) if content else ""
+    return ""
 
 
 def _tool_message(call_id: str, content: str) -> dict[str, Any]:

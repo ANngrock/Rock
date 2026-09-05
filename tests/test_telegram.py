@@ -143,6 +143,50 @@ def test_trace_label_needs_more_than_an_open_port() -> None:
     assert _trace_label(SimpleNamespace(db_ready=False), ok) == "БД не настроена — только память"
 
 
+def test_status_keeps_journal_and_polish_apart() -> None:
+    """Три обещания — три строки: журнал пишется, ответ сверяется, чужое размечается.
+
+    Все три могут быть включены по-разному, и «всё хорошо» из одной строки не следует из другой:
+    ровно так же, как «аудит пишется» ≠ «ход воспроизводим».
+    """
+    from aegis.interaction.telegram.bot import _polish_line, _repro_line
+
+    full = {
+        "repro_enabled": True,
+        "repro_failures": 0,
+        "answer_polish": {"verify": True, "quarantine": True, "always": True},
+    }
+    off = {
+        "repro_enabled": True,
+        "repro_failures": 0,
+        "answer_polish": {"verify": False, "quarantine": False, "always": False},
+    }
+    assert "ведётся" in _repro_line(full)
+    assert "сверка с источниками вкл" in _polish_line(full)
+    assert "карантин внешнего текста вкл" in _polish_line(full)
+    assert "не проверяются" in _polish_line(off)
+    assert "карантин внешнего текста выкл" in _polish_line(off)
+    assert _polish_line({}) != _repro_line({})
+
+
+def test_status_reminders_line_names_the_reason_for_silence() -> None:
+    """«Напоминание не пришло» — это три разных диагноза: выключено, нет БД, тик не догнал."""
+    from aegis.interaction.telegram.bot import _reminders_line
+
+    assert "некуда сохранять" in _reminders_line({})
+    assert "некуда сохранять" in _reminders_line({"reminders": {"enabled": False, "batch": 20}})
+    quiet = _reminders_line(
+        {"reminders": {"enabled": True, "scheduled": 2, "overdue": 0, "batch": 20}}
+    )
+    assert "2 в расписании" in quiet and "⚠️" not in quiet
+    late = _reminders_line(
+        {"reminders": {"enabled": True, "scheduled": 2, "overdue": 1, "failed": 1, "batch": 5}}
+    )
+    assert "1 пора" in late and "исчерпанными" in late and "тик ≤ 5" in late
+    broken = _reminders_line({"reminders": {"enabled": True, "error": "connection refused"}})
+    assert "счётчик не читается" in broken and "connection refused" in broken
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

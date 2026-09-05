@@ -24,6 +24,7 @@ from aegis.governance.audit import AuditLog, NullAudit, SqlAuditLog
 from aegis.governance.killswitch import KillSwitch
 from aegis.governance.policy import PolicyEngine
 from aegis.governance.recorder import DecisionRecorder, NullDecisionRecorder, SqlDecisionRecorder
+from aegis.planning.reminders import NullReminderStore, ReminderStore, SqlReminderStore
 from aegis.platform.config import Settings, settings
 from aegis.platform.db import get_sessionmaker
 from aegis.platform.events.sink import (
@@ -160,7 +161,10 @@ def build_app(
         SqlDecisionRecorder(cfg) if (db_ready and cfg.repro_enabled) else NullDecisionRecorder()
     )
     gateway = ModelGateway(cfg, cost, recorder=_make_recorder(audit, repro), dlp=DLP())
-    services = Services.build(gateway, repro=repro)
+    # напоминания без БД бессмысленны (тик живёт отдельно от процесса бота), поэтому магазин
+    # подключается ровно тогда же, когда и остальная запись: db_ready — единственный источник истины
+    reminders: ReminderStore = SqlReminderStore() if db_ready else NullReminderStore()
+    services = Services.build(gateway, repro=repro, reminders=reminders)
     policy = PolicyEngine.from_settings(cfg)
     kill_switch = KillSwitch(kv)
     supervisor = Supervisor(

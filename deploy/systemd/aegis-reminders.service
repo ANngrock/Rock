@@ -1,0 +1,22 @@
+[Unit]
+Description=aegis: доставка напоминаний по расписанию (шаг 2)
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь под свой клон; WorkingDir нужен, чтобы compose нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+EnvironmentFile=-/srv/aegis/.env
+# тик идемпотентен по построению: строку забирает из расписания только тот, кто выиграл
+# FOR UPDATE SKIP LOCKED, поэтому два одновременных запуска (или догон после SimpleMissing)
+# не отправят владельцу одно и то же дважды
+ExecStart=/usr/bin/docker compose -f /srv/aegis/deploy/docker-compose.yml run --rm bot aegis remind tick
+# если docker недоступен (машина без контейнеров), тот же шаг локальным окружением:
+# ExecStart=/srv/aegis/.venv/bin/aegis remind tick
+TimeoutStartSec=180
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

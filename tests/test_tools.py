@@ -179,6 +179,43 @@ async def test_explain_decision_falls_back_to_the_last_turn() -> None:
     assert journal.calls == ["latest:1", "records:11111111-1111-1111-1111-111111111111"]
 
 
+async def test_explain_decision_shows_the_verdict_of_the_verifier() -> None:
+    """«Проверили и всё хорошо» и «проверять не стали» обязаны различаться в объяснении хода.
+
+    Строка журнала вида `verdict`, пропущенная рендером, выглядела бы как «ход был без сверки»,
+    и владелец прочитал бы это как отсутствие проблемы.
+    """
+    from aegis.agents.tools import repro as repro_tools
+
+    journal = JournalStub(
+        latest="11111111-1111-1111-1111-111111111111",
+        records=[
+            {
+                "seq": 2,
+                "kind": "verdict",
+                "turn_no": 2,
+                "model": "glm-4.7-flash",
+                "params": {"severity": "critical", "checked": ["43.18", "12345"]},
+                "policy": {
+                    "decision": "flagged",
+                    "reason": "в ответе есть «12345», чего нет в источниках",
+                },
+                "prompt_ids": [{"id": "verify/judge", "version": "1.0"}],
+                "cost_usd": "0.000000",
+                "latency_ms": 40,
+                "input": None,
+                "truncated": False,
+            },
+            {"seq": 3, "kind": "future_kind", "turn_no": 2, "params": {}, "policy": None},
+        ],
+    )
+    out = await repro_tools.explain_decision(repro_tools.ExplainArgs(), ctx(repro=journal))
+    assert "сверка ответа: flagged" in out.content
+    assert "критерий: verify/judge@1.0" in out.content
+    assert "12345" in out.content
+    assert "future_kind" in out.content, "незнакомая запись не имеет права исчезать из объяснения"
+
+
 async def test_explain_decision_refuses_to_guess_between_two_traces() -> None:
     """«Возьмём первый совпавший» означало бы объяснить не тот ход — хуже честного отказа."""
     from aegis.agents.tools import repro as repro_tools

@@ -44,6 +44,22 @@ def test_package_prompt_loads_and_is_described(
     assert len(prompt.sha256) == 64
 
 
+def test_every_prompt_catalog_is_a_package_and_shipped(tmp_path: Path) -> None:
+    """Каталог промптов без `__init__.py` живёт в editable-установке и исчезает из wheel.
+
+    Именно так «в контейнере нет файла судьи» и появляется: тесты на исходниках зелёные, образ —
+    без .md. Проверка дешёвая и ловит класс, а не один случай: каждый каталог с промптами обязан
+    быть пакетом, а package-data — объявлять `**/*.md`.
+    """
+    root = Path(__file__).resolve().parents[1] / "src" / "aegis" / "prompts"
+    markdown = sorted(root.rglob("*.md"))
+    assert markdown, "в пакете нет ни одного промпта — что-то сломалось в путях"
+    for path in markdown:
+        assert (path.parent / "__init__.py").exists(), f"{path}: каталог не пакет → wheel без файла"
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert '"aegis.prompts" = ["**/*.md"]' in pyproject.read_text(encoding="utf-8")
+
+
 def test_judge_prompt_cannot_demand_what_replay_never_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

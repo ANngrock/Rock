@@ -330,3 +330,63 @@ async def test_traces_are_found_by_prefix_and_last_turn_is_addressable() -> None
     assert await recorder.matching_traces("аи") == []  # не UUID и не кириллица — сразу отказ
     assert await recorder.latest_trace(owner_id=777) is not None
     assert await recorder.latest_trace(owner_id=999_999) is None
+
+
+# ------------------------------------------------------------------ вердикт верификатора (шаг 2)
+
+
+@pytest.mark.usefixtures("db")
+async def test_verdict_record_is_accepted_by_the_journal() -> None:
+    """``decision_records_kind`` — CHECK из миграции: моки его не видят вообще.
+
+    Новый вид записи без 0003 даёт не «не записалось», а падение ворованного `_fail`: журнал
+    продолжал бы работать, а вердикты исчезли бы молча. Поэтому проверка именно живая.
+    """
+    recorder = SqlDecisionRecorder(_cfg())
+    trace = str(uuid.uuid4())
+    recorder.begin_turn(trace, owner_id=4242, prompt_ids=[], tools_schema_sha=None)
+    await recorder.verdict(
+        trace_id=trace,
+        turn_no=1,
+        owner_id=4242,
+        ok=False,
+        severity="critical",
+        checked=["43.18", "04.09.2026"],
+        problems=["в ответе есть «99», чего нет в источниках"],
+        model="glm-4.7-flash",
+        latency_ms=15,
+        prompt_ids=[{"id": "verify/judge", "version": "1.0", "sha256": "b" * 64}],
+        payload={"answer": "Курс 99", "sources": ["NBU: 43,18"]},
+    )
+    recorder.end_turn(trace)
+
+    rows = await recorder.records_for_trace(trace)
+    kinds = [row["kind"] for row in rows]
+    assert "verdict" in kinds, f"журнал не принял новый вид: {kinds}"
+    verdict_row = [row for row in rows if row["kind"] == "verdict"][0]
+    assert verdict_row["policy"]["decision"] == "flagged"
+    assert "99" in verdict_row["policy"]["reason"]
+    # содержимое сверки лежит в блобе и читается: вердикт обязан быть объясним, а не «хэш и верь»
+    body = await recorder.record_input(verdict_row)
+    assert body and body["answer"] == "Курс 99"
+
+    report = await recorder.verify()
+    assert report.ok, report.summary()
+    assert recorder.failures == 0, "вердикт записался с ошибкой, которую никто не показал"
+
+
+@pytest.mark.usefixtures("db")
+async def test_unknown_record_kind_is_still_rejected() -> None:
+    """Расширять CHECK можно, превращать журнал в «пиши что хочешь» — нельзя."""
+    with pytest.raises(DBAPIError, match="decision_records_kind"):
+        async with session() as s:
+            await s.execute(
+                text(
+                    "INSERT INTO governance.decision_records"
+                    "    (id, trace_id, turn_no, kind, owner_id, prev_hash, hash)"
+                    " VALUES (gen_random_uuid(), :trace, 1, 'wtf', 1,"
+                    "         decode(repeat('00', 32), 'hex'), decode(repeat('11', 32), 'hex'))"
+                ),
+                {"trace": str(uuid.uuid4())},
+            )
+            await s.rollback()

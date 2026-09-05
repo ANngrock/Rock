@@ -419,7 +419,7 @@ class ModelGateway:
             "auth_hint": self.auth_hint(),
             "models": {
                 role: resolve_spec(role, self.cfg).name
-                for role in ("brain", "vision", "fast", "embed")
+                for role in ("brain", "vision", "fast", "embed", "quarantine")
             },
             "fallback_enabled": self.fallback is not None,
             "embed_endpoint": (self.cfg.embed_base_url or self.cfg.glm_base_url or "")

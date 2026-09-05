@@ -61,6 +61,31 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("trace", nargs="?", default="", help="trace_id или его начало (8 символов)")
     replay.add_argument("--last", action="store_true", help="взять последний ход в журнале")
     replay.add_argument("--owner-id", type=int, default=1)
+
+    remind = sub.add_parser(
+        "remind", help="напоминания: поставить, показать, отменить, прогнать расписание"
+    )
+    remind_actions = remind.add_subparsers(dest="remind_action", required=True)
+    add = remind_actions.add_parser("add", help="поставить напоминание без участия модели")
+    add.add_argument("text", nargs="+", help="что напомнить")
+    add.add_argument("--when", required=True, help="словами: «через 20 минут», «завтра в 9»")
+    add.add_argument("--at", default=None, help="точное время ISO с поясом (обход разборщика)")
+    add.add_argument("--owner-id", type=int, default=1)
+    show = remind_actions.add_parser("list", help="запланированные напоминания")
+    show.add_argument("--limit", type=int, default=10)
+    show.add_argument("--owner-id", type=int, default=1)
+    rm = remind_actions.add_parser("cancel", help="отменить по началу id или по слову из текста")
+    rm.add_argument("ref")
+    rm.add_argument("--owner-id", type=int, default=1)
+    tick = remind_actions.add_parser(
+        "tick", help="прогнать расписание: отправить всё, что пора (для systemd-таймера)"
+    )
+    tick.add_argument("--limit", type=int, default=None, help="сколько строк за проход")
+    tick.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что ушло бы, — не отправляя и не трогая БД",
+    )
     return parser
 
 
@@ -72,6 +97,49 @@ async def _scalar(sql: str) -> Any:
 
     async with session() as s:
         return await s.scalar(text(sql))
+
+
+async def _reminders_report(cfg: Any) -> dict[str, Any]:
+    """Расписание напоминаний: таблица, настроен ли инструмент, догоняет ли тик.
+
+    Проба всегда `ok=True` — и это не мягкость. Здоровье контейнера означает «бот может отвечать»;
+    невыкатанная миграция 0004 или выключенные напоминания не делают бота больным, а HEALTHCHECK,
+    который орёт из-за неиспользуемой функции, владелец через неделю начнёт игнорировать. Всё, что
+    здесь не так, — `note`/`hint`, которые doctor печатает строкой.
+    """
+    out: dict[str, Any] = {"ok": True}
+    try:
+        ready = await _scalar("SELECT to_regclass('planning.reminders') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - настоящая ошибка БД уже в проверке postgres
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        out["hint"] = "детали — в проверке postgres"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = (
+            "docker compose -f deploy/docker-compose.yml run --rm bot alembic upgrade head"
+            " (миграция 0004)"
+        )
+        return out
+    if not cfg.reminders_enabled:
+        out["state"] = "выключено"
+        out["note"] = "REMINDERS_ENABLED=false: инструмент отказывает явно"
+        return out
+    live = await _scalar(
+        "SELECT count(*) FROM planning.reminders WHERE status IN ('scheduled', 'sending')"
+    )
+    overdue = await _scalar(
+        "SELECT count(*) FROM planning.reminders WHERE status = 'scheduled' AND due_at <= now()"
+    )
+    out["live"] = int(live or 0)
+    out["overdue"] = int(overdue or 0)
+    out["note"] = (
+        f"в расписании {out['live']}, просрочено {out['overdue']}"
+        f" · тик ≤ {cfg.reminders_batch} за проход"
+    )
+    if out["overdue"]:
+        out["hint"] = "ждут тика: systemctl status aegis-reminders.timer"
+    return out
 
 
 async def _postgres_report() -> dict[str, Any]:
@@ -92,7 +160,8 @@ async def _postgres_report() -> dict[str, Any]:
 
     counts = (
         "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE c.relkind = 'r' AND n.nspname IN ('platform', 'governance', 'memory', 'knowledge')"
+        "WHERE c.relkind = 'r' AND n.nspname IN "
+        "('platform', 'governance', 'memory', 'knowledge', 'planning')"
     )
     for key, sql in (
         ("schema_ready", "SELECT to_regclass('platform.events') IS NOT NULL"),
@@ -294,8 +363,10 @@ async def _rates_report(cfg: Settings) -> dict[str, Any]:
 
 
 async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> int:
-    from aegis.agents.tools import builtin, repro  # noqa: F401  (регистрирует инструменты)
+    from aegis.agents.tools import load_builtin_tools
     from aegis.agents.tools.registry import registry
+
+    load_builtin_tools()
     from aegis.platform.config import settings
     from aegis.runtime import build_app
 
@@ -314,6 +385,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
     app = build_app(registry=registry, cfg=cfg, configure_logging=True)
     try:
         report["checks"]["postgres"] = await _postgres_report()
+        report["checks"]["reminders"] = await _reminders_report(cfg)
 
         try:
             if cfg.kv_backend == "memory":
@@ -358,10 +430,137 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
     return 0 if ok else 1
 
 
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Русское склонение числительного — да, ради одной строки вывода.
+
+    «Ушло бы 1 напоминаний» читается как «код писал тот, кому не до деталей», а доверие к боту
+    складывается именно из них.
+    """
+    if count % 100 in range(11, 15):
+        return f"{count} {many}"
+    last = count % 10
+    if last == 1:
+        return f"{count} {one}"
+    if last in range(2, 5):
+        return f"{count} {few}"
+    return f"{count} {many}"
+
+
+async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
+    """Напоминания из консоли — без модели: момент считает парсер, а не угадывает LLM.
+
+    Тот же путь, что проходит инструмент ``set_reminder``, — поэтому «в CLI работает, а в боте нет»
+    невозможно по конструкции: расходиться может только разбор аргументов.
+    """
+    from datetime import UTC, datetime
+
+    from aegis.planning.reminders import SqlReminderStore, deliver
+    from aegis.planning.schedule import WhenNotParsed, humanize, parse_when
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlReminderStore()
+
+    if action == "add":
+        body = " ".join(args.text)
+        try:
+            if args.at:
+                due = datetime.fromisoformat(args.at)
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=cfg.tz)
+                note, matched = "", args.at
+            else:
+                when = parse_when(args.when, now=datetime.now(cfg.tz), timezone=cfg.timezone)
+                due, note, matched = when.at, when.note, when.matched
+        except (WhenNotParsed, ValueError) as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        if due < datetime.now(UTC):
+            print("! в прошлом напоминания не ставлю", file=sys.stderr)
+            return 2
+        reminder_id = await store.add(owner_id=args.owner_id, body=body, due_at=due.astimezone(UTC))
+        # та же форма, что у инструмента: абсолютный момент + «через сколько», — чтобы «через 4 мин»
+        # не выглядело расхождением с «поставленными через 5»
+        local = due.astimezone(cfg.tz)
+        moment = humanize(due, now=datetime.now(cfg.tz), timezone=cfg.timezone)
+        print(f"Поставлено на {local:%d.%m %H:%M} ({moment}) — {body}. id={reminder_id[:8]}")
+        print(f"  разбор: {matched!r}")
+        if note:
+            print(f"  ! {note}", file=sys.stderr)
+        return 0
+
+    if action == "list":
+        items = await store.list_scheduled(owner_id=args.owner_id, limit=args.limit)
+        if not items:
+            print("Запланированных напоминаний нет.")
+            return 0
+        now = datetime.now(cfg.tz)
+        for item in items:
+            moment = humanize(item.due_at, now=now, timezone=cfg.timezone)
+            print(f"- {item.short_id} · {moment} · {item.text}")
+        counts = await store.counts()
+        if counts:
+            print("  всего в расписании: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+        return 0
+
+    if action == "cancel":
+        removed = await store.cancel(owner_id=args.owner_id, ref=args.ref)
+        if removed is None:
+            print(
+                f"! ничего не отменено: {args.ref!r} не похоже на id или слово из текста",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Отменено (id={removed.short_id}): {removed.text}")
+        return 0
+
+    if action == "tick":
+        limit = args.limit or cfg.reminders_batch
+        if args.dry_run:
+            pending = await store.peek_due(limit=limit)
+            if not pending:
+                print("Пусто: ничего не пора отправлять.")
+                return 0
+            kind = _plural(len(pending), "напоминание", "напоминания", "напоминаний")
+            print(f"{kind} ушло бы (ничего не отправлено, БД не тронута):")
+            for item in pending:
+                print(f"  - {item.label(cfg.timezone)}")
+            return 0
+        from aegis.interaction.telegram.notify import TelegramNotifier
+
+        try:
+            notifier = TelegramNotifier.from_settings(cfg)
+        except RuntimeError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        try:
+            await notifier.start()
+            report = await deliver(store, send=notifier.send, limit=limit)
+        finally:
+            await notifier.aclose()
+        print(report.summary())
+        for short in report.sent:
+            print(f"  ok {short}")
+        for short in report.failed:
+            print(f"  !! {short}", file=sys.stderr)
+        for short in report.exhausted:
+            print(f"  !! {short}: попытки кончились", file=sys.stderr)
+        # ненулевой выход нужен, чтобы systemd видел failed у юнита, а не «тихо и чисто»
+        return 1 if report.failed else 0
+
+    return 2
+
+
 async def _cmd_ask(text: str, owner_id: int) -> int:
     from aegis.agents.supervisor import Inbound
-    from aegis.agents.tools import builtin, repro  # noqa: F401
+    from aegis.agents.tools import load_builtin_tools
     from aegis.agents.tools.registry import registry
+
+    load_builtin_tools()
     from aegis.platform.config import ConfigError
     from aegis.runtime import build_app
 
@@ -447,8 +646,10 @@ async def _cmd_repro(action: str, args: argparse.Namespace) -> int:
         return 0
 
     if action == "replay":
-        from aegis.agents.tools import builtin, repro  # noqa: F401  (регистрирует инструменты)
+        from aegis.agents.tools import load_builtin_tools
         from aegis.agents.tools.registry import registry
+
+        load_builtin_tools()
         from aegis.governance.replay import replay_trace
         from aegis.runtime import build_app
 
@@ -486,8 +687,10 @@ async def _cmd_repro(action: str, args: argparse.Namespace) -> int:
 
 
 def _cmd_tools() -> int:
-    from aegis.agents.tools import builtin, repro  # noqa: F401
+    from aegis.agents.tools import load_builtin_tools
     from aegis.agents.tools.registry import registry
+
+    load_builtin_tools()
 
     for spec in registry.all():
         schema = spec.args.model_json_schema()
@@ -510,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_tools()
         if args.command == "repro":
             return asyncio.run(_cmd_repro(args.repro_action, args))
+        if args.command == "remind":
+            return asyncio.run(_cmd_remind(args.remind_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

@@ -36,8 +36,7 @@ from aiogram.types import (
 )
 
 from aegis.agents.supervisor import Inbound, Reply
-from aegis.agents.tools import builtin  # noqa: F401  — импорт регистрирует инструменты
-from aegis.agents.tools import repro as repro_tools  # noqa: F401  — инструменты журнала (M1)
+from aegis.agents.tools import load_builtin_tools
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
 from aegis.interaction.telegram.render import render_for_telegram, strip_tags
@@ -46,6 +45,8 @@ from aegis.platform.gateway.diagnose import redact_secrets
 from aegis.runtime import App, build_app
 
 __all__ = ["OwnerOnly", "build_dispatcher", "main"]
+
+load_builtin_tools()
 
 log = structlog.get_logger(__name__)
 
@@ -181,6 +182,8 @@ async def cmd_status(message: Message, app: App) -> None:
     lines += [
         f"Бюджет: <code>{budget_line}</code>",
         f"Kill switch: <b>{_kill_label(status)}</b>",
+        _polish_line(status),
+        _reminders_line(status),
         f"История в контексте: {status['history_messages']} реплик",
         f"Инструментов: {len(status['tools'])}",
     ]
@@ -381,6 +384,47 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         pass
     if bot is not None:
         await send_reply(bot, message.chat.id, reply)
+
+
+def _polish_line(status: dict[str, Any]) -> str:
+    """Сверка с источниками и карантин внешнего текста — то, что «подкручивает» ответ.
+
+    Строка есть, чтобы «почему мне не сказали, что число не из источника» не решалось чтением кода:
+    выключенный `VERIFY_ENABLED` выглядит точно так же, как «проверили и всё хорошо».
+    """
+    polish = status.get("answer_polish") or {}
+    verify = "вкл" if polish.get("verify") else "выкл"
+    quarantine = "вкл" if polish.get("quarantine") else "выкл"
+    tail = ", только при расхождении чисел" if not polish.get("always") else ""
+    if not polish.get("verify"):
+        tail = " — ответы не проверяются на опору в источниках"
+    return f"Ответы: сверка с источниками {verify}{tail} · карантин внешнего текста {quarantine}"
+
+
+def _reminders_line(status: dict[str, Any]) -> str:
+    """Отдельная строка про расписание: «напоминание не пришло» бывает тремя разными случаями.
+
+    Выключенная возможность, отсутствующая БД и живой тик с просроченной строкой выглядят для
+    владельца одинаково («молчат»), поэтому различие обязано быть в /status, а не в чтении кода.
+    """
+    info = status.get("reminders") or {}
+    if info.get("error"):
+        return f"Напоминания: ⚠️ счётчик не читается — {str(info['error'])[:80]}"
+    if not info.get("enabled"):
+        return (
+            "Напоминания: <b>некуда сохранять</b> (нет БД или REMINDERS_ENABLED=false) — "
+            "инструмент отвечает отказом, а не обещанием"
+        )
+    scheduled = int(info.get("scheduled") or 0)
+    overdue = int(info.get("overdue") or 0)
+    failed = int(info.get("failed") or 0)
+    bits = [f"{scheduled} в расписании"]
+    if overdue:
+        bits.append(f"⚠️ {overdue} пора (ждут тика)")
+    if failed:
+        bits.append(f"⚠️ {failed} с исчерпанными попытками")
+    bits.append(f"тик ≤ {info.get('batch', 20)} за проход")
+    return "Напоминания: " + ", ".join(bits)
 
 
 def _repro_line(status: dict[str, Any]) -> str:

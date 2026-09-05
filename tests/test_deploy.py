@@ -24,6 +24,34 @@ def test_healthcheck_is_the_offline_probe() -> None:
     assert "--json" in cmd, "вывод должен оставаться машиночитаемым (одна строка JSON)"
 
 
+def test_every_systemd_unit_is_an_aegis_oneshot() -> None:
+    """Юниты — тоже код: `Type=oneshot` без `WantedBy`, опечатка в `OnCalendar` или вызов не `aegis`
+    означают, что бэкап/якорь/напоминания просто никогда не запустятся — и молча."""
+    for path in sorted((DEPLOY / "systemd").glob("*.service")):
+        body = path.read_text(encoding="utf-8")
+        assert "[Service]" in body, f"{path.name}: нет секции [Service]"
+        assert "Type=oneshot" in body, f"{path.name}: ожидается разовая задача"
+        start = [ln for ln in body.splitlines() if ln.startswith("ExecStart=")]
+        assert start, f"{path.name}: нечем запускать"
+        assert any("aegis " in ln or "backup.sh" in ln for ln in start), (
+            f"{path.name}: ExecStart обязан идти в aegis (или в скрипт бэкапа)"
+        )
+        assert "WantedBy=multi-user.target" in body, f"{path.name}: юнит никуда не включается"
+    assert (DEPLOY / "systemd").glob("*.timer"), "в репозитории не осталось таймеров"
+
+
+def test_reminder_timer_fires_more_often_than_a_day() -> None:
+    """Смысл напоминаний — в частоте: ежедневный тик превращает «в 9:00» в «когда-нибудь утром»."""
+    timer = (DEPLOY / "systemd" / "aegis-reminders.timer").read_text(encoding="utf-8")
+    service = (DEPLOY / "systemd" / "aegis-reminders.service").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:00/5:00" in timer, "интервал тика съехал"
+    assert "Persistent=true" in timer, "после простоя просроченное должно догнаться"
+    assert "WantedBy=timers.target" in timer
+    assert "aegis remind tick" in service
+    # боевой юнит отправляет по-настоящему: «посмотреть без отправки» — отдельный ручной запуск CLI
+    assert "--dry-run" not in service, "таймер не должен работать вхолостую"
+
+
 def test_compose_bot_delegates_health_to_image() -> None:
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
     bot_block = compose.split("  bot:")[1].split("\n  ")[0]

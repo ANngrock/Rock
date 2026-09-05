@@ -36,7 +36,7 @@ def test_default_role_prices_are_catalog_values() -> None:
     assert resolve_spec("brain", cfg) is CATALOG["brain"], "без переопределения имя не трогаем"
 
 
-@pytest.mark.parametrize("role", ["brain", "vision", "fast", "embed"])
+@pytest.mark.parametrize("role", ["brain", "vision", "fast", "embed", "quarantine"])
 def test_every_catalog_name_has_a_price(role: str) -> None:
     from aegis.platform.gateway.models import CATALOG
 

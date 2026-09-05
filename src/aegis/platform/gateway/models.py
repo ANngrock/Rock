@@ -29,7 +29,7 @@ __all__ = [
     "spec_for_name",
 ]
 
-ChatRole = Literal["brain", "vision", "fast", "embed"]
+ChatRole = Literal["brain", "vision", "fast", "embed", "quarantine"]
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,9 @@ CATALOG: dict[ChatRole, ModelSpec] = {
     "brain": ModelSpec("glm-4.7-flash", "brain", 0.0, 0.0, supports_thinking=True),
     "vision": ModelSpec("glm-4.6v-flash", "vision", 0.0, 0.0, supports_vision=True),
     "fast": ModelSpec("glm-4.7-flash", "fast", 0.0, 0.0),
+    #: роль карантина: та же дешёвая модель по умолчанию, но отдельная конфигурация — чтобы
+    #: «разметчик внешнего текста» можно было увести в локальную модель, не трогая мозг
+    "quarantine": ModelSpec("glm-4.7-flash", "quarantine", 0.0, 0.0),
     "embed": ModelSpec("embedding-3", "embed", 0.05, 0.0),
 }
 
@@ -62,6 +65,7 @@ _OVERRIDES: dict[ChatRole, str] = {
     "brain": "model_brain",
     "vision": "model_vision",
     "fast": "model_fast",
+    "quarantine": "model_quarantine",
     "embed": "model_embed",
 }
 

@@ -187,7 +187,7 @@ async def test_quick_skips_every_live_probe(
     async def forbidden(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
         raise AssertionError(f"--quick не имеет права ходить в сеть: {args[:1]}")
 
-    async def ok() -> dict[str, Any]:
+    async def ok(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True}
 
     cfg = Settings(_env_file=None, kv_backend="memory", glm_api_key="k", daily_budget_usd=1.0)
@@ -198,10 +198,83 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_model_report", forbidden)
     monkeypatch.setattr(cli, "_models_report", forbidden)
     monkeypatch.setattr(cli, "_postgres_report", ok)
+    monkeypatch.setattr(cli, "_reminders_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert set(report["checks"]) == {"postgres", "redis"}, report["checks"]
+    assert set(report["checks"]) == {"postgres", "redis", "reminders"}, report["checks"]
     assert report["checks"]["redis"]["backend"] == "memory"
+
+
+async def test_reminders_probe_reports_a_missing_table_without_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Невыкатанная миграция 0004 — это «напоминаний нет», а не «бот болен»: HEALTHCHECK не роняем.
+
+    Иначе из-за неиспользуемой функции контейнер стал бы «unhealthy», и через неделю на это
+    перестали бы смотреть — ровно так же, как на вечно падающий CI.
+    """
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(cli, "_scalar", _FakeSession({"to_regclass": False}))
+    report = await cli._reminders_report(cfg)
+    assert report["ok"] is True, "проба обязана оставаться справочной"
+    assert report["state"] == "нет таблицы"
+    assert "0004" in report["hint"]
+
+
+async def test_reminders_probe_shows_stuck_rows_and_the_way_to_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k", reminders_batch=7)  # type: ignore[call-arg]
+    fake = _FakeSession(
+        {"to_regclass": True, "IN ('scheduled', 'sending')": 3, "due_at <= now()": 2}
+    )
+    monkeypatch.setattr(cli, "_scalar", fake)
+    report = await cli._reminders_report(cfg)
+    assert report["live"] == 3 and report["overdue"] == 2
+    assert "тик ≤ 7" in report["note"]
+    assert "aegis-reminders.timer" in report["hint"], "просроченное обязано вести к таймеру"
+
+    quiet = _FakeSession(
+        {"to_regclass": True, "IN ('scheduled', 'sending')": 1, "due_at <= now()": 0}
+    )
+    monkeypatch.setattr(cli, "_scalar", quiet)
+    report = await cli._reminders_report(cfg)
+    assert "hint" not in report, "пустое расписание не поводом что-то проверять"
+
+
+async def test_reminders_probe_survives_a_dead_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+
+    async def boom(sql: str) -> Any:
+        raise OSError("Connection refused")
+
+    monkeypatch.setattr(cli, "_scalar", boom)
+    report = await cli._reminders_report(cfg)
+    assert report["ok"] is True and "не проверялось" in report["note"]
+    assert "postgres" in report["hint"]
+
+
+async def test_reminders_probe_says_when_the_feature_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None, _env_prefix="T_", glm_api_key="k", reminders_enabled=False
+    )
+    monkeypatch.setattr(cli, "_scalar", _FakeSession({"to_regclass": True}))
+    report = await cli._reminders_report(cfg)
+    assert report["state"] == "выключено" and "REMINDERS_ENABLED" in report["note"]
 
 
 async def test_live_probe_cannot_hang_doctor(monkeypatch: pytest.MonkeyPatch) -> None:

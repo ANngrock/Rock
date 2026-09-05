@@ -182,6 +182,18 @@ def _render(trace_id: str, records: list[dict[str, Any]]) -> str:
             )
             if row.get("truncated"):
                 lines.append("⚠ содержимое усечено лимитом: ход воспроизводится не целиком")
+        elif kind == "verdict":
+            ids = row.get("prompt_ids") or []
+            criterion = ", ".join(f"{i.get('id')}@{i.get('version')}" for i in ids[:3] if i)
+            lines.append(
+                f"[{step}] сверка ответа: {policy.get('decision')} — "
+                f"{str(policy.get('reason'))[:160]}"
+                + (f" (критерий: {criterion})" if criterion else " (критерий не записан)")
+            )
+        else:
+            # незнакомый вид — это не «мелочь»: молча пропущенная строка журнала выглядит как
+            # «ход состоял из того, что показалось», и объяснение теряет смысл
+            lines.append(f"[{step}] запись вида «{kind or '?'}» — этот код её не разбирает")
     if len(records) == 1:
         lines.append("(записей мало — вероятно, ход был частично до включения журнала)")
     return "\n".join(lines)[:_MAX_EXPLAIN]
