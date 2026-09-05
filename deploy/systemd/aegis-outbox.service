@@ -1,0 +1,21 @@
+[Unit]
+Description=aegis: опубликовать события outbox в NATS (шаг 2)
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь под свой клон; WorkingDir нужен, чтобы compose нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+EnvironmentFile=-/srv/aegis/.env
+# тик атомарен: строки держатся FOR UPDATE до commit'а, «опубликовано» ставится только после ack
+# сервера, поэтому падение между ними = повторная доставка, а не потеря (потребитель дедуплицирует
+# по metadata.event_id)
+ExecStart=/usr/bin/docker compose -f /srv/aegis/deploy/docker-compose.yml run --rm bot aegis outbox tick
+# если docker недоступен (машина без контейнеров), тот же шаг локальным окружением:
+# ExecStart=/srv/aegis/.venv/bin/aegis outbox tick
+TimeoutStartSec=180
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -118,41 +118,89 @@ class EventStore:
 
     # --- outbox (для relay'я; публикуется отдельным процессом с шага 2) ---
 
-    async def fetch_unpublished(self, limit: int = 100) -> list[dict[str, Any]]:
+    _FIELDS = """
+        SELECT o.id, o.event_id, e.stream_type, e.stream_id, e.version,
+               e.event_type, e.payload, e.metadata
+        FROM platform.outbox o
+        JOIN platform.events e ON e.id = o.event_id
+        WHERE o.published_at IS NULL
+          AND (CAST(:max_attempts AS int) IS NULL OR o.attempts < CAST(:max_attempts AS int))
+        ORDER BY o.id
+        LIMIT :limit
+    """
+
+    async def fetch_unpublished(
+        self, limit: int = 100, *, max_attempts: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Строки для публикации. `FOR UPDATE SKIP LOCKED` — чтобы два relay'я не дублировали.
+
+        `max_attempts` отсекает «ядовитые» строки на уровне выборки: событие, которое сервер
+        принципиально не принимает, не должно крутиться в каждом тике и вытеснять нормальные.
+        """
         rows = await self._s.execute(
-            text(
-                """
-                SELECT o.id, o.event_id, e.stream_type, e.stream_id, e.version,
-                       e.event_type, e.payload, e.metadata
-                FROM platform.outbox o
-                JOIN platform.events e ON e.id = o.event_id
-                WHERE o.published_at IS NULL
-                ORDER BY o.id
-                LIMIT :limit
-                FOR UPDATE OF o SKIP LOCKED
-                """
-            ).bindparams(limit=limit)
+            text(self._FIELDS + "FOR UPDATE OF o SKIP LOCKED").bindparams(
+                limit=limit, max_attempts=max_attempts
+            )
         )
-        return [
-            {
-                "outbox_id": r[0],
-                "event_id": r[1],
-                "stream_type": r[2],
-                "stream_id": r[3],
-                "version": r[4],
-                "event_type": r[5],
-                "payload": r[6],
-                "metadata": r[7],
-            }
-            for r in rows
-        ]
+        return [self._row(r) for r in rows]
+
+    async def peek_unpublished(
+        self, limit: int = 100, *, max_attempts: int | None = None
+    ) -> list[dict[str, Any]]:
+        """То же без блокировок и без права что-либо менять — для `--dry-run`."""
+        rows = await self._s.execute(
+            text(self._FIELDS).bindparams(limit=limit, max_attempts=max_attempts)
+        )
+        return [self._row(r) for r in rows]
+
+    @staticmethod
+    def _row(r: Any) -> dict[str, Any]:
+        return {
+            "outbox_id": r[0],
+            "event_id": r[1],
+            "stream_type": r[2],
+            "stream_id": r[3],
+            "version": r[4],
+            "event_type": r[5],
+            "payload": r[6],
+            "metadata": r[7],
+        }
 
     async def mark_published(self, outbox_ids: Sequence[int]) -> None:
+        """Отметить доставленным. Только после ack от сервера — иначе «доставлено» врёт."""
         if not outbox_ids:
             return
         await self._s.execute(
             text(
-                "UPDATE platform.outbox SET published_at = now() "
+                "UPDATE platform.outbox SET published_at = now(), last_error = NULL "
                 "WHERE id = ANY(CAST(:ids AS bigint[]))"
             ).bindparams(ids=list(outbox_ids))
         )
+
+    async def mark_failed(self, outbox_id: int, error: str) -> None:
+        """Неудача: +1 попытка и причина. Строка остаётся в очереди, пока попытки не кончатся."""
+        await self._s.execute(
+            text(
+                "UPDATE platform.outbox SET attempts = attempts + 1, last_error = :err "
+                "WHERE id = CAST(:id AS bigint)"
+            ).bindparams(err=error[:2000], id=outbox_id)
+        )
+
+    async def counts(self, *, max_attempts: int | None = None) -> dict[str, int]:
+        """Состояние очереди: сколько ждёт и сколько уже не retry'ится."""
+        row = await self._s.execute(
+            text(
+                """
+                SELECT count(*) FILTER (WHERE published_at IS NULL)::int AS pending,
+                       count(*) FILTER (
+                           WHERE published_at IS NULL AND attempts >= t.threshold
+                       )::int AS stuck
+                FROM platform.outbox
+                CROSS JOIN (
+                    SELECT COALESCE(CAST(:max_attempts AS int), 2147483647) AS threshold
+                ) t
+                """
+            ).bindparams(max_attempts=max_attempts)
+        )
+        r = row.one()
+        return {"pending": int(r[0]), "stuck": int(r[1])}

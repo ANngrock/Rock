@@ -761,3 +761,83 @@ embedding IS NULL)` не станет нулём. Частичный индек�
   протокол `Indexable` (три метода) позволит подключить второй магазин без правок индексатора;
 * ANN-индекса (hnsw) на колонке нет: pgvector не строит его для 2048 измерений, а на личном объёме
   точный скан стоит единицы миллисекунд. Ветка «база выросла» описана в ADR-0012 и в миграции 0001.
+
+## 17. Outbox → NATS: включить relay, создать стрим, понять застрявшее
+
+События пишутся в `platform.outbox` той же транзакцией, что и доменное изменение (ADR-0004), и
+никуда не уходят, пока не включён relay. Это не «тихая потеря»: очередь видна, и она догонится.
+Смысл решений — `docs/ADR/0013`.
+
+### Поднять доставку
+
+```bash
+# 1. брокер (NATS лежит в compose-профиле durable)
+docker compose -f deploy/docker-compose.yml --profile durable up -d nats
+# 2. стрим — один раз, вручную: молча создавать его relay сознательно отказывается
+docker compose -f deploy/docker-compose.yml run --rm nats \
+  nats stream add --subjects 'aegis.*.*.*' --retention limits --max-age 336h \
+  --storage file --replicas 1 aegis_events
+# 3. включить relay и завести таймер
+grep -n OUTBOX_RELAY_ENABLED .env && sed -i 's/^OUTBOX_RELAY_ENABLED=.*/OUTBOX_RELAY_ENABLED=true/' .env
+sudo systemctl enable --now aegis-outbox.timer
+aegis outbox stats && aegis outbox tick --dry-run
+```
+
+Без шага 2 тик ответит строкой `в JetStream нет стрима 'aegis_events': создайте его один раз — nats
+stream add …` и кодом 2. Это намеренно: параметры стрима (retention, max-age) — решение владельца о
+том, как долго события переживают простой потребителя, а не то, что процесс подбирает наугад.
+
+### Что смотреть
+
+| Вопрос | Команда |
+| --- | --- |
+| сколько ждёт и сколько застряло | `aegis outbox stats` (exit 1, если есть застрявшие) |
+| что уйдёт в ближайший тик | `aegis outbox tick --dry-run` (не публикует, не блокирует строки) |
+| статус доставки как части здоровья | `aegis doctor --quick --json \| jq .checks.outbox` |
+| последний тик | `systemctl status aegis-outbox.service`, `journalctl -u aegis-outbox.service -n 50` |
+| когда следующий | `systemctl list-timers 'aegis-outbox*'` |
+
+Коды выхода тика: `0` — всё, что выбрали, опубликовано; `1` — транспорт не принял строку
+(осталась в очереди, попытки потрачены); `2` — настраивать надо не брокер, а окружение
+(`OUTBOX_RELAY_ENABLED=false`, нет пакета `nats-py`, `NATS_URL` пуст, брокер не отвечает, нет
+стрима). Различение `1` и `2` нужно затем, чтобы `systemctl status` отвечал на «почему не
+доехало» без чтения логов.
+
+### Застрявшие строки
+
+`stats` показывает `с исчерпанными попытками: N`. Это не «ошибка данных» и не повод удалять:
+событие осталось в таблице и в потоке, просто выборка его больше не берёт, чтобы оно не вытесняло
+нормальные из пакета. Порядок действий:
+
+1. посмотреть причину — `last_error` строки:
+   ```sql
+   select o.id, o.attempts, o.last_error, e.event_type
+     from platform.outbox o join platform.events e on e.id = o.event_id
+    where o.published_at is null and o.attempts >= 8 order by o.id desc limit 20;
+   ```
+2. починить причину (чаще всего — стрим/лимиты/доступность брокера);
+3. вернуть в очередь: `UPDATE platform.outbox SET attempts = 0, last_error = NULL WHERE …` и
+   дождаться тика (или `aegis outbox tick`).
+
+`OUTBOX_MAX_ATTEMPTS` (по умолчанию 8) считается по тикам, а не по попыткам внутри тика: тик
+публикует до `OUTBOX_BATCH` строк и останавливается на первом отказе транспорта. При таймере в 5
+минут это ~40 минут, в течение которых событие ещё пытаются доставить.
+
+### Настройки
+
+| Переменная | Что делает |
+| --- | --- |
+| `OUTBOX_RELAY_ENABLED` | `false` = events копятся в таблице (безопасно); `true` = тик публикует |
+| `NATS_URL` | адрес брокера (в контейнере — `nats://nats:4222`) |
+| `NATS_STREAM` | имя JetStream-стрима; пусто = core NATS без ack, и `stats` это скажет прямо |
+| `NATS_SUBJECT_PREFIX` | префикс субъектов: `<prefix>.<stream_type>.<stream_id>.<event_type>` |
+| `NATS_CONNECT_TIMEOUT_S` | секунд на коннект (иначе тик висит, а `TimeoutStartSec` только страхует) |
+| `OUTBOX_BATCH` | строк за тик — столько же держится `FOR UPDATE` |
+| `OUTBOX_MAX_ATTEMPTS` | после скольких неудач строка перестаёт выбираться |
+
+### Чего здесь нет специально
+
+* exactly-once: семантика — at-least-once, дедупликация по `metadata.event_id` на потребителе;
+* автосоздания стрима и «очистки старых событий» (retention — решение владельца, см. выше);
+* публикации из процесса бота: `drain` — чистая функция, и если однажды понадобится нулевая
+  задержка, её вызовут оттуда же, не переписывая relay.

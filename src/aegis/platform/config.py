@@ -90,6 +90,20 @@ class Settings(BaseSettings):
     #: обнулить бюджет — то есть ровно то, за чем Redis тут и нужен.
     kv_backend: Literal["redis", "memory"] = "redis"
     nats_url: str = "nats://nats:4222"
+    #: relay включается явно: NATS живёт в compose-профиле `durable`, и на большинстве установок
+    #: его нет. «Выключено» означает «события копятся в outbox» — это безопасно, а не потеряно:
+    #: публикация догонит, когда транспорт появится
+    outbox_relay_enabled: bool = False
+    #: событий за один тик: строки держатся `FOR UPDATE` до commit'а, поэтому пакет обязан быть
+    #: коротким — иначе следующий тик будет ждать locks вместо работы
+    outbox_batch: int = Field(default=50, ge=1, le=1000)
+    #: после скольких неудач строка перестаёт выбираться выборкой (остаётся в очереди до починки)
+    outbox_max_attempts: int = Field(default=8, ge=1, le=100)
+    #: JetStream-стрим: `ack` от сервера — единственное, что делает «опубликовано» честным
+    nats_stream: str = "aegis_events"
+    #: префикс субъектов: `<prefix>.<stream_type>.<stream_id>.<event_type>`
+    nats_subject_prefix: str = "aegis"
+    nats_connect_timeout_s: float = Field(default=3.0, ge=0.5, le=30.0)
     searxng_url: str = "http://localhost:8888"
     searxng_timeout_s: float = Field(default=20.0, ge=1.0, le=120.0)
     fetch_timeout_s: float = Field(default=25.0, ge=1.0, le=120.0)

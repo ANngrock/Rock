@@ -832,3 +832,82 @@ $ aegis doctor --quick --json | jq .checks.notes_index
 
 **Что осталось от шага 2:** outbox-relay → NATS, golden-наборы v2 (даты/финансы/инъекции), STT на
 faster-whisper, экспорт в Langfuse.
+
+### 2.5 — Outbox-relay в NATS: «опубликовано» = ack сервера, попытка = один тик ✅
+
+`platform.outbox` был написан на шаге 1 вместе с event store (ADR-0004) и с тех пор только рос:
+строки с `published_at IS NULL` никто не забирал. Делали вторую половину контракта — и начинали с
+вопроса «что означает слово „доставлено“», потому что именно на нём обычно и экономят.
+
+**Что появилось.** `platform/events/relay.py` (200 строк): `subject_for` (субъект из строки, ровно 4
+уровня, токены вычищаются), `encode_event` (конверт с `event_id`/`version` — то, чем потребитель
+дедуплицирует), `drain(store, transport, limit=, max_attempts=, dry_run=, prefix=)` и `RelayReport`
+с `summary()`. `NullTransport` — чтобы проба очереди не требовала поднятого брокера.
+`platform/events/nats.py` (95 строк) — тонкий адаптер: `connect / publish(ack=True) / close`, импорт
+`nats` внутри `start()` (пакет живёт в extra `durable`, приложение поднимается и без него), при
+отсутствии стрима — `RelayUnavailable` с полной `nats stream add`. В `EventStore` добавлены
+`peek_unpublished`, `mark_failed`, `counts(max_attempts=)` и фильтр попыток в `fetch_unpublished`;
+`mark_published` теперь чистит `last_error` (успех после починки не должен оставлять старую жалобу).
+CLI: `aegis outbox stats|tick [--dry-run] [--limit]`. Юниты `aegis-outbox.{service,timer}` (5 минут,
+`Persistent=true`, `TimeoutStartSec=180` — это потолок удержания `FOR UPDATE`, а не «на всякий
+случай»). Проба `checks.outbox` в doctor'е — справочная, как две предыдущие.
+
+**Три решения, которые стоит зафиксировать, потому что они выглядят «излишествами».**
+
+*Отметка после ack, а не до.* Порядок «пометили → отправили» быстрее и не требует дедупликации на
+потребителе. Он же теряет события при каждом падении relay'я между этими двумя строками. Выбран
+обратный: повторная доставка — цена, которую платит потребитель по `metadata.event_id`, потеря —
+цена, которую никто не платит, потому что её не видно.
+
+*Блокировка держится на время сетевого вызова.* Строки в `FOR UPDATE` до commit'а — значит два
+одновременных тика не гонят одно событие параллельно (тест на живом PG это прямо проверяет: второй
+`fetch` не видит занятую строку). Расход — пакет обязан быть коротким, поэтому `OUTBOX_BATCH=50` и
+потолок в юните.
+
+*Исчерпанные попытки не удаляются.* `attempts >= OUTBOX_MAX_ATTEMPTS` отсекается на уровне выборки:
+«ядовитое» событие не вытесняет нормальные, но и не исчезает. Возврат в очередь — `UPDATE … SET
+attempts = 0` руками (RUNBOOK §17), и это осознанный шаг владельца, а не самоуничтожение журнала.
+
+**Что нашёл прогон, а не тесты.** Первая версия `aegis outbox tick --dry-run` требовала
+транспорт: `NatsPublisher.from_settings` падал с `RelayUnavailable` на выключенном relay — то есть
+«посмотреть, что уйдёт» было доступно ровно тогда, когда смотреть уже нечего. Отсюда `NullTransport`
+и сухой путь пробы. Второе: `NATS_URL` я добавил в `.env.example` вторым экземпляром (он уже был в
+секции инфраструктуры), и тест-зеркало `Settings` ↔ `.env.example` это поймало — в тот раз как
+поломку теста, а не дубля; дубль убран, `NATS_CONNECT_TIMEOUT_S` добавлен (без этого теста про
+новое поле просто забыли бы).
+
+Живой прогон CLI на локальной базе (4 события записаны, NATS нет):
+
+```
+$ aegis outbox stats
+ждут публикации 4 из 4, с исчерпанными попытками: 0
+  relay: выключен · тик ≤ 50 · транспорт: nats://nats:4222 · стрим: aegis_events
+$ aegis outbox tick --dry-run
+4 события ушли бы в NATS (ничего не опубликовано) · в очереди ещё 4
+$ aegis outbox tick
+! OUTBOX_RELAY_ENABLED=false: события остаются в platform.outbox. Включите переменную и поднимите
+  брокер: docker compose -f deploy/docker-compose.yml --profile durable up -d nats        # exit 2
+$ OUTBOX_RELAY_ENABLED=true aegis outbox tick
+! нет пакета nats-py: pip install -e ".[durable]" (или включите профиль durable)              # exit 2
+$ aegis doctor --quick --json | jq .checks.outbox
+{"ok": true, "pending": 4, "stuck": 0, "relay": "выключен", "stream": "aegis_events",
+ "note": "4 ждут публикации · тик ≤ 50 · attempts ≥ 8",
+ "hint": "копятся, пока relay выключен: OUTBOX_RELAY_ENABLED=true + aegis-outbox.timer"}
+```
+
+Формы отказа различимы по коду и тексту: «не включено» (2), «нет пакета» (2), «брокер не отвечает»
+(2), «события не принимаются» (1, и `stuck` в stats), «всё чисто» (0). Для таймера это и есть
+диагностика: `systemctl status aegis-outbox.service` отвечает на «работает ли доставка» без чтения
+логов.
+
+**Итог проверок:** `make check` офлайн — 724 passed / 46 skipped (было 701), ruff + mypy (73 файла)
++ `lint-imports` (3 контракта), золото 35/35, repro 18/18. Живой Postgres: `pytest -q
+-m integration` → **48 passed** (было 42; +6 на relay: блокировка, попытки, отсечка `max_attempts`,
+чистота пробы, отметки, кириллица через jsonb).
+
+**Не проверено и остаётся на владельце:** живой NATS — ack, лимиты стрима, `discarded`. В этом
+песочном окружении брокера нет, и вместо имитации «вроде работает» предпочтён явный отказ (тот же
+критерий, что у Temporal в ADR-0010).
+
+**Что осталось от шага 2:** golden-наборы v2 (даты/финансы/инъекции), STT на faster-whisper, экспорт
+в Langfuse.

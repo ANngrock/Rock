@@ -52,6 +52,22 @@ def test_reminder_timer_fires_more_often_than_a_day() -> None:
     assert "--dry-run" not in service, "таймер не должен работать вхолостую"
 
 
+def test_outbox_timer_publishes_and_reports_stuck_rows() -> None:
+    """Тик relay'я обязан «гореть» красным, когда попытки исчерпаны: очередь — это не норма.
+
+    Проверяется контракт, а не строки юнита «вообще»: `TimeoutStartSec` ограничен (строки держатся
+    `FOR UPDATE` до commit'а, и висящий тик блокирует следующий), а `--dry-run` в боёвке означал бы
+    «события никогда не уедут».
+    """
+    timer = (DEPLOY / "systemd" / "aegis-outbox.timer").read_text(encoding="utf-8")
+    service = (DEPLOY / "systemd" / "aegis-outbox.service").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:00/5:00" in timer
+    assert "Persistent=true" in timer, "после простоя очередь догоняется целиком"
+    assert "aegis outbox tick" in service
+    assert "--dry-run" not in service
+    assert "TimeoutStartSec=" in service, "без потолка тик мог бы держать locks до бесконечности"
+
+
 def test_index_timer_runs_a_batch_and_is_calm_about_its_schedule() -> None:
     """Индексация — не сервис здоровья: редкий таймер, низкий приоритет, «догнать после простоя».
 

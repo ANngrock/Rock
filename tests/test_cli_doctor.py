@@ -15,7 +15,7 @@ class _FakeSession:
         self.values = values
         self.fail = fail
 
-    async def __call__(self, sql: str) -> Any:
+    async def __call__(self, sql: str, **params: Any) -> Any:
         for needle, value in self.values.items():
             if needle in sql:
                 if self.fail and self.fail in sql:
@@ -200,6 +200,7 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_postgres_report", ok)
     monkeypatch.setattr(cli, "_reminders_report", ok)
     monkeypatch.setattr(cli, "_notes_index_report", ok)
+    monkeypatch.setattr(cli, "_outbox_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(report["checks"]) == {
@@ -207,6 +208,7 @@ async def test_quick_skips_every_live_probe(
         "redis",
         "reminders",
         "notes_index",
+        "outbox",
     }, report["checks"]
     assert report["checks"]["redis"]["backend"] == "memory"
 
@@ -347,6 +349,64 @@ async def test_notes_index_probe_survives_missing_schema_and_dead_db(
 
     monkeypatch.setattr(cli, "_scalar", boom)
     report = await cli._notes_index_report(cfg)
+    assert report["ok"] is True and "не проверялось" in report["note"]
+
+
+async def test_outbox_probe_shows_the_queue_and_the_way_to_fix_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Очередь outbox без NATS — это «копится и ждёт», а не болезнь: события в таблице целы."""
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(
+        cli,
+        "_scalar",
+        # порядок игл в _FakeSession значителен: совпадает первое подошедшее, поэтому более
+        # специфичный «attempts >= :n» идёт раньше общего «published_at IS NULL»
+        _FakeSession({"to_regclass": True, "attempts >= :n": 0, "published_at IS NULL": 4312}),
+    )
+    report = await cli._outbox_report(cfg)
+    assert report["ok"] is True
+    assert report["pending"] == 4312 and report["relay"] == "выключен"
+    assert "OUTBOX_RELAY_ENABLED=true" in report["hint"]
+    assert "4312 ждут публикации" in report["note"]
+
+
+async def test_outbox_probe_calls_out_exhausted_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None, _env_prefix="T_", glm_api_key="k", outbox_relay_enabled=True
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scalar",
+        _FakeSession({"to_regclass": True, "attempts >= :n": 5, "published_at IS NULL": 7}),
+    )
+    report = await cli._outbox_report(cfg)
+    assert report["stuck"] == 5
+    assert "aegis outbox tick" in report["hint"] and "attempts = 0" in report["hint"]
+
+
+async def test_outbox_probe_survives_missing_table_and_dead_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis import cli
+    from aegis.platform.config import Settings
+
+    cfg = Settings(_env_file=None, _env_prefix="T_", glm_api_key="k")  # type: ignore[call-arg]
+    monkeypatch.setattr(cli, "_scalar", _FakeSession({"to_regclass": False}))
+    report = await cli._outbox_report(cfg)
+    assert report["ok"] is True and report["state"] == "нет таблицы"
+
+    async def boom(sql: str, **params: Any) -> Any:
+        raise OSError("[Errno 111] Connect call failed")
+
+    monkeypatch.setattr(cli, "_scalar", boom)
+    report = await cli._outbox_report(cfg)
     assert report["ok"] is True and "не проверялось" in report["note"]
 
 

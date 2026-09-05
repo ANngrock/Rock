@@ -100,17 +100,35 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="только сказать, сколько ждёт индексации — не трогая БД и модель",
     )
+    outbox = sub.add_parser("outbox", help="очередь событий и её публикация в NATS (relay)")
+    outbox_actions = outbox.add_subparsers(dest="outbox_action", required=True)
+    outbox_actions.add_parser(
+        "stats", help="сколько событий ждёт публикации и сколько с исчерпанными попытками"
+    )
+    ob_tick = outbox_actions.add_parser(
+        "tick", help="опубликовать непубликованное (для systemd-таймера)"
+    )
+    ob_tick.add_argument("--limit", type=int, default=None, help="сколько событий за проход")
+    ob_tick.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что ушло бы, — не публикуя и не трогая счётчики",
+    )
     return parser
 
 
-async def _scalar(sql: str) -> Any:
-    """Один запрос — одна сессия. Иначе упавший запрос отравляет остаток проверки."""
+async def _scalar(sql: str, **params: Any) -> Any:
+    """Один запрос — одна сессия. Иначе упавший запрос отравляет остаток проверки.
+
+    `params` — именованные bind'ы: порог («сколько попыток уже исчерпано») приезжает параметром, а
+    не вклеивается в SQL. Иначе каждый такой текст приходится держать в голове как «точно число?».
+    """
     from sqlalchemy import text
 
     from aegis.platform.db import session
 
     async with session() as s:
-        return await s.scalar(text(sql))
+        return await s.scalar(text(sql), params or None)
 
 
 async def _reminders_report(cfg: Any) -> dict[str, Any]:
@@ -197,6 +215,56 @@ async def _notes_index_report(cfg: Any) -> dict[str, Any]:
         "поиску это не мешает (он уходит в text-match); индексация: aegis index notes "
         "или aegis-index.timer"
     )
+    return out
+
+
+async def _outbox_report(cfg: Any) -> dict[str, Any]:
+    """Очередь outbox: сколько событий ждёт публикации и сколько застряло.
+
+    Проба справочная (`ok=true` всегда) — по той же причине, что и две предыдущие: без NATS бот
+    работает, события лежат в таблице и никуда не деваются. А вот «attempts исчерпаны» — это уже
+    «relay крутится впустую», и это `hint`, который надо увидеть в выводе, а не в статусе
+    контейнера.
+    """
+    out: dict[str, Any] = {"ok": True}
+    try:
+        ready = await _scalar("SELECT to_regclass('platform.outbox') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - настоящая ошибка БД уже в проверке postgres
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        out["hint"] = "детали — в проверке postgres"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = (
+            "docker compose -f deploy/docker-compose.yml run --rm bot alembic upgrade head"
+        )
+        return out
+    pending = int(
+        await _scalar("SELECT count(*) FROM platform.outbox WHERE published_at IS NULL") or 0
+    )
+    threshold = int(cfg.outbox_max_attempts)
+    stuck = int(
+        await _scalar(
+            "SELECT count(*) FROM platform.outbox WHERE published_at IS NULL AND attempts >= :n",
+            n=threshold,
+        )
+        or 0
+    )
+    out["pending"] = pending
+    out["stuck"] = stuck
+    out["relay"] = "включён" if cfg.outbox_relay_enabled else "выключен"
+    out["stream"] = cfg.nats_stream or "core NATS (без ack)"
+    if not pending:
+        out["note"] = "очередь пуста"
+        return out
+    out["note"] = f"{pending} ждут публикации · тик ≤ {cfg.outbox_batch} · attempts ≥ {threshold}"
+    if stuck:
+        out["hint"] = (
+            "события не принимаются транспортом: aegis outbox tick покажет причину; "
+            "вернуть в очередь — UPDATE platform.outbox SET attempts = 0"
+        )
+    elif not cfg.outbox_relay_enabled:
+        out["hint"] = "копятся, пока relay выключен: OUTBOX_RELAY_ENABLED=true + aegis-outbox.timer"
     return out
 
 
@@ -445,6 +513,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["postgres"] = await _postgres_report()
         report["checks"]["reminders"] = await _reminders_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
+        report["checks"]["outbox"] = await _outbox_report(cfg)
 
         try:
             if cfg.kv_backend == "memory":
@@ -667,6 +736,86 @@ async def _cmd_index(action: str, args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+async def _cmd_outbox(action: str, args: argparse.Namespace) -> int:
+    """Outbox → NATS: очередь событий, один проход relay'я, диагностика.
+
+    Никакой другой логики здесь нет: `drain` — чистая функция над магазином и транспортом, и тот
+    же путь проходит systemd-тик. Поэтому «в CLI публикует, а по таймеру нет» невозможно по
+    конструкции, как и с напоминаниями.
+    """
+    from sqlalchemy import text
+
+    from aegis.platform.config import ConfigError, settings
+    from aegis.platform.db import session
+    from aegis.platform.events.relay import RelayUnavailable, drain
+    from aegis.platform.events.store import EventStore
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+
+    if action == "stats":
+        try:
+            async with session() as s:
+                counts = await EventStore(s).counts(max_attempts=cfg.outbox_max_attempts)
+                total = int(await s.scalar(text("SELECT count(*) FROM platform.outbox")) or 0)
+        except Exception as exc:  # noqa: BLE001 - CLI обязан объяснить, а не показать стек
+            print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+            return 1
+        print(
+            f"ждут публикации {counts['pending']} из {total}, "
+            f"с исчерпанными попытками: {counts['stuck']}"
+        )
+        print(
+            f"  relay: {'включён' if cfg.outbox_relay_enabled else 'выключен'} · "
+            f"тик ≤ {cfg.outbox_batch} · транспорт: {cfg.nats_url} · стрим: {cfg.nats_stream}"
+        )
+        # застрявшее — это «нужна реакция», и systemd должен видеть failed у юнита, а не «тихо»
+        return 1 if counts["stuck"] else 0
+
+    if action == "tick":
+        from aegis.platform.events.nats import NatsPublisher
+        from aegis.platform.events.relay import NullTransport
+
+        # проба очереди не требует поднятого брокера: «сколько накопилось» хотят узнать и без
+        # NATS. Требовать транспорт, чтобы посмотреть очередь, — значит обесценить пробу
+        transport: Any = NullTransport() if args.dry_run else None
+        if transport is None:
+            try:
+                transport = NatsPublisher.from_settings(cfg)
+                await transport.start()
+            except RelayUnavailable as exc:
+                print(f"! {exc}", file=sys.stderr)
+                return 2
+            except Exception as exc:  # noqa: BLE001 - транспорт не обязан знать наши классы
+                print(
+                    f"! транспорт недоступен: {type(exc).__name__}: {str(exc)[:200]}",
+                    file=sys.stderr,
+                )
+                return 2
+        try:
+            async with session() as s:
+                report = await drain(
+                    EventStore(s),
+                    transport,
+                    limit=args.limit or cfg.outbox_batch,
+                    max_attempts=cfg.outbox_max_attempts,
+                    dry_run=args.dry_run,
+                    prefix=cfg.nats_subject_prefix,
+                )
+        except Exception as exc:  # noqa: BLE001 - тот же договор: без стека в выводе тика
+            print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+            return 1
+        finally:
+            await transport.aclose()
+        print(report.summary())
+        return 0 if report.ok else 1
+
+    return 2
+
+
 async def _cmd_ask(text: str, owner_id: int) -> int:
     from aegis.agents.supervisor import Inbound
     from aegis.agents.tools import load_builtin_tools
@@ -829,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_remind(args.remind_action, args))
         if args.command == "index":
             return asyncio.run(_cmd_index(args.index_action, args))
+        if args.command == "outbox":
+            return asyncio.run(_cmd_outbox(args.outbox_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

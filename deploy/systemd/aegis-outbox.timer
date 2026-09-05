@@ -1,0 +1,14 @@
+[Unit]
+Description=aegis: каждые 5 минут выгружать outbox в NATS
+
+[Timer]
+# 5 минут: получателей событий сегодня нет ни у кого, а latency стрима из личных событий
+# измеряется часами. Когда появится потребитель «реагировать быстро» — достаточно уменьшить
+# интервал: сам проход идемпотентен и держит lock только на время своего пакета
+OnCalendar=*-*-* *:00/5:00
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target
