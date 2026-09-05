@@ -50,6 +50,7 @@ from aegis.platform.gateway.client import ChatResult, ModelUnavailable
 from aegis.platform.gateway.cost import BudgetExceeded
 from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint
 from aegis.platform.gateway.models import ChatRole
+from aegis.platform.gateway.streaming import TextSink
 from aegis.platform.kv import KV, history_key, pending_key
 from aegis.platform.logging import bind_contextvars
 from aegis.web.search import wrap_untrusted
@@ -164,7 +165,7 @@ class Supervisor:
 
     # ------------------------------------------------ public
 
-    async def handle(self, msg: Inbound) -> Reply:
+    async def handle(self, msg: Inbound, *, on_delta: TextSink | None = None) -> Reply:
         trace_id = str(uuid.uuid4())
         bind_contextvars(trace_id=trace_id, owner_id=msg.owner_id)
         level = await self._degradation_level()
@@ -226,7 +227,7 @@ class Supervisor:
                 fast.trace_id = trace_id
                 await self._record_turn(ctx, messages, fast, route=route)
                 return fast
-            reply = await self._guarded_loop(messages, ctx, route=route)
+            reply = await self._guarded_loop(messages, ctx, route=route, on_delta=on_delta)
             await self._verify_reply(reply, ctx, question=msg.text)
             notes = _notes_of(ctx)
             _append_notices(reply, ctx)
@@ -455,11 +456,16 @@ class Supervisor:
     # ------------------------------------------------ цикл агента
 
     async def _guarded_loop(
-        self, messages: list[dict[str, Any]], ctx: ToolContext, *, route: Route
+        self,
+        messages: list[dict[str, Any]],
+        ctx: ToolContext,
+        *,
+        route: Route,
+        on_delta: TextSink | None = None,
     ) -> Reply:
         """Цикл с гарантированной деградацией: ни бюджет, ни отказ провайдера не роняют ответ."""
         try:
-            return await self._loop(messages, ctx, route=route)
+            return await self._loop(messages, ctx, route=route, on_delta=on_delta)
         except BudgetExceeded as exc:
             redacted = self.services.gateway.dlp.redact(str(exc))
             reply = Reply(
@@ -498,7 +504,12 @@ class Supervisor:
             return reply
 
     async def _loop(
-        self, messages: list[dict[str, Any]], ctx: ToolContext, *, route: Route
+        self,
+        messages: list[dict[str, Any]],
+        ctx: ToolContext,
+        *,
+        route: Route,
+        on_delta: TextSink | None = None,
     ) -> Reply:
         total_cost = 0.0
         model: str | None = None
@@ -509,13 +520,22 @@ class Supervisor:
             # без begin_turn (resume, деградация) — тогда step=0 и мы откатываемся на итерацию
             step = self.repro.turn_step(ctx.trace_id) or iterations
             ctx.extras["turn_no"] = step
-            res: ChatResult = await self.services.gateway.chat(
-                route.role,
-                messages,
-                tools=self.registry.schemas() if route.tools else None,
-                thinking=route.thinking,
-                trace_id=ctx.trace_id,
-            )
+            call_kwargs: dict[str, Any] = {
+                "tools": self.registry.schemas() if route.tools else None,
+                "thinking": route.thinking,
+                "trace_id": ctx.trace_id,
+            }
+            # стриминг включён, только если интерфейс реально куда-то текст досылает: иначе это был
+            # бы «стрим ради стрима» — та же задержка до ответа и лишний риск на оборванный поток
+            sink = on_delta if self.cfg.stream_replies else None
+            if sink is None:
+                res: ChatResult = await self.services.gateway.chat(
+                    route.role, messages, **call_kwargs
+                )
+            else:
+                res = await self.services.gateway.chat_stream(
+                    route.role, messages, on_text=sink, **call_kwargs
+                )
             total_cost += res.cost_usd
             model = res.model
             messages.append(res.raw_message)

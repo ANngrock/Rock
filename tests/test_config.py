@@ -17,6 +17,22 @@ def load(**kw: object) -> Settings:
     return Settings(_env_file=None, _env_prefix="AEGIS_TEST_ONLY_", **kw)
 
 
+def test_streaming_is_off_until_the_owner_turns_it_on() -> None:
+    """Стриминг по умолчанию выключен, а интервал имеет пол.
+
+    Оба правила стоят места в тесте: `STREAM_REPLIES=true` без правки лимитов чата — это 429 в
+    разгар ответа, а `STREAM_EDIT_INTERVAL_MS=0` означает «править на каждый токен».
+    """
+    cfg = load()
+    assert cfg.stream_replies is False
+    assert cfg.stream_edit_interval_ms == 900
+
+    assert load(stream_replies=True, stream_edit_interval_ms=200).stream_replies is True
+    for bad in (100, 0, -1, 60_000):
+        with pytest.raises(ValidationError):
+            load(stream_edit_interval_ms=bad)
+
+
 def test_defaults_are_sane_without_env() -> None:
     cfg = load()
     assert cfg.timezone == "Europe/Moscow"

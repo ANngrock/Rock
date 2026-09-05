@@ -40,6 +40,7 @@ from aegis.agents.tools import load_builtin_tools
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
 from aegis.interaction.telegram.render import render_for_telegram, strip_tags
+from aegis.interaction.telegram.stream import PLACEHOLDER, make_stream
 from aegis.platform.config import ConfigError
 from aegis.platform.gateway.diagnose import redact_secrets
 from aegis.runtime import App, build_app
@@ -184,6 +185,7 @@ async def cmd_status(message: Message, app: App) -> None:
         f"Kill switch: <b>{_kill_label(status)}</b>",
         _polish_line(status),
         _reminders_line(status),
+        f"Живой ответ: {_stream_label(app.cfg)}",
         f"История в контексте: {status['history_messages']} реплик",
         f"Инструментов: {len(status['tools'])}",
     ]
@@ -361,11 +363,18 @@ async def on_confirm(callback: CallbackQuery, app: App, bot: Bot) -> None:
 
 
 async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = None) -> None:
-    """Общий путь: индикатор → supervisor → отправка; ошибка — в чат и, если задан, в алерты."""
+    """Общий путь: индикатор → supervisor → отправка; ошибка — в чат и, если задан, в алерты.
+
+    При `STREAM_REPLIES=true` «индикатор» перестаёт быть индикатором: он и есть ответ, который
+    дописывается на месте. Отсюда порядок — сначала пробуем `finish` (если правки хватило, выходим),
+    и только иначе удаляем черновик и идём обычной отправкой. Другой порядок дал бы либо потерянный
+    ответ, либо два одинаковых сообщения.
+    """
     bot = bot or message.bot
-    status = await message.answer("…")
+    status = await message.answer(PLACEHOLDER)
+    stream = make_stream(status, app.cfg)
     try:
-        reply = await app.supervisor.handle(inbound)
+        reply = await app.supervisor.handle(inbound, on_delta=stream.push if stream else None)
     except Exception as exc:  # noqa: BLE001 - владельцу показываем деградацию, а не traceback
         log.exception("handle.failed")
         reply = Reply(
@@ -378,12 +387,33 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
             degraded=True,
         )
         await notify_failure(app, bot, exc)
+    if stream is not None:
+        markup = (
+            _confirm_keyboard(reply.pending_id, len(reply.pending))
+            if reply.needs_confirmation and reply.pending_id is not None
+            else None
+        )
+        if await stream.finish(reply.text, markup=markup):
+            return
     try:
         await status.delete()
     except TelegramAPIError:
         pass
     if bot is not None:
         await send_reply(bot, message.chat.id, reply)
+
+
+def _stream_label(cfg: Any) -> str:
+    """Включён ли живой ответ.
+
+    Строка нужна, потому что «бот молчит сорок секунд» и «бот правит сообщение по кускам» для
+    владельца выглядят одинаково, а различаются одной настройкой — и первый вопрос после этого
+    всегда «он вообще работает?».
+    """
+    if not getattr(cfg, "stream_replies", False):
+        return "выключен (ответ одним сообщением)"
+    ms = int(getattr(cfg, "stream_edit_interval_ms", 900))
+    return f"включён, правка раз в {ms} мс"
 
 
 def _polish_line(status: dict[str, Any]) -> str:

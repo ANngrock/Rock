@@ -12,8 +12,14 @@ from typing import Any
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 
-from aegis.agents.supervisor import PendingAction, Reply
-from aegis.interaction.telegram.bot import OwnerOnly, _confirm_keyboard, send_reply
+from aegis.agents.supervisor import Inbound, PendingAction, Reply
+from aegis.interaction.telegram.bot import (
+    OwnerOnly,
+    _confirm_keyboard,
+    _stream_label,
+    run,
+    send_reply,
+)
 
 
 async def test_owner_only_lets_the_owner_through() -> None:
@@ -234,3 +240,128 @@ async def test_unknown_command_answered_locally(monkeypatch: pytest.MonkeyPatch)
         None,  # type: ignore[arg-type]
     )
     assert handled == ["привет"]
+
+
+# ------------------------------------------------------------------ живой ответ в чате
+
+
+class DraftMessage:
+    """Message, у которого «индикатор» и есть будущий ответ: `answer` возвращает себя.
+
+    Так устроено в проде (`status = await message.answer("…")`, потом правки того же сообщения), и
+    тест обязан видеть именно эту связь: черновик либо превращается в ответ, либо удаляется.
+    """
+
+    def __init__(self, *, edit_fails: bool = False) -> None:
+        self.chat = SimpleNamespace(id=7)
+        self.bot = None
+        self.edits: list[dict[str, Any]] = []
+        self.deleted = False
+        self.edit_fails = edit_fails
+
+    async def answer(self, text: str, *args: Any, **kwargs: Any) -> DraftMessage:
+        self.asked = text
+        return self
+
+    async def edit_text(
+        self,
+        text: str | None = None,
+        *,
+        parse_mode: Any = None,
+        reply_markup: Any = None,
+        link_preview_options: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        if self.edit_fails:
+            raise TelegramBadRequest(method="editMessageText", message="can't parse entities")
+        self.edits.append({"text": text, "parse_mode": parse_mode, "reply_markup": reply_markup})
+
+    async def delete(self) -> None:
+        self.deleted = True
+
+
+class DraftSupervisor:
+    """Отдаёт заготовленный ответ и досылает куски ровно так, как это делает шлюз."""
+
+    def __init__(self, reply: Reply, *, pieces: tuple[str, ...] = ("при", "вет")) -> None:
+        self.reply = reply
+        self.pieces = pieces
+        self.sinks: list[Any] = []
+
+    async def handle(self, inbound: Any, *, on_delta: Any = None) -> Reply:
+        self.sinks.append(on_delta)
+        if on_delta is not None:
+            for piece in self.pieces:
+                await on_delta(piece)
+        return self.reply
+
+
+def draft_app(supervisor: DraftSupervisor, **cfg: Any) -> Any:
+    from aegis.platform.config import Settings
+
+    base: dict[str, Any] = {"stream_replies": True}
+    base.update(cfg)
+    return SimpleNamespace(cfg=Settings(**base), supervisor=supervisor)  # type: ignore[arg-type]
+
+
+async def test_streamed_answer_becomes_the_draft_message() -> None:
+    sup = DraftSupervisor(Reply(text="привет, всё хорошо"))
+    message = DraftMessage()
+    bot = RecordingBot()
+
+    await run(message, draft_app(sup), Inbound(text="как дела", owner_id=1), bot)  # type: ignore[arg-type]
+
+    assert sup.sinks[0] is not None, "при включённом стриминге интерфейс обязан передать приёмник"
+    assert message.edits[-1]["text"] == "привет, всё хорошо"
+    assert message.edits[-1]["parse_mode"] == "HTML", "формат догоняется в финальной правке"
+    assert not message.deleted, "черновик не удаляют: он и есть ответ"
+    assert bot.sent == [], "второе сообщение с тем же текстом — это дубль"
+
+
+async def test_streaming_off_keeps_the_usual_path() -> None:
+    sup = DraftSupervisor(Reply(text="ответ"))
+    message = DraftMessage()
+    bot = RecordingBot()
+
+    await run(
+        message,
+        draft_app(sup, stream_replies=False),
+        Inbound(text="привет", owner_id=1),
+        bot,  # type: ignore[arg-type]
+    )
+
+    assert sup.sinks[0] is None, "без стриминга шлюз не дёргают стримом"
+    assert message.deleted is True
+    assert bot.sent[0][1] == "ответ"
+
+
+async def test_long_answer_is_not_left_in_the_draft() -> None:
+    sup = DraftSupervisor(Reply(text="д" * 9000))
+    message = DraftMessage()
+    bot = RecordingBot()
+
+    await run(message, draft_app(sup), Inbound(text="длинно", owner_id=1), bot)  # type: ignore[arg-type]
+
+    assert bot.sent and message.deleted is True, "многочастичный ответ отправляется целиком"
+    assert "".join(text for _, text, _ in bot.sent) == "д" * 9000
+
+
+async def test_failed_edit_does_not_eat_the_answer() -> None:
+    sup = DraftSupervisor(Reply(text="ответ"))
+    message = DraftMessage(edit_fails=True)
+    bot = RecordingBot()
+
+    await run(message, draft_app(sup), Inbound(text="привет", owner_id=1), bot)  # type: ignore[arg-type]
+
+    assert message.edits == []
+    assert bot.sent[0][1] == "ответ", "сбой правки обязан уйти в обычную отправку, а не в тишину"
+
+
+def test_status_names_the_answer_mode() -> None:
+    """Режим ответа видно в /status: «молчит и правит» и «молчит и ждёт» — разные сбои."""
+
+    off = SimpleNamespace(stream_replies=False, stream_edit_interval_ms=900)
+    on = SimpleNamespace(stream_replies=True, stream_edit_interval_ms=1500)
+
+    assert "выключен" in _stream_label(off)  # type: ignore[arg-type]
+    assert _stream_label(on) == "включён, правка раз в 1500 мс"  # type: ignore[arg-type]

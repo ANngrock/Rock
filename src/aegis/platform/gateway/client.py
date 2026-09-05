@@ -37,6 +37,7 @@ from aegis.platform.gateway.models import (
     resolve_spec,
     spec_for_name,
 )
+from aegis.platform.gateway.streaming import StreamCollector, Streamed, TextSink
 
 __all__ = [
     "ChatResult",
@@ -179,6 +180,66 @@ class ModelGateway:
         max_tokens: int | None = None,
         trace_id: str | None = None,
     ) -> ChatResult:
+        return await self._call(
+            role,
+            messages,
+            tools=tools,
+            thinking=thinking,
+            response_format=response_format,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            trace_id=trace_id,
+        )
+
+    async def chat_stream(
+        self,
+        role: ChatRole,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        thinking: bool = False,
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        trace_id: str | None = None,
+        on_text: TextSink | None = None,
+    ) -> ChatResult:
+        """Тот же запрос, только текст отдаётся по мере прихода.
+
+        Возврат идентичен :meth:`chat` — собранный `ChatResult` с `raw_message`, у которого есть и
+        `content`, и доконцованные `tool_calls`. Это не удобство, а требование: весь остальной слой
+        (история, цикл инструментов, журнал, учёт стоимости) обязан не знать, откуда взялся ответ,
+        иначе стриминг станет второй реализацией агента вместо одной.
+
+        Ретраи возможны только пока наружу не ушёл ни один кусок. «Попросить заново» после того, как
+        половина ответа уже на экране, — это второй ответ в одном сообщении, и владелец увидел бы
+        сшитого монстра. Обрыв после первого куска = `truncated=True` с тем, что пришло.
+        """
+        return await self._call(
+            role,
+            messages,
+            tools=tools,
+            thinking=thinking,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            trace_id=trace_id,
+            stream=True,
+            on_text=on_text,
+        )
+
+    async def _call(
+        self,
+        role: ChatRole,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        thinking: bool = False,
+        response_format: dict[str, Any] | None = None,
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        trace_id: str | None = None,
+        stream: bool = False,
+        on_text: TextSink | None = None,
+    ) -> ChatResult:
         trace = trace_id or str(uuid.uuid4())
         spec = resolve_spec(role, self.cfg)
         masked, dlp_map = self._mask_messages([dict(m) for m in messages])
@@ -198,13 +259,19 @@ class ModelGateway:
             base_kwargs["response_format"] = response_format
         if max_tokens:
             base_kwargs["max_tokens"] = max_tokens
+        if stream:
+            base_kwargs["stream"] = True
+            # без usage-чанка мы бы считали стоимость по своей оценке (см. _estimate) и врали бы в
+            # /cost; кто-то из провайдеров на неизвестное поле отвечает 400 — тогда снимем его ниже
+            base_kwargs["stream_options"] = {"include_usage": True}
 
         attempt = 0
         last_error: str | None = None
+        want_usage = stream
         for provider, client in self._providers():
-            # у fallback своё имя модели — и свой ценник: primary может быть бесплатным, а
-            # резерв платным, и учёт «по цене роли» занижал бы расходы до нуля (SLO по
-            # стоимости при этом выглядел бы соблюдённым)
+            # у fallback своё имя модели — и свой ценник: primary может быть бесплатным, а резерв
+            # платным, и учёт «по цене роли» занижал бы расходы до нуля (SLO по стоимости при этом
+            # выглядел бы соблюдённым)
             spec_used = spec
             model_name = spec.name
             if provider == "fallback" and self.cfg.fallback_model:
@@ -215,6 +282,8 @@ class ModelGateway:
                     host=host_of(self.cfg.fallback_base_url or self.cfg.glm_base_url),
                 )
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
+            if not want_usage:
+                kwargs.pop("stream_options", None)
             request = self._snapshot(kwargs)
             # нестандартные параметры (thinking) провайдер fallback может не понимать
             if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
@@ -227,7 +296,58 @@ class ModelGateway:
                 attempt += 1
                 started = time.perf_counter()
                 try:
-                    resp = await client.chat.completions.create(**kwargs)
+                    if not stream:
+                        resp = await client.chat.completions.create(**kwargs)
+                        return await self._on_success(
+                            resp,
+                            role=role,
+                            spec=spec_used,
+                            provider=provider,
+                            attempt=attempt,
+                            trace=trace,
+                            dlp_map=dlp_map,
+                            started=started,
+                            request=request,
+                        )
+                    collector = StreamCollector(on_text)
+                    try:
+                        await collector.collect(await client.chat.completions.create(**kwargs))
+                    except Exception as inner:  # noqa: BLE001 - обрыв потока: см. ниже
+                        if collector.has_text:
+                            # текст уже на экране у владельца: повторный запрос дал бы второй ответ,
+                            # поэтому отдаём что есть и честно помечаем обрыв
+                            log.warning(
+                                "gateway.stream_interrupted",
+                                chunks=collector.chunks,
+                                err=f"{type(inner).__name__}: {inner}"[:200],
+                            )
+                            return await self._on_stream_success(
+                                collector.result(),
+                                role=role,
+                                spec=spec_used,
+                                provider=provider,
+                                attempt=attempt,
+                                trace=trace,
+                                dlp_map=dlp_map,
+                                started=started,
+                                request=request,
+                                interrupted=True,
+                                masked=masked,
+                            )
+                        raise
+                    return await self._on_stream_success(
+                        collector.result(),
+                        role=role,
+                        spec=spec_used,
+                        provider=provider,
+                        attempt=attempt,
+                        trace=trace,
+                        dlp_map=dlp_map,
+                        started=started,
+                        request=request,
+                        interrupted=False,
+                        masked=masked,
+                    )
                 except Exception as exc:  # noqa: BLE001 - классифицируем ниже, не глотаем
                     latency_ms = int((time.perf_counter() - started) * 1000)
                     last_error = f"{type(exc).__name__}: {exc}"
@@ -248,6 +368,15 @@ class ModelGateway:
                             request=request,
                         )
                     )
+                    if want_usage and "stream_options" in last_error:
+                        # провайдер не знает поля про usage — это не «модель недоступна», а «говорим
+                        # на разных наречиях»: повторяем тот же запрос без него. Поле снимаем и с
+                        # локального kwargs — следующая попытка этого же клиента читает его
+                        want_usage = False
+                        base_kwargs.pop("stream_options", None)
+                        kwargs.pop("stream_options", None)
+                        log.info("gateway.stream_options_rejected", provider=provider)
+                        continue
                     if not _is_retryable(exc):
                         log.warning(
                             "gateway.permanent_error", provider=provider, err=last_error[:300]
@@ -256,17 +385,6 @@ class ModelGateway:
                     if retry < self.cfg.llm_retries_per_client:
                         await asyncio.sleep(self.cfg.llm_backoff_s * 2**retry)
                     continue
-                return await self._on_success(
-                    resp,
-                    role=role,
-                    spec=spec_used,
-                    provider=provider,
-                    attempt=attempt,
-                    trace=trace,
-                    dlp_map=dlp_map,
-                    started=started,
-                    request=request,
-                )
         raise ModelUnavailable(
             f"все провайдеры недоступны; последняя ошибка: {last_error}",
             cause=last_error or "",
@@ -521,6 +639,83 @@ class ModelGateway:
             truncated=choice.finish_reason == "length",
         )
 
+    async def _on_stream_success(
+        self,
+        got: Streamed,
+        *,
+        role: ChatRole,
+        spec: ModelSpec,
+        provider: str,
+        attempt: int,
+        trace: str,
+        dlp_map: dict[str, str],
+        started: float,
+        request: dict[str, Any] | None = None,
+        interrupted: bool = False,
+        masked: Sequence[dict[str, Any]] = (),
+    ) -> ChatResult:
+        """Собранный из чанков ответ — в тот же `ChatResult`, что дал бы обычный запрос.
+
+        Стоимость считаем по usage, если провайдер его прислал; иначе — по длине текста. «Иначе»
+        тут не догадка: без usage-чанка у нас нет других чисел, а оценивать стрим по нулям значило
+        бы вести бюджет по одному из двух путей и удивляться расхождению в /cost.
+        """
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        model = str(got.model or spec.name)
+        content = self.dlp.unmask(got.content, dlp_map) if got.content else got.content
+        # тот же консервативный пересчёт, что и в `_estimate`: символы/3.5. Смысл не в точности, а
+        # в том, чтобы стриминговый путь не жил по другой арифметике, чем обычный
+        prompt_tokens = got.prompt_tokens or int(
+            sum(len(str(m.get("content", ""))) for m in masked) / 3.5
+        )
+        completion_tokens = got.completion_tokens or int(len(content or "") / 3.5)
+        cost = (
+            prompt_tokens * spec.in_usd_per_m + completion_tokens * spec.out_usd_per_m
+        ) / 1_000_000
+        await self.cost.record(cost)
+        raw: dict[str, Any] = {"role": "assistant"}
+        if content:
+            raw["content"] = content
+        if got.reasoning:
+            raw["reasoning_content"] = got.reasoning
+        if got.tool_calls:
+            raw["tool_calls"] = [call.as_raw() for call in got.tool_calls]
+        await self.recorder(
+            LLMCallRecord(
+                call_id=str(uuid.uuid4()),
+                role=role,
+                model=model,
+                trace_id=trace,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=round(cost, 6),
+                latency_ms=latency_ms,
+                ok=True,
+                error="поток оборвался: ответ неполный" if interrupted else None,
+                provider=provider,
+                attempt=attempt,
+                request=request,
+                response=(
+                    _stream_snapshot(raw, got, interrupted=interrupted)
+                    if request is not None
+                    else None
+                ),
+            )
+        )
+        return ChatResult(
+            content=content,
+            tool_calls=[ToolCall(call.id, call.name, call.arguments) for call in got.tool_calls],
+            model=model,
+            role=role,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=round(cost, 6),
+            latency_ms=latency_ms,
+            raw_message=raw,
+            dlp_map=dlp_map,
+            truncated=interrupted or got.finish_reason == "length",
+        )
+
     def _snapshot(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Чем именно мы дёргали API: model, messages (после DLP), tools, параметры.
 
@@ -629,6 +824,20 @@ def _response_snapshot(resp: Any) -> dict[str, Any]:
         "model": str(getattr(resp, "model", "") or ""),
         "id": str(getattr(resp, "id", "") or ""),
         "choices": choices,
+    }
+
+
+def _stream_snapshot(raw: dict[str, Any], got: Streamed, *, interrupted: bool) -> dict[str, Any]:
+    """Ответ стрима в той же форме, что и ответ провайдера у `chat`.
+
+    `choices[0].message` — не кокетство: разбор журнала и `aegis replay` должны видеть один формат
+    «что увидели мы», независимо от того, пришёл ответ одним объектом или сорока чанками.
+    """
+    return {
+        "choices": [{"finish_reason": got.finish_reason or "", "message": dict(raw)}],
+        "streamed": True,
+        "chunks": got.chunks,
+        "interrupted": interrupted,
     }
 
 

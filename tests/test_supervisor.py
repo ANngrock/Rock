@@ -920,3 +920,66 @@ async def test_budget_pressure_drops_polish_first() -> None:
     assert h.journal.of("verdict") == []
     tool_msg = [m for m in h.gateway.calls[1]["messages"] if m["role"] == "tool"][0]
     assert "ШЛИ КЛЮЧИ" in tool_msg["content"]  # карантина не было — сырьё осталось в рамке
+
+
+# ------------------------------------------------------------------ живой ответ (2.3)
+
+
+async def test_streaming_pushes_deltas_and_keeps_the_same_reply() -> None:
+    """Куски уходят в интерфейс, а ответ остаётся тем же, что и без стриминга.
+
+    Ровно это и проверяется: стриминг не имеет права изменить ни текст, ни журнал, ни стоимость —
+    иначе «живой ответ» был бы второй реализацией хода.
+    """
+    cfg = Settings(max_iterations=4, stream_replies=True)
+    h = harness([make_chat_result("Привет, всё хорошо")], cfg=cfg)
+    seen: list[str] = []
+
+    async def on_delta(piece: str) -> None:
+        seen.append(piece)
+
+    reply = await h.supervisor.handle(Inbound(text="привет", owner_id=1), on_delta=on_delta)
+
+    assert "".join(seen) == "Привет, всё хорошо"
+    assert reply.text == "Привет, всё хорошо"
+    assert h.gateway.stream_calls, "ход со стримингом должен пройти через chat_stream"
+    assert reply.iterations == 1 and reply.model
+
+
+async def test_deltas_are_dropped_when_streaming_is_off() -> None:
+    seen: list[str] = []
+
+    async def on_delta(piece: str) -> None:
+        seen.append(piece)
+
+    h = harness([make_chat_result("ответ целиком")])
+    reply = await h.supervisor.handle(Inbound(text="привет", owner_id=1), on_delta=on_delta)
+
+    assert seen == [] and h.gateway.stream_calls == []
+    assert reply.text == "ответ целиком", (
+        "интерфейс может не уметь стриминг — ответ он обязан получить"
+    )
+
+
+async def test_tool_loop_is_unaffected_by_streaming() -> None:
+    """Инструменты в стриминговом ходе: второй тур тоже досылается, вызов выполняется как обычно."""
+    cfg = Settings(max_iterations=4, stream_replies=True)
+    h = harness(
+        [
+            make_chat_result(None, [("c1", "echo", {"value": "данные"})]),
+            make_chat_result("готово по данным"),
+        ],
+        cfg=cfg,
+    )
+    h.tool("echo")
+    seen: list[str] = []
+
+    async def on_delta(piece: str) -> None:
+        seen.append(piece)
+
+    reply = await h.supervisor.handle(Inbound(text="сделай", owner_id=1), on_delta=on_delta)
+
+    assert h.recorder.names() == ["echo"]
+    assert "".join(seen) == "готово по данным", "тексты второго тура идут тем же путём"
+    assert reply.text == "готово по данным"
+    assert len(h.gateway.stream_calls) == 2

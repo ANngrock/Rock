@@ -57,6 +57,8 @@ class FakeGateway:
         self.dlp = DLP()
         self.calls: list[dict[str, Any]] = []
         self.json_calls: list[dict[str, Any]] = []
+        #: что ушло в стриминговый путь: отдельный список, чтобы `calls` не менял форму
+        self.stream_calls: list[dict[str, Any]] = []
         self.embed_calls = 0
         self.auth_hint_text = ""
 
@@ -78,6 +80,40 @@ class FakeGateway:
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
+        return item
+
+    async def chat_stream(
+        self,
+        role: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        thinking: bool = False,
+        trace_id: str | None = None,
+        on_text: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Стриминговый путь: тот же скрипт, но текст отдаётся кусками — как у провайдера.
+
+        Куски по 7 знаков, а не «весь ответ одним delta»: одним куском не проверить ни склейку, ни
+        то, что интерфейс видел ровно те же символы, что попали в ответ. `calls` остаётся той же
+        формы, что и у `chat` — тесты сверяют содержательные поля, а не различие путей.
+        """
+        self.calls.append(
+            {"role": role, "tools": tools, "thinking": thinking, "messages": messages}
+        )
+        self.stream_calls.append({"role": role, "trace_id": trace_id, "deltas": []})
+        if not self._responses:
+            raise AssertionError("FakeGateway: скрипт ответов исчерпан")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        content = item.content if isinstance(item.content, str) else ""
+        for start in range(0, len(content), 7):
+            piece = content[start : start + 7]
+            self.stream_calls[-1]["deltas"].append(piece)
+            if on_text is not None:
+                await on_text(piece)
         return item
 
     async def chat_json(

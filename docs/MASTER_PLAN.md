@@ -79,7 +79,7 @@ aegis/
 | Шаг | Содержание | Статус |
 |---|---|---|
 | 1. Фундамент | репозиторий, Docker, Postgres+pgvector, Redis, NATS, Temporal, SearXNG; config; event store+outbox; Model Gateway (GLM + fallback + retry + cost + DLP + запись вызовов); tool registry; policy engine; supervisor v1 с tier-роутингом и подтверждениями; Telegram bot с whitelist; память фактов, заметки, web search/fetch, vision-инструмент; миграции; тесты; CI | **сделан, ожидает запуска у владельца** |
-| 2. Ядро агента 2.0 | Temporal workflow сессии, Verifier, dual-LLM для untrusted, стриминг, STT (faster-whisper), напоминания (scheduler), Langfuse, golden datasets v1 (live-режим) | **Verifier + dual-LLM карантин и напоминания сделаны** (ADR-0009, ADR-0010); стриминг, Temporal/NATS/Langfuse/STT и golden datasets v2 — ждут |
+| 2. Ядро агента 2.0 | Temporal workflow сессии, Verifier, dual-LLM для untrusted, стриминг, STT (faster-whisper), напоминания (scheduler), Langfuse, golden datasets v1 (live-режим) | **Verifier + dual-LLM карантин, напоминания и стриминг ответов сделаны** (ADR-0009, ADR-0010, ADR-0011); Temporal/NATS/Langfuse/STT и golden datasets v2 — ждут |
 | 3. Finance | ledger двойной записи, счета/валюты, ввод текст/голос, категории+правила, бюджеты, семантический слой метрик, дайджесты, property-тесты | ожидает |
 | 4. Vision 2.0 | чеки/QR ФНС, документы, скриншоты→задачи, ingest в Knowledge, карантинная модель | ожидает |
 | 5. Planning | задачи/календарь, CP-SAT план дня, брифинги, привычки | ожидает |
@@ -104,6 +104,7 @@ aegis/
 | [0008](ADR/0008-decision-journal.md) | журнал решений в Postgres: контент-адресные блобы, хэш-цепочка, якорь дня; replay с замороженным миром |
 | [0009](ADR/0009-answer-verification-and-quarantine.md) | ответ сверяется с источниками (числа — кодом, смысл — судом в чистом контексте); внешний текст размечает отдельная роль, планировщик его не видит |
 | [0010](ADR/0010-reminders-on-a-table-and-a-timer.md) | напоминания: момент считает парсер, а не модель; расписание живёт в `planning.reminders`, исполняется тиком systemd-таймера с арендой строки — временная замена Temporal с теми же обещаниями |
+| [0011](ADR/0011-streaming-replies.md) | стриминг — транспорт, а не второй путь: `chat_stream` отдаёт тот же `ChatResult`; обрыв после первого куска = неполный ответ, а не повторный запрос; в Telegram итог дописывается в то же сообщение |
 
 ## 7. Что явно не делаем
 

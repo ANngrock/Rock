@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_owner_id: int | None = None
     telegram_alerts_chat_id: int | None = None
+    #: досылать ответ по мере генерации: то же сообщение правится по таймеру вместо «подожди 40
+    #: секунд и держись за стул». По умолчанию выключено: редактирование — отдельный вызов API, и
+    #: при чужих лимитах лучше молча отдать один готовый текст, чем воевать с 429 посреди ответа
+    stream_replies: bool = False
+    #: как часто можно править живое сообщение. Лимит Telegram считается на чат и делится со всеми
+    #: вызовами, поэтому «редактировать на каждый токен» — это гарантированный отказ
+    stream_edit_interval_ms: int = Field(default=900, ge=200, le=10_000)
 
     # --- модели (OpenAI-совместимый API) ---
     glm_api_key: SecretStr | None = None
