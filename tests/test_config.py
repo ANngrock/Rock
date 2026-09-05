@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from aegis.platform.config import ConfigError, Settings, override_settings, settings
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load(**kw: object) -> Settings:
@@ -81,3 +85,25 @@ def test_override_settings_is_scoped() -> None:
 def test_is_production_flag() -> None:
     assert load(env="production").is_production is True
     assert load(env="dev").is_production is False
+
+
+def test_env_example_documents_every_setting() -> None:
+    """Каждое поле Settings обязано быть в ``.env.example`` — закомментированным тоже.
+
+    Причина не в аккуратности: настройка, которой нет в образце, для владельца не существует. Так
+    «нет ключа в .env» превращается в «дефолт, о котором никто не просил», и первый же вопрос
+    «почему история живёт сутки» упирается в чтение кода.
+    """
+    sample = (_ROOT / ".env.example").read_text(encoding="utf-8").upper()
+    tokens = set(sample.replace("#", " ").replace("=", " ").split())
+    missing = sorted(name.upper() for name in Settings.model_fields if name.upper() not in tokens)
+    assert not missing, f"в .env.example нет строк для: {missing}"
+
+
+def test_repro_defaults_follow_the_plan_of_the_journal() -> None:
+    """Значения по умолчанию включены: воспроизводимость — требование, а не эксперимент."""
+    cfg = load()
+    assert cfg.repro_enabled is True
+    assert cfg.repro_record_payload is True
+    assert 4096 <= cfg.repro_max_blob_bytes <= 33_554_432
+    assert cfg.repro_verify_limit >= 100

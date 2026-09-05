@@ -37,6 +37,7 @@ from aiogram.types import (
 
 from aegis.agents.supervisor import Inbound, Reply
 from aegis.agents.tools import builtin  # noqa: F401  — импорт регистрирует инструменты
+from aegis.agents.tools import repro as repro_tools  # noqa: F401  — инструменты журнала (M1)
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
 from aegis.interaction.telegram.render import render_for_telegram, strip_tags
@@ -58,6 +59,7 @@ _HELP = (
     "• /cost — расходы на LLM сегодня\n"
     "• /status — режим, модели, бюджеты, kill switch\n"
     "• /tools — доступные инструменты\n"
+    "• /replay [id] — повторить ход по журналу и сравнить ответ (без id — последний)\n"
     "• /halt — заморозить записи (бот отвечает только чтением)\n"
     "• /resume — разморозить записи\n"
     "• /help — это сообщение"
@@ -169,6 +171,7 @@ async def cmd_status(message: Message, app: App) -> None:
     lines = [
         "<b>Состояние</b>",
         f"Трассировка: {trace}",
+        _repro_line(status),
         f"Промпт: <code>{status['prompt_version']}</code> · итераций ≤ {status['max_iterations']}",
         f"Модели:\n{models}",
         f"Fallback: {'включён' if status['gateway']['fallback_enabled'] else 'выключен'}",
@@ -193,6 +196,44 @@ async def cmd_tools(message: Message, app: App) -> None:
         risk = "" if spec.risk == "none" else f" · риск {spec.risk}"
         lines.append(f"• <code>{name}</code> {flag}{risk}")
     await message.answer("<b>Инструменты</b>\n" + "\n".join(lines))
+
+
+@router.message(Command("replay"))
+async def cmd_replay(message: Message, app: App, command: CommandObject) -> None:
+    """Повторить ход по журналу (M1): тот же вход, замороженный мир, вердикт судьи.
+
+    Без аргумента берём последний ход этого владельца: просить человека достать UUID из лога —
+    значит сделать функцию, которой никто не воспользуется.
+    """
+    if message.from_user is None:
+        return
+    from aegis.governance.replay import replay_trace
+
+    recorder = app.repro
+    if not recorder.enabled:
+        await message.answer(
+            "Журнал решений не ведётся (REPRO_ENABLED=false или нет БД) — воспроизводить нечего."
+        )
+        return
+    ref = (command.args or "").strip()
+    trace_id = ref or await recorder.latest_trace(owner_id=message.from_user.id) or ""
+    if not trace_id:
+        await message.answer("В журнале нет ни одного хода. Напиши что-нибудь, потом /replay.")
+        return
+    matches = await recorder.matching_traces(trace_id)
+    if not matches:
+        await message.answer(
+            f"Ход {trace_id[:13]} не найден: нужен UUID целиком или его начало от 6 символов."
+        )
+        return
+    if len(matches) > 1:
+        await message.answer(
+            "Начало подходит к нескольким ходам: " + ", ".join(m[:13] for m in matches)
+        )
+        return
+    pending = await message.answer("Повторяю ход: модель + судья, это два запроса…")
+    report = await replay_trace(matches[0], recorder=recorder, gateway=app.gateway)
+    await pending.edit_text(html_lib.escape(report.as_text(), quote=False)[:3800])
 
 
 @router.message(Command("halt"))
@@ -340,6 +381,24 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         pass
     if bot is not None:
         await send_reply(bot, message.chat.id, reply)
+
+
+def _repro_line(status: dict[str, Any]) -> str:
+    """Отдельная строка про журнал: «аудит пишется» и «ход воспроизводим» — разные обещания.
+
+    Аудит — строки для ``/cost``, журнал — содержимое промптов и ответов. Первое может жить без
+    второго, и владелец обязан видеть, что именно у него включено: иначе ``/replay`` выглядит
+    сломанным, а не выключенным.
+    """
+    if not status.get("repro_enabled"):
+        return (
+            "Журнал решений: <b>выключен</b> (REPRO_ENABLED) — /replay и «почему так ответил» "
+            "не работают"
+        )
+    failures = int(status.get("repro_failures") or 0)
+    if failures:
+        return f"Журнал решений: ⚠️ {failures} сбоев записи — проверь миграции и диск"
+    return "Журнал решений: ведётся (промпты, ответы, решения policy)"
 
 
 def _trace_label(app: App, status: dict[str, Any]) -> str:

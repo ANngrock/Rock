@@ -23,6 +23,7 @@ from aegis.agents.tools.registry import ToolRegistry
 from aegis.governance.audit import AuditLog, NullAudit, SqlAuditLog
 from aegis.governance.killswitch import KillSwitch
 from aegis.governance.policy import PolicyEngine
+from aegis.governance.recorder import DecisionRecorder, NullDecisionRecorder, SqlDecisionRecorder
 from aegis.platform.config import Settings, settings
 from aegis.platform.db import get_sessionmaker
 from aegis.platform.events.sink import (
@@ -56,6 +57,9 @@ class App:
     supervisor: Supervisor
     events: EventSink
     audit: AuditLog
+    #: журнал решений (M1). Отдельным полем, а не «внутри audit»: у него своя ответственность —
+    #  доказуемость хода, и «аудит пишется, а журнал нет» — реальное состояние, которое надо видеть
+    repro: DecisionRecorder
     registry: ToolRegistry
     db_ready: bool
     #: свой ли KV-клиент: чужой (инжектированный тестом) не закрываем
@@ -152,8 +156,11 @@ def build_app(
     db_ready = _probe_db()
     events: EventSink = BestEffortEventSink(OutboxEventSink()) if db_ready else NullEventSink()
     audit: AuditLog = SqlAuditLog() if db_ready else NullAudit()
-    gateway = ModelGateway(cfg, cost, recorder=_make_recorder(audit), dlp=DLP())
-    services = Services.build(gateway)
+    repro: DecisionRecorder = (
+        SqlDecisionRecorder(cfg) if (db_ready and cfg.repro_enabled) else NullDecisionRecorder()
+    )
+    gateway = ModelGateway(cfg, cost, recorder=_make_recorder(audit, repro), dlp=DLP())
+    services = Services.build(gateway, repro=repro)
     policy = PolicyEngine.from_settings(cfg)
     kill_switch = KillSwitch(kv)
     supervisor = Supervisor(
@@ -165,10 +172,12 @@ def build_app(
         events=events,
         audit=audit,
         kill_switch=kill_switch,
+        recorder=repro,
     )
     log.info(
         "app.built",
         db_ready=db_ready,
+        repro=repro.enabled,
         owns_kv=own_kv is not None,
         budget=cfg.daily_budget_usd,
         models=gateway.describe()["models"],
@@ -184,13 +193,22 @@ def build_app(
         supervisor=supervisor,
         events=events,
         audit=audit,
+        repro=repro,
         registry=registry,
         db_ready=db_ready,
     )
 
 
-def _make_recorder(audit: AuditLog) -> Any:
+def _make_recorder(audit: AuditLog, repro: DecisionRecorder) -> Any:
+    """Один хук шлюза — два получателя: метрики в аудит, содержимое в журнал решений.
+
+    Порядок фиксирован и не влияет на правильность (каждый писатель глотает свои ошибки сам), но
+    важен для цены вопроса: аудит — про бюджет и доступность, журнал — про доказуемость. Ни один из
+    них не имеет права лишить владельца ответа.
+    """
+
     async def record(record: Any) -> None:
         await audit.llm_call(record)
+        await repro.on_llm_call(record)
 
     return record

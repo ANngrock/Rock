@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -29,10 +30,18 @@ import structlog
 from aegis.agents.intents import try_answer
 from aegis.agents.prompts.system import PROMPT_VERSION, build_system_prompt
 from aegis.agents.services import Services
-from aegis.agents.tools.registry import Attachment, ToolContext, ToolRegistry, UnknownTool
+from aegis.agents.tools.registry import (
+    Attachment,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    UnknownTool,
+)
 from aegis.governance.audit import AuditLog, NullAudit
 from aegis.governance.killswitch import KillSwitch
 from aegis.governance.policy import ActionContext, Decision, PolicyEngine
+from aegis.governance.recorder import DecisionRecorder, NullDecisionRecorder
+from aegis.platform.canonical import sha256_hex
 from aegis.platform.config import Settings, settings
 from aegis.platform.events.sink import EventSink, NullEventSink
 from aegis.platform.gateway.client import ChatResult, ModelUnavailable
@@ -41,6 +50,7 @@ from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint
 from aegis.platform.gateway.models import ChatRole
 from aegis.platform.kv import KV, history_key, pending_key
 from aegis.platform.logging import bind_contextvars
+from aegis.web.search import wrap_untrusted
 
 __all__ = ["Inbound", "PendingAction", "Reply", "Route", "Supervisor"]
 
@@ -131,6 +141,7 @@ class Supervisor:
         events: EventSink | None = None,
         audit: AuditLog | None = None,
         kill_switch: KillSwitch | None = None,
+        recorder: DecisionRecorder | None = None,
     ) -> None:
         self.services = services
         self.registry = registry
@@ -140,6 +151,9 @@ class Supervisor:
         self.events: EventSink = events or NullEventSink()
         self.audit: AuditLog = audit or NullAudit()
         self.kill_switch = kill_switch
+        #: журнал решений (M1): точный вход/выход хода и хэш-цепочка. Null — когда БД нет, и это
+        #  видно в /status: «воспроизводимости нет» должно быть фактом, а не сюрпризом на инцидент
+        self.repro: DecisionRecorder = recorder or NullDecisionRecorder()
         #: KV упал в этом процессе? Честно показываем в /status, а не молча «забываем» историю
         self.kv_degraded = False
 
@@ -152,11 +166,13 @@ class Supervisor:
         route = self._route(msg, level=level)
         # level передаётся явно: route() и системный промпт должны видеть один и тот же бюджет
         log.info("supervisor.route", role=route.role, thinking=route.thinking, reason=route.reason)
+        system = await self._system_message(level=level)
         messages: list[dict[str, Any]] = [
-            await self._system_message(level=level),
+            system,
             *await self._history(msg.owner_id),
             {"role": "user", "content": self._user_content(msg)},
         ]
+        prompt_ids = self._prompt_ids(str(system.get("content") or ""))
         ctx = ToolContext(
             trace_id=trace_id,
             owner_id=msg.owner_id,
@@ -165,7 +181,20 @@ class Supervisor:
             attachments=list(msg.attachments),
             # инструменты ходят в тот же KV за кэшем курсов: свой ответ на «повтори» дешевле,
             # чем новый запрос в банк, но кэш не должен пережить смену вопроса
-            extras={"kv": self.kv, "notices": []},
+            extras={
+                "kv": self.kv,
+                "notices": [],
+                # шаги хода для журнала: номер шага и «чем этот ход был вооружён»
+                "turn_no": 0,
+                "prompt_ids": prompt_ids,
+                "started_at": time.perf_counter(),
+            },
+        )
+        self.repro.begin_turn(
+            trace_id,
+            owner_id=msg.owner_id,
+            prompt_ids=prompt_ids,
+            tools_schema_sha=self.registry.schema_sha(),
         )
         await self._event(
             owner_id=msg.owner_id,
@@ -181,16 +210,22 @@ class Supervisor:
         )
         # Детерминированный путь раньше модели: там, где есть первоисточник, LLM не нужен —
         # ответ не зависит ни от дневного бюджета, ни от живости провайдера (принцип 5).
-        fast = await self._try_intent(msg, ctx)
-        if fast is not None:
-            await self._save_history(msg.owner_id, messages, final_text=fast.text)
-            fast.trace_id = trace_id
-            return fast
-        reply = await self._guarded_loop(messages, ctx, route=route)
-        _append_notices(reply, ctx)
-        await self._save_history(msg.owner_id, messages, final_text=reply.text)
-        reply.trace_id = trace_id
-        return reply
+        try:
+            fast = await self._try_intent(msg, ctx)
+            if fast is not None:
+                await self._save_history(msg.owner_id, messages, final_text=fast.text)
+                fast.trace_id = trace_id
+                await self._record_turn(ctx, messages, fast, route=route)
+                return fast
+            reply = await self._guarded_loop(messages, ctx, route=route)
+            notes = _notes_of(ctx)
+            _append_notices(reply, ctx)
+            await self._save_history(msg.owner_id, messages, final_text=reply.text)
+            reply.trace_id = trace_id
+            await self._record_turn(ctx, messages, reply, route=route, notes=notes)
+            return reply
+        finally:
+            self.repro.end_turn(trace_id)
 
     async def resume(self, pending_id: str, approved: bool, owner_id: int) -> Reply:
         """Продолжение прерванного хода после решения владельца (ADR-006)."""
@@ -209,14 +244,23 @@ class Supervisor:
         messages: list[dict[str, Any]] = list(snapshot["messages"])
         actions: list[dict[str, Any]] = list(snapshot["actions"])
         trace_id = str(snapshot["trace_id"])
-        ctx = ToolContext(trace_id=trace_id, owner_id=owner_id, services=self.services)
+        ctx = ToolContext(
+            trace_id=trace_id,
+            owner_id=owner_id,
+            services=self.services,
+            extras={"kv": self.kv, "notices": [], "turn_no": 0, "started_at": time.perf_counter()},
+        )
+        # ход продолжает уже начатую трассу: без этого «до» и «после подтверждения» выглядели бы
+        # как два несвязанных ответа, а это ровно тот случай, где владельца интересует причина
+        self.repro.begin_turn(trace_id, owner_id=owner_id, tools_schema_sha=None)
 
         for action in actions:
             tool = str(action["tool"])
             args = dict(action["args"])
             call_id = str(action["call_id"])
             if approved:
-                content = await self._execute(tool=tool, args=args, ctx=ctx, decision="confirmed")
+                result = await self._execute(tool=tool, args=args, ctx=ctx, decision="confirmed")
+                content = _tool_text(tool, result)
             else:
                 content = "Отменено владельцем (действие не выполнено)."
                 await self._audit_tool(ctx, tool, args, "rejected", content, ok=True)
@@ -234,10 +278,16 @@ class Supervisor:
         route = Route(
             role="brain", tools=True, thinking=False, reason="продолжение после подтверждения"
         )
-        reply = await self._guarded_loop(messages, ctx, route=route)
-        await self._save_history(owner_id, messages, final_text=reply.text)
-        reply.trace_id = trace_id
-        return reply
+        try:
+            reply = await self._guarded_loop(messages, ctx, route=route)
+            notes = _notes_of(ctx)
+            _append_notices(reply, ctx)
+            await self._save_history(owner_id, messages, final_text=reply.text)
+            reply.trace_id = trace_id
+            await self._record_turn(ctx, messages, reply, route=route, notes=notes)
+            return reply
+        finally:
+            self.repro.end_turn(trace_id)
 
     async def reset(self, owner_id: int) -> None:
         await self._kv("history.delete", self.kv.delete(history_key(owner_id)), 0)
@@ -245,7 +295,11 @@ class Supervisor:
 
     @property
     def _tracing_failures(self) -> int:
-        return int(getattr(self.events, "failures", 0)) + int(getattr(self.audit, "failures", 0))
+        return (
+            int(getattr(self.events, "failures", 0))
+            + int(getattr(self.audit, "failures", 0))
+            + int(getattr(self.repro, "failures", 0))
+        )
 
     @property
     def _tracing_degraded(self) -> bool:
@@ -265,6 +319,9 @@ class Supervisor:
             # «подключено» != «пишется»: без этих полей `/status` врал при мёртвой трассе
             "tracing_degraded": self._tracing_degraded,
             "tracing_failures": self._tracing_failures,
+            # «пишем журнал или нет» — свой факт: без него /status врёт о воспроизводимости
+            "repro_enabled": bool(self.repro.enabled),
+            "repro_failures": int(getattr(self.repro, "failures", 0)),
         }
 
     # ------------------------------------------------ роутинг
@@ -313,6 +370,54 @@ class Supervisor:
             model=f"deterministic:{answer.intent}",
             cost_usd=0.0,
             iterations=0,
+        )
+
+    def _prompt_ids(self, system_text: str) -> list[dict[str, str]]:
+        """Версия промпта + хэш именно того текста, что ушёл в модель.
+
+        ``PROMPT_VERSION`` одна на все ходы, а в системном сообщении живут ещё и факты, список
+        инструментов, заметки уровня деградации: два хода при одной версии могут требовать разного
+        поведения. Хэш полного текста — это то, по чему replay обязан совпасть или честно
+        расписаться в расхождении.
+        """
+        if not system_text:
+            return []
+        return [
+            {
+                "id": "core/system",
+                "version": PROMPT_VERSION,
+                "sha256": sha256_hex(system_text.encode("utf-8")),
+            }
+        ]
+
+    async def _record_turn(
+        self,
+        ctx: ToolContext,
+        messages: list[dict[str, Any]],
+        reply: Reply,
+        *,
+        route: Route,
+        notes: Sequence[str] = (),
+    ) -> None:
+        """Ход в журнале целиком: вход, ответ, стоимость, инструменты, замечания."""
+        started = float(ctx.extras.get("started_at") or 0.0)
+        prompt_ids = list(ctx.extras.get("prompt_ids") or [])
+        if not prompt_ids and messages:
+            prompt_ids = self._prompt_ids(str(messages[0].get("content") or ""))
+        await self.repro.turn_summary(
+            trace_id=ctx.trace_id,
+            turn_no=int(ctx.extras.get("turn_no", 0)),
+            owner_id=ctx.owner_id,
+            messages=messages,
+            answer=reply.text,
+            model=reply.model,
+            cost_usd=reply.cost_usd,
+            latency_ms=int((time.perf_counter() - started) * 1000) if started else 0,
+            iterations=reply.iterations,
+            prompt_ids=prompt_ids,
+            tools_schema_sha=self.registry.schema_sha() if route.tools else None,
+            route=f"{route.role}:{route.reason}",
+            notes=notes,
         )
 
     async def _degradation_level(self) -> int:
@@ -372,6 +477,10 @@ class Supervisor:
         iterations = 0
         for _ in range(self.cfg.max_iterations):
             iterations += 1
+            # номер шага ведёт рекордер: локальный счётчик расходится с журналом, если ход начался
+            # без begin_turn (resume, деградация) — тогда step=0 и мы откатываемся на итерацию
+            step = self.repro.turn_step(ctx.trace_id) or iterations
+            ctx.extras["turn_no"] = step
             res: ChatResult = await self.services.gateway.chat(
                 route.role,
                 messages,
@@ -415,6 +524,15 @@ class Supervisor:
                     event_type="policy.decision",
                     payload={"tool": spec.name, "decision": str(decision), "reason": reason},
                 )
+                await self.repro.policy(
+                    trace_id=ctx.trace_id,
+                    turn_no=step,
+                    owner_id=ctx.owner_id,
+                    tool=spec.name,
+                    decision=str(decision),
+                    reason=reason,
+                    risk=str(spec.risk),
+                )
                 if decision is Decision.DENY:
                     messages.append(_tool_message(call.id, f"DENIED: {reason}"))
                     await self._audit_tool(ctx, spec.name, args, "deny", reason, ok=True)
@@ -435,7 +553,7 @@ class Supervisor:
                 out = await self._execute(
                     tool=spec.name, args=args, ctx=ctx, decision=str(decision)
                 )
-                messages.append(_tool_message(call.id, out))
+                messages.append(_tool_message(call.id, _tool_text(call.name, out)))
 
             if pending:
                 return await self._request_confirmation(messages, ctx, pending)
@@ -503,10 +621,16 @@ class Supervisor:
 
     async def _execute(
         self, *, tool: str, args: dict[str, Any], ctx: ToolContext, decision: str
-    ) -> str:
+    ) -> ToolResult:
+        """Один вызов инструмента: policy уже сказал «можно», здесь — исполнение и запись.
+
+        Результат возвращается размеченным (:class:`ToolResult`), потому что «что модель увидела»
+        и «насколько этому можно верить» — разные вещи, и вторая без первой бесполезна.
+        """
         spec = self.registry.get(tool)
+        started = time.perf_counter()
         try:
-            out = await spec.handler(spec.args.model_validate(args), ctx)
+            out = ToolResult.coerce(await spec.handler(spec.args.model_validate(args), ctx))
         except Exception as exc:  # noqa: BLE001 - ошибка инструмента уходит модели как данные, не как 500
             log.exception("tool.failed", tool=tool)
             await self._audit_tool(ctx, tool, args, decision, repr(exc), ok=False)
@@ -516,17 +640,30 @@ class Supervisor:
                 payload={"tool": tool, "err": repr(exc)[:500]},
             )
             safe = self.services.gateway.dlp.redact(str(exc))
-            return f"ERROR: {type(exc).__name__}: {safe[:800]}"
-        await self._audit_tool(ctx, tool, args, decision, out, ok=True)
+            return ToolResult(content=f"ERROR: {type(exc).__name__}: {safe[:800]}")
+        await self._audit_tool(ctx, tool, args, decision, out.content, ok=True)
         await self._event(
             owner_id=ctx.owner_id,
             event_type="tool.executed",
             payload={
                 "tool": tool,
                 "decision": decision,
-                "result_len": len(out),
-                "result": out[:1000],
+                "trust": out.trust,
+                "result_len": len(out.content),
+                "result": out.content[:1000],
             },
+        )
+        await self.repro.tool_run(
+            trace_id=ctx.trace_id,
+            turn_no=int(ctx.extras.get("turn_no", 0)),
+            owner_id=ctx.owner_id,
+            tool=tool,
+            args=args,
+            result=out.content,
+            trust=out.trust,
+            decision=decision,
+            ok=True,
+            latency_ms=int((time.perf_counter() - started) * 1000),
         )
         return out
 
@@ -675,6 +812,11 @@ class Supervisor:
 # --------------------------------------------------------------- helpers
 
 
+def _notes_of(ctx: ToolContext) -> list[str]:
+    """Снимок замечаний инструментов — до того, как их приклеят к ответу и очистят."""
+    return [str(note) for note in (ctx.extras.get("notices") or []) if str(note).strip()]
+
+
 def _append_notices(reply: Reply, ctx: ToolContext) -> None:
     """Причины отказа инструментов доходят до владельца текстом, а не обещанием модели.
 
@@ -689,6 +831,19 @@ def _append_notices(reply: Reply, ctx: ToolContext) -> None:
     ctx.extras["notices"] = []
     tail = "\n\n⚠️ " + "; ".join(dict.fromkeys(notices))[:400]
     reply.text = (reply.text + tail)[:MAX_MESSAGE_CHARS]
+
+
+def _tool_text(tool: str, result: ToolResult) -> str:
+    """Что реально уйдёт в контекст модели как результат инструмента.
+
+    Правило «внешнее помечено» исполняется здесь, а не в каждом handler'е: забыть обёртку в одном
+    инструменте означает отдать веб-страницу право командовать агентом. Инструменты, которые уже
+    обернули сами (``<untrusted>`` в тексте), не оборачиваем повторно — двойная рамка учит модель
+    считать метку оформлением.
+    """
+    if not result.is_untrusted or "<untrusted" in result.content[:400]:
+        return result.content
+    return wrap_untrusted(tool, result.content)
 
 
 def _tool_message(call_id: str, content: str) -> dict[str, Any]:

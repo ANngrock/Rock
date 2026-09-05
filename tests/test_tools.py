@@ -10,12 +10,21 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from aegis.agents.tools import builtin
-from aegis.agents.tools.registry import Attachment, ToolContext
+from aegis.agents.tools.registry import Attachment, ToolContext, ToolResult
 from aegis.knowledge.notes import Note, NoteHit
 from aegis.platform.config import override_settings
 from aegis.web.fetch import PageFetchError
 from aegis.web.rates import RateQuestion
 from aegis.web.search import EngineReport, SearchHit, SearchOutcome
+
+
+def text_of(out: object) -> str:
+    """Текст, который увидит модель. Инструменты отвечают размеченным ``ToolResult``.
+
+    Отдельная функция, а не ``.content`` в каждом тесте: проверка «строка или результат» — это
+    контракт слоя, и тесты обязаны следить за содержимым, а не за упаковкой.
+    """
+    return out.content if isinstance(out, ToolResult) else str(out)
 
 
 class SearchStub:
@@ -75,6 +84,53 @@ class ServicesStub:
         self.search = kw.get("search")
         self.fetch = kw.get("fetch")
         self.gateway = kw.get("gateway")
+        self.repro = kw.get("repro")
+
+
+class JournalStub:
+    """Двойник журнала решений: отдаёт то, что ему положат, и считает вызовы.
+
+    ``enabled`` переключаем, потому что «объяснить ход» при выключенном журнале — отдельный
+    пользовательский случай, и ответ в нём обязан быть текстом, а не пустотой.
+    """
+
+    def __init__(
+        self,
+        *,
+        records: list[dict[str, object]] | None = None,
+        traces: list[str] | None = None,
+        latest: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        self.enabled = enabled
+        self._records = records or []
+        self._traces = traces or []
+        self._latest = latest
+        self.calls: list[str] = []
+
+    async def latest_trace(self, *, owner_id: int) -> str | None:
+        self.calls.append(f"latest:{owner_id}")
+        return self._latest
+
+    async def matching_traces(self, ref: str, *, limit: int = 3) -> list[str]:
+        self.calls.append(f"match:{ref}")
+        return [t for t in self._traces if t.startswith(ref)][:limit]
+
+    async def records_for_trace(self, trace_id: str) -> list[dict[str, object]]:
+        self.calls.append(f"records:{trace_id}")
+        return self._records
+
+    async def verify(self, **kwargs: object) -> object:
+        from aegis.governance.recorder import ChainReport
+
+        self.calls.append("verify")
+        return ChainReport(ok=True, checked=4, first_seq=1, last_seq=4)
+
+    async def anchor(self, day: str | None = None) -> object:
+        from aegis.governance.recorder import AnchorReport
+
+        self.calls.append(f"anchor:{day}")
+        return AnchorReport(ok=True, day=day or "2026-01-22", records=4, merkle_root="ab" * 32)
 
 
 def ctx(**kw: Any) -> ToolContext:
@@ -92,6 +148,69 @@ _DAYS_RU = {
     "Saturday": "суббота",
     "Sunday": "воскресенье",
 }
+
+
+# ------------------------------------------------- инструменты журнала (M1)
+
+
+async def test_explain_decision_falls_back_to_the_last_turn() -> None:
+    from aegis.agents.tools import repro as repro_tools
+
+    journal = JournalStub(
+        latest="11111111-1111-1111-1111-111111111111",
+        records=[
+            {
+                "seq": 1,
+                "kind": "turn_summary",
+                "turn_no": 1,
+                "model": "glm-4.7",
+                "params": {"iterations": 2, "route": "brain:tools"},
+                "policy": None,
+                "prompt_ids": [{"id": "core/system", "version": "sys-v0.3.0"}],
+                "cost_usd": "0.001200",
+                "latency_ms": 900,
+                "input": "сообщения",
+                "truncated": False,
+            }
+        ],
+    )
+    out = await repro_tools.explain_decision(repro_tools.ExplainArgs(), ctx(repro=journal))
+    assert "glm-4.7" in out.content and "sys-v0.3.0" in out.content
+    assert journal.calls == ["latest:1", "records:11111111-1111-1111-1111-111111111111"]
+
+
+async def test_explain_decision_refuses_to_guess_between_two_traces() -> None:
+    """«Возьмём первый совпавший» означало бы объяснить не тот ход — хуже честного отказа."""
+    from aegis.agents.tools import repro as repro_tools
+
+    journal = JournalStub(traces=["1a2b3c4d-0000-0000-0000-000000000001", "1a2b3c4d-9999-0000-0"])
+    out = await repro_tools.explain_decision(
+        repro_tools.ExplainArgs(trace_id="1a2b3c4d"), ctx(repro=journal)
+    )
+    assert "нескольким ходам" in out.content
+    assert "records:" not in " ".join(journal.calls)
+
+
+async def test_explain_decision_says_when_journal_is_disabled() -> None:
+    from aegis.agents.tools import repro as repro_tools
+
+    out = await repro_tools.explain_decision(
+        repro_tools.ExplainArgs(trace_id="1a2b3c4d"), ctx(repro=JournalStub(enabled=False))
+    )
+    assert "REPRO_ENABLED" in out.content
+    assert "Не выдумывай" in out.content or "не выдумывай" in out.content
+
+
+async def test_verify_and_anchor_tools_reuse_recorder_reports() -> None:
+    from aegis.agents.tools import repro as repro_tools
+
+    journal = JournalStub()
+    check = await repro_tools.verify_integrity(repro_tools.VerifyArgs(days=3), ctx(repro=journal))
+    assert "проверено 4 записей" in check.content
+    anchored = await repro_tools.anchor_journal(repro_tools.AnchorArgs(), ctx(repro=journal))
+    assert "Заякорировано 4 записей" in anchored.content
+    assert "root=" in anchored.content
+    assert any(c.startswith("anchor:") for c in journal.calls)
 
 
 async def test_get_datetime_reports_owner_timezone_in_russian() -> None:
@@ -175,7 +294,9 @@ async def test_search_notes_falls_back_to_text_when_embeddings_fail() -> None:
 
 async def test_web_search_wraps_results_as_untrusted() -> None:
     search = SearchStub([SearchHit(title="Заголовок", url="https://e.com/1", snippet="Кратко")])
-    out = await builtin.web_search(builtin.WebSearchArgs(query="новости"), ctx(search=search))
+    out = text_of(
+        await builtin.web_search(builtin.WebSearchArgs(query="новости"), ctx(search=search))
+    )
     assert '<untrusted source="web_search">' in out
     assert out.rstrip().endswith("</untrusted>")
     assert "https://e.com/1" in out
@@ -187,7 +308,7 @@ async def test_web_search_unavailable_is_reported_honestly() -> None:
         engines=[EngineReport(engine="searxng", status="unavailable", note="SearXNG не отвечает")],
     )
     context = ctx(search=search)
-    out = await builtin.web_search(builtin.WebSearchArgs(query="что-то"), context)
+    out = text_of(await builtin.web_search(builtin.WebSearchArgs(query="что-то"), context))
     assert "ПОИСК НЕДОСТУПЕН" in out and "не выдумывай" in out
     assert "SearXNG не отвечает" in out, "причина обязана быть в тексте, а не в логе контейнера"
     assert context.extras["notices"], "владелец получит причину и отдельной строкой в ответе"
@@ -199,7 +320,7 @@ async def test_web_search_keeps_the_verdict_outside_the_untrusted_block() -> Non
         [SearchHit(title="Т", url="https://e.com/1", snippet="…")],
         engines=[EngineReport(engine="searxng", status="ok", hits=1)],
     )
-    out = await builtin.web_search(builtin.WebSearchArgs(query="тест"), ctx(search=search))
+    out = text_of(await builtin.web_search(builtin.WebSearchArgs(query="тест"), ctx(search=search)))
     assert out.startswith("РЕЗУЛЬТАТ ПОИСКА:")
     assert out.index("РЕЗУЛЬТАТ ПОИСКА") < out.index("<untrusted")
 
@@ -209,7 +330,7 @@ async def test_web_search_empty_is_not_called_failure() -> None:
         [], engines=[EngineReport(engine="searxng", status="empty", note="нет совпадений")]
     )
     context = ctx(search=search)
-    out = await builtin.web_search(builtin.WebSearchArgs(query="квиркел"), context)
+    out = text_of(await builtin.web_search(builtin.WebSearchArgs(query="квиркел"), context))
     assert "совпадений нет" in out
     assert "ПОИСК НЕДОСТУПЕН" not in out
     assert not context.extras.get("notices")
@@ -320,14 +441,16 @@ async def test_web_search_neutralizes_early_untrusted_close() -> None:
     search = SearchStub(
         [SearchHit(title="Заражённый заголовок", url="https://e.com/1", snippet=injection)]
     )
-    out = await builtin.web_search(builtin.WebSearchArgs(query="курс"), ctx(search=search))
+    out = text_of(await builtin.web_search(builtin.WebSearchArgs(query="курс"), ctx(search=search)))
     assert out.count("</untrusted>") == 1, "внешний текст не имеет права закрыть блок"
 
 
 async def test_fetch_page_reports_blocked_target() -> None:
-    out = await builtin.fetch_page(
-        builtin.FetchArgs(url="http://169.254.169.254/latest/meta-data/"),
-        ctx(fetch=FetchStub(error=PageFetchError("запрещено: доступ к внутренней сети"))),
+    out = text_of(
+        await builtin.fetch_page(
+            builtin.FetchArgs(url="http://169.254.169.254/latest/meta-data/"),
+            ctx(fetch=FetchStub(error=PageFetchError("запрещено: доступ к внутренней сети"))),
+        )
     )
     assert "СТРАНИЦА НЕДОСТУПНА" in out
 
@@ -362,7 +485,7 @@ async def test_save_link_reads_title_when_page_available() -> None:
 
 
 async def test_analyze_image_without_attachment_explains() -> None:
-    out = await builtin.analyze_image(builtin.AnalyzeArgs(question="что это?"), ctx())
+    out = text_of(await builtin.analyze_image(builtin.AnalyzeArgs(question="что это?"), ctx()))
     assert "не прикреплено" in out.lower()
 
 
@@ -377,7 +500,7 @@ async def test_analyze_image_calls_vision_with_prepared_image() -> None:
 
     context = ctx(gateway=Gateway())
     context.attachments = [Attachment(data=b"\x89PNG\r\n\x1a\n" + b"0" * 40, mime="image/png")]
-    out = await builtin.analyze_image(builtin.AnalyzeArgs(question="сколько?"), context)
+    out = text_of(await builtin.analyze_image(builtin.AnalyzeArgs(question="сколько?"), context))
     assert captured["role"] == "vision"
     assert out.startswith('<untrusted source="image"')
     assert any(p.get("type") == "image_url" for p in captured["parts"])

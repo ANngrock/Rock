@@ -133,6 +133,19 @@ class Settings(BaseSettings):
     image_max_side: int = Field(default=1568, ge=256, le=4096)
     image_jpeg_quality: int = Field(default=85, ge=40, le=100)
 
+    # --- воспроизводимость (M1): журнал решений с хэш-цепочкой ---
+    #: Писать decision records. Выключить имеет смысл только если БД живёт на медленном диске и
+    #: журнал мешает: ответы не зависят от него, а «докажите, почему тогда так ответили» — да.
+    repro_enabled: bool = True
+    #: Содержимое запросов/ответов модели в блобы. Без него остаются только метрики (как в аудите),
+    #: и replay/«почему ты так ответил» становится невозможен — это единственный по-настоящему
+    #: дорогой по объёму переключатель.
+    repro_record_payload: bool = True
+    #: Потолок одного блоба. Больше — храним начало и честно помечаем запись как truncated.
+    repro_max_blob_bytes: int = Field(default=1_048_576, ge=4096, le=33_554_432)
+    #: Сколько записей сверяет `aegis repro verify` за один проход по умолчанию.
+    repro_verify_limit: int = Field(default=5000, ge=100, le=200_000)
+
     # --- наблюдаемость ---
     log_level: str = "INFO"
     log_json: bool = True

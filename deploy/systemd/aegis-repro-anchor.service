@@ -1,0 +1,21 @@
+[Unit]
+Description=aegis: мерклов корень журнала решений за день (M1)
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# путь под свой клон; WorkingDir нужен, чтобы docker compose нашёл .env и compose-файл
+WorkingDirectory=/srv/aegis
+EnvironmentFile=-/srv/aegis/.env
+# якорь идемпотентен: пересчёт того же дня даёт тот же root, поэтому пропущенный запуск
+# достаточно догнать вручную — «чинить состояние» не приходится
+ExecStart=/usr/bin/docker compose -f /srv/aegis/deploy/docker-compose.yml run --rm bot aegis repro anchor
+# если docker недоступен (машина без контейнеров), тот же шаг локальным окружением:
+# ExecStart=/srv/aegis/.venv/bin/aegis repro anchor
+TimeoutStartSec=600
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

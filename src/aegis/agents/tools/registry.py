@@ -2,6 +2,12 @@
 
 Инструмент = описание + схема + handler + метаданные риска. Метаданные (``writes``, ``risk``)
 существуют ради policy engine: регистрация инструмента уже говорит, надо ли его подтверждать.
+
+Результат — :class:`ToolResult`, а не голая строка: у содержимого есть степень доверия, и без неё
+невозможно ни честное воспроизведение хода (M1: чем именно подтверждали ответ), ни карантин
+недоверенного контента (M2: что нельзя считать инструкцией). Handler'ы, которым маркировать нечего,
+по-прежнему возвращают ``str`` — supervisor понимает оба варианта, иначе ``trust`` пришлось бы
+выставлять руками в десятке мест и обязательно где-то забыть.
 """
 
 from __future__ import annotations
@@ -9,13 +15,22 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from aegis.governance.policy import Risk, Trust
 
-__all__ = ["Attachment", "ToolContext", "ToolRegistry", "ToolSpec", "UnknownTool", "registry"]
+__all__ = [
+    "Attachment",
+    "ToolContext",
+    "ToolRegistry",
+    "ToolResult",
+    "ToolSpec",
+    "TrustLevel",
+    "UnknownTool",
+    "registry",
+]
 
 # OpenAI name: ^[a-zA-Z0-9_-]{1,64}$; у нас дополнительно snake_case
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -47,8 +62,51 @@ class ToolContext:
     extras: dict[str, Any] = field(default_factory=dict)
 
 
-# handler(args: ArgsModel, ctx: ToolContext) -> str
-ToolHandler = Callable[..., Awaitable[str]]
+#: Откуда данные: ``owner`` — написал владелец, ``system`` — наши вычисления и БД, ``untrusted`` —
+#: внешний мир (веб, файл, картинка). Это не метка вежливости, а граница безопасности: untrusted
+#: не имеет права превращаться в инструкцию (принцип 2 системного промпта).
+TrustLevel = Literal["owner", "system", "untrusted"]
+
+
+@dataclass(slots=True)
+class ToolResult:
+    """Что инструмент ответил и насколько этому можно верить.
+
+    ``ref_id`` — ссылка на исходник внутри хода: по ней отдаётся сырой фрагмент владельцу
+    (``show_source`` в M2), не протаскивая его в контекст планировщика.
+    """
+
+    content: str
+    trust: TrustLevel = "system"
+    source: str = ""
+    media_type: str = "text/plain"
+    ref_id: str | None = None
+
+    @property
+    def is_untrusted(self) -> bool:
+        return self.trust == "untrusted"
+
+    @classmethod
+    def untrusted(cls, content: str, source: str = "", *, ref_id: str | None = None) -> ToolResult:
+        return cls(content=content, trust="untrusted", source=source, ref_id=ref_id)
+
+    @classmethod
+    def coerce(cls, value: str | ToolResult) -> ToolResult:
+        """Принять и строку, и размеченный результат: реестр не диктует handler'ам лишний слой."""
+        return value if isinstance(value, ToolResult) else cls(content=str(value))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "trust": self.trust,
+            "source": self.source,
+            "media_type": self.media_type,
+            "ref_id": self.ref_id,
+        }
+
+
+# handler(args: ArgsModel, ctx: ToolContext) -> str | ToolResult
+ToolHandler = Callable[..., Awaitable[str | ToolResult]]
 
 
 @dataclass(slots=True)
@@ -127,6 +185,18 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict[str, Any]]:
         return [t.schema() for t in self._tools.values() if t.enabled]
+
+    def schema_sha(self) -> bytes:
+        """Хэш открытой модели инструментов — 32 байта, доказывающие, *чем именно* был вооружён
+        агент в том ходе (M1: «модель та же» ≠ «возможности те же»).
+
+        Считаем от отсортированного по имени списка: ``schemas()`` идёт в порядке регистрации, а
+        перестановка инструментов местами не должна выглядеть как изменение поведения.
+        """
+        from aegis.platform.canonical import canonical_sha256
+
+        ordered = sorted(self.schemas(), key=lambda item: str(item.get("function", {}).get("name")))
+        return canonical_sha256(ordered)
 
     # --- управление (dev/эксперименты, kill switch по инструментам) ---
 

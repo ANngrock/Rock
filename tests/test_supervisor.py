@@ -68,6 +68,46 @@ class FakeKillSwitch:
         return KillSwitchState(active=self.active, reason="тест")
 
 
+class JournalSpy:
+    """Шпион журнала решений: видно, *что именно* supervisor обещает записать про ход.
+
+    Заменяет собой и Null-рекордер в тестах: молчаливый noop не поймает регрессию «ход перестал
+    попадать в журнал», а она ровно та, из-за которой ``/replay`` позже «не находит» вчерашний ход.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.enabled = True
+        self.failures = 0
+        self._step = 0
+
+    def turn_step(self, trace_id: str) -> int:
+        """Нумерация шагов как у настоящего рекордера: supervisor читает её каждый проход."""
+        self._step += 1
+        return self._step
+
+    def _add(self, kind: str, **fields: Any) -> None:
+        self.calls.append((kind, fields))
+
+    def begin_turn(self, trace_id: str, **kwargs: Any) -> None:
+        self._add("begin", trace_id=trace_id, **kwargs)
+
+    def end_turn(self, trace_id: str) -> None:
+        self._add("end", trace_id=trace_id)
+
+    async def policy(self, **kwargs: Any) -> None:
+        self._add("policy", **kwargs)
+
+    async def tool_run(self, **kwargs: Any) -> None:
+        self._add("tool_run", **kwargs)
+
+    async def turn_summary(self, **kwargs: Any) -> None:
+        self._add("turn", **kwargs)
+
+    def of(self, kind: str) -> list[dict[str, Any]]:
+        return [fields for name, fields in self.calls if name == kind]
+
+
 class Recorder:
     """Шпионит за вызовами инструментов, чтобы проверять «исполнилось / не исполнилось»."""
 
@@ -116,6 +156,7 @@ class Harness:
         self.recorder = Recorder()
         self.events = InMemoryEventSink()
         self.kill_switch = FakeKillSwitch(kwargs.pop("kill_active", False))
+        self.journal = kwargs.pop("journal", None) or JournalSpy()
         self.supervisor = Supervisor(
             services=self.services,
             registry=self.registry,
@@ -124,6 +165,7 @@ class Harness:
             cfg=self.cfg,
             events=self.events,
             kill_switch=self.kill_switch,  # type: ignore[arg-type]
+            recorder=self.journal,  # type: ignore[arg-type]
         )
 
     def tool(self, name: str, **kwargs: Any) -> None:
@@ -149,6 +191,95 @@ class Harness:
 
 def harness(responses: list[Any], **kwargs: Any) -> Harness:
     return Harness(responses, **kwargs)
+
+
+# ------------------------------------------------------------------ журнал (M1)
+
+
+async def test_turn_is_opened_and_closed_around_the_answer() -> None:
+    h = harness([make_chat_result("Привет!")])
+    await h.handle("привет", owner_id=9)
+    kinds = [name for name, _ in h.journal.calls]
+    assert kinds.index("begin") < kinds.index("turn") < kinds.index("end")
+    begin = h.journal.of("begin")[0]
+    assert begin["owner_id"] == 9
+    assert begin["prompt_ids"], "ход без идентификаторов промптов невоспроизводим по определению"
+    assert begin["prompt_ids"][0]["id"] == "core/system"
+
+
+async def test_turn_is_closed_even_when_the_model_is_unavailable() -> None:
+    """``end_turn`` в finally: иначе после падения журнала у нас «вечный открытый ход»."""
+    h = harness([ModelUnavailable("провайдер молчит", cause="429")])
+    await h.handle("сделай")
+    assert [name for name, _ in h.journal.calls].count("end") == 1
+
+
+async def test_tool_call_and_policy_decision_land_in_the_journal() -> None:
+    h = harness([make_chat_result(None, [("c1", "pay", {"value": "х"})]), make_chat_result("ок")])
+    h.tool("pay", writes=True, risk=Risk.LOW)
+    await h.handle("заплати")
+
+    policy = h.journal.of("policy")[0]
+    assert policy["tool"] == "pay" and policy["decision"] == "allow"
+    assert policy["reason"], "решение без причины — не решение, а строка в логе"
+    tool = h.journal.of("tool_run")[0]
+    assert tool["tool"] == "pay" and tool["decision"] == "allow"
+    assert tool["trust"] == "system", "результат тестового инструмента — наши данные"
+    assert tool["latency_ms"] >= 0
+
+
+async def test_denied_tool_is_journaled_without_execution() -> None:
+    """Отказ policy — тоже ход: «почему не сделал» владелец спрачивает не реже, чем «как сделал»."""
+    h = harness(
+        [make_chat_result(None, [("c1", "pay", {"value": "х"})]), make_chat_result("нельзя")],
+        kill_active=True,
+    )
+    h.tool("pay", writes=True, risk=Risk.HIGH)
+    await h.handle("заплати")
+    assert h.journal.of("policy")[0]["decision"] == "deny"
+    assert h.journal.of("tool_run") == [], "записанного исполнения быть не должно"
+
+
+async def test_turn_summary_carries_messages_answer_and_route() -> None:
+    h = harness([make_chat_result("ответ")])
+    await h.handle("обычный вопрос")
+    turn = h.journal.of("turn")[0]
+    assert turn["answer"] == "ответ"
+    assert [m["role"] for m in turn["messages"]] == ["system", "user", "assistant"]
+    assert turn["messages"][1]["content"] == "обычный вопрос"
+    # хвостовая реплика — часть записанного входа: журнал хранит список целиком, а replay
+    # срезает ровно этот хвост (trim_to_frozen_world), иначе «тот же вход» не собрать
+    assert turn["messages"][-1]["content"] == "ответ"
+    assert turn["route"].startswith("fast:") or turn["route"].startswith("brain:")
+    assert turn["iterations"] == 1
+
+
+async def test_fast_path_is_journaled_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Детерминированный ответ — тоже ход: «почему ты так ответил» спрашивают и про него."""
+    from aegis.agents import intents
+    from aegis.web.rates import RateAnswer, RateQuestion
+
+    async def fake(question: RateQuestion, **_kwargs: object) -> RateAnswer:
+        return RateAnswer(
+            question=question,
+            quotes=[],
+            verdict="unavailable",
+            causes=["тест"],
+            fetched_at="2026-09-05T01:13:00+03:00",
+        )
+
+    monkeypatch.setattr(intents, "fetch_rates", fake)
+    h = harness([make_chat_result("обычный ответ")])
+    reply = await h.handle("обычный вопрос")
+    turn = h.journal.of("turn")[-1]
+    assert turn["answer"] == reply.text
+    assert h.journal.of("begin"), "даже ход без инструментов открывается и закрывается в журнале"
+
+
+async def test_status_reports_journal_state() -> None:
+    h = harness([make_chat_result("ок")])
+    status = await h.supervisor.status(1)
+    assert status["repro_enabled"] is True and status["repro_failures"] == 0
 
 
 # ------------------------------------------------------------------ роутинг

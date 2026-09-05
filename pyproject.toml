@@ -54,6 +54,12 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Промпты — файлы внутри пакета (docs-как-данные): без этой строки wheel соберётся без .md, и в
+# контейнере `load("repro/judge")` упадёт с PromptNotFound. Editable-установка этого не замечает,
+# поэтому ловить такое надо сборкой, а не прогоном.
+[tool.setuptools.package-data]
+"aegis.prompts" = ["**/*.md"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

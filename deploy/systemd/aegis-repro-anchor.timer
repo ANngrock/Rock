@@ -1,0 +1,11 @@
+[Unit]
+Description=aegis: якорь журнала решений ежедневно
+
+[Timer]
+# 03:10 — после бэкапа (03:00): заякорить записи, которые уже лежат в дампе, а не «на глазок»
+OnCalendar=*-*-* 03:10:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

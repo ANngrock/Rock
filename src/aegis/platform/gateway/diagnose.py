@@ -26,11 +26,25 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 _MAX_LEN = 220
 
 
-def redact_secrets(text: str) -> str:
-    out = text[:_MAX_LEN]
+def _scrub(text: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
-        out = pattern.sub(replacement, out)
-    return out
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_secrets(text: str) -> str:
+    """Для строк диагноза: паттерны + обрезка до ``_MAX_LEN`` — это подпись, не данные."""
+    return _scrub(text[:_MAX_LEN])
+
+
+def scrub_secrets(text: str) -> str:
+    """Те же паттерны, но без обрезки — для журнала (M1), где обрезка испортила бы данные.
+
+    Вынесено отдельно именно потому, что ``redact_secrets`` укорачивает: подсунуть его записи
+    аргументов инструмента означало бы «воспроизводимый» ход, из которого молча вырезано всё,
+    что длиннее 220 символов.
+    """
+    return _scrub(text)
 
 
 _AUTH_401 = (

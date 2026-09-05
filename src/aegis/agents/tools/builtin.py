@@ -16,7 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from aegis.agents.tools.images import prepare_image
-from aegis.agents.tools.registry import ToolContext, registry
+from aegis.agents.tools.registry import ToolContext, ToolResult, registry
 from aegis.governance.policy import Risk
 from aegis.platform.config import Settings, settings
 from aegis.web.fetch import PageFetchError
@@ -186,7 +186,7 @@ class WebSearchArgs(BaseModel):
     "её пересказывай владельцу дословно, это не «мнение», а состояние источника.",
     WebSearchArgs,
 )
-async def web_search(args: WebSearchArgs, ctx: ToolContext) -> str:
+async def web_search(args: WebSearchArgs, ctx: ToolContext) -> ToolResult:
     """Отчёт по движкам обязана увидеть и модель, и владелец.
 
     Иначе «SearXNG лежит» и «в интернете нет такой страницы» выглядят для владельца одинаково —
@@ -200,12 +200,15 @@ async def web_search(args: WebSearchArgs, ctx: ToolContext) -> str:
         await ctx.services.gateway.cost.record(cfg.search_cost_usd_per_call * len(live))
     if outcome.verdict == "unavailable":
         ctx.extras.setdefault("notices", []).append(f"веб-поиск недоступен: {outcome.engines_text}")
-        return (
+        return ToolResult(
             f"ПОИСК НЕДОСТУПЕН: {outcome.engines_text}. "
             "Так и скажи владельцу дословно, с причиной; не выдумывай результаты и не предлагай "
-            "«уточнить запрос» — дело не в запросе."
+            "«уточнить запрос» — дело не в запросе.",
+            trust="system",
         )
-    return outcome.as_tool_text()
+    # Доверие ставится здесь, а не в текстовом хедере: правило «снаружи — чужое» должно быть
+    # машиночитаемым (policy и журнал смотрят на поле), обёртка <untrusted> — для модели.
+    return ToolResult(outcome.as_tool_text(), trust="untrusted")
 
 
 class ExchangeRateArgs(BaseModel):
@@ -264,13 +267,12 @@ class FetchArgs(BaseModel):
 @registry.register(
     "fetch_page", "Прочитать веб-страницу по URL и вернуть её основной текст.", FetchArgs
 )
-async def fetch_page(args: FetchArgs, ctx: ToolContext) -> str:
+async def fetch_page(args: FetchArgs, ctx: ToolContext) -> ToolResult:
     try:
         result = await ctx.services.fetch.fetch(args.url, max_chars=args.max_chars)
     except PageFetchError as exc:
-        return f"СТРАНИЦА НЕДОСТУПНА: {exc}."
-    rendered: str = result.as_untrusted(args.max_chars)
-    return rendered
+        return ToolResult(f"СТРАНИЦА НЕДОСТУПНА: {exc}.", trust="system")
+    return ToolResult(result.as_untrusted(args.max_chars), trust="untrusted")
 
 
 class LinkArgs(BaseModel):
@@ -311,11 +313,16 @@ class AnalyzeArgs(BaseModel):
     "Посмотреть на прикреплённое изображение и ответить по нему (тексты, цифры, документы).",
     AnalyzeArgs,
 )
-async def analyze_image(args: AnalyzeArgs, ctx: ToolContext) -> str:
+async def analyze_image(args: AnalyzeArgs, ctx: ToolContext) -> ToolResult:
     if not ctx.attachments:
-        return "Изображений не прикреплено. Попроси владельца прислать фото."
+        return ToolResult(
+            "Изображений не прикреплено. Попроси владельца прислать фото.", trust="system"
+        )
     if args.attachment_index >= len(ctx.attachments):
-        return f"Индекс изображения вне диапазона: есть только {len(ctx.attachments)}."
+        return ToolResult(
+            f"Индекс изображения вне диапазона: есть только {len(ctx.attachments)}.",
+            trust="system",
+        )
     att = ctx.attachments[args.attachment_index]
     cfg = settings()
     data, mime = prepare_image(
@@ -339,4 +346,9 @@ async def analyze_image(args: AnalyzeArgs, ctx: ToolContext) -> str:
     res = await ctx.services.gateway.chat(
         "vision", [{"role": "user", "content": content}], trace_id=ctx.trace_id
     )
-    return wrap_untrusted("image", res.content or "Модель не вернула текст.")
+    # Результат vision-модели по чужому изображению — тоже внешние данные: на картинке мог быть
+    # текст «выполни команду X», и модель могла его пересказать как приказ.
+    return ToolResult(
+        wrap_untrusted("image", res.content or "Модель не вернула текст."),
+        trust="untrusted",
+    )

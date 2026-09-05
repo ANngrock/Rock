@@ -1,4 +1,8 @@
-"""CLI-точка входа: ``aegis bot|doctor|ask|tools``.
+"""CLI-точка входа: ``aegis bot|doctor|ask|tools|repro``.
+
+``repro`` — журнал решений (M1): ``verify`` сверяет хэш-цепочку, ``stats`` показывает объём,
+``anchor`` ставит мерклов корень дня (его крутят по cron), ``replay`` повторяет ход. Те же данные,
+что бот отдаёт в ``/replay``: и там, и здесь читается одна таблица.
 
 Зачем нужен ``ask``: путь «сообщение → supervisor → ответ» должен быть проверяемым без Telegram
 и без токена — это и инструмент отладки, и то, чем прогоняют смоук-тест в CI.
@@ -42,6 +46,21 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--owner-id", type=int, default=1)
 
     sub.add_parser("tools", help="список зарегистрированных инструментов")
+
+    repro = sub.add_parser(
+        "repro", help="журнал решений: сверка цепочки, объём, якорь дня, воспроизведение хода"
+    )
+    actions = repro.add_subparsers(dest="repro_action", required=True)
+    verify = actions.add_parser("verify", help="пересчитать хэш-цепочку журнала")
+    verify.add_argument("--days", type=int, default=7, help="за сколько дней (0 = всё)")
+    verify.add_argument("--json", action="store_true", help="машинный вывод")
+    actions.add_parser("stats", help="сколько записей, блобов, якорей")
+    anchor = actions.add_parser("anchor", help="мерклов корень записей дня в governance.anchors")
+    anchor.add_argument("--day", default=None, help="YYYY-MM-DD, по умолчанию сегодня")
+    replay = actions.add_parser("replay", help="повторить ход с тем же входом и сравнить ответ")
+    replay.add_argument("trace", nargs="?", default="", help="trace_id или его начало (8 символов)")
+    replay.add_argument("--last", action="store_true", help="взять последний ход в журнале")
+    replay.add_argument("--owner-id", type=int, default=1)
     return parser
 
 
@@ -275,7 +294,7 @@ async def _rates_report(cfg: Settings) -> dict[str, Any]:
 
 
 async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> int:
-    from aegis.agents.tools import builtin  # noqa: F401  (регистрирует инструменты)
+    from aegis.agents.tools import builtin, repro  # noqa: F401  (регистрирует инструменты)
     from aegis.agents.tools.registry import registry
     from aegis.platform.config import settings
     from aegis.runtime import build_app
@@ -341,7 +360,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
 
 async def _cmd_ask(text: str, owner_id: int) -> int:
     from aegis.agents.supervisor import Inbound
-    from aegis.agents.tools import builtin  # noqa: F401
+    from aegis.agents.tools import builtin, repro  # noqa: F401
     from aegis.agents.tools.registry import registry
     from aegis.platform.config import ConfigError
     from aegis.runtime import build_app
@@ -372,8 +391,102 @@ async def _cmd_bot() -> int:
     return 0
 
 
+async def _cmd_repro(action: str, args: argparse.Namespace) -> int:
+    """Команды журнала. Без ``build_app`` там, где хватает рекордера: сверка не должна падать
+    из-за недоступного Telegram-токена — ровно для этого ``verify`` и заводится в cron.
+    """
+    from datetime import date, timedelta
+
+    from aegis.governance.recorder import SqlDecisionRecorder
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if not cfg.repro_enabled:
+        print("! REPRO_ENABLED=false: журнал не ведётся, сверять нечего", file=sys.stderr)
+        return 2
+    recorder = SqlDecisionRecorder(cfg)
+
+    if action == "stats":
+        print(json.dumps(await recorder.stats(), indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    if action == "verify":
+        since = (date.today() - timedelta(days=args.days)).isoformat() if args.days > 0 else None
+        chain = await recorder.verify(since=since)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": chain.ok,
+                        "checked": chain.checked,
+                        "gaps": chain.gaps,
+                        "missing_blobs": chain.missing_blobs,
+                        "truncated": chain.truncated,
+                        "problems": chain.problems[:20],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(f"журнал с {since or 'начала'}: {chain.summary()}")
+            if recorder.failures:
+                print(f"! журнал писался с ошибками: {recorder.failures}", file=sys.stderr)
+        return 0 if chain.ok else 1
+
+    if action == "anchor":
+        anchored = await recorder.anchor(args.day)
+        if not anchored.ok:
+            print(f"! якорь не поставлен: {anchored.note or 'нет записей'}", file=sys.stderr)
+            return 1
+        print(f"якорь {anchored.day}: {anchored.records} записей, root={anchored.merkle_root}")
+        print("публикуй root туда, где его не изменить задним числом (git tag, почта, запись в БД)")
+        return 0
+
+    if action == "replay":
+        from aegis.agents.tools import builtin, repro  # noqa: F401  (регистрирует инструменты)
+        from aegis.agents.tools.registry import registry
+        from aegis.governance.replay import replay_trace
+        from aegis.runtime import build_app
+
+        ref = str(getattr(args, "trace", "") or "").strip()
+        if not ref or args.last:
+            ref = await recorder.latest_trace(owner_id=args.owner_id) or ""
+        if not ref:
+            print("! в журнале нет ни одного хода: воспроизводить нечего", file=sys.stderr)
+            return 1
+        matches = await recorder.matching_traces(ref)
+        if not matches:
+            print(f"! ход {ref} не найден (нужен UUID целиком или его начало от 6 символов)")
+            return 1
+        if len(matches) > 1:
+            print("! началу идентификатора соответствует несколько ходов: " + ", ".join(matches))
+            return 1
+        app = build_app(registry=registry)
+        try:
+            report = await replay_trace(
+                matches[0],
+                recorder=recorder,
+                gateway=app.gateway,
+                judge_role="fast",
+            )
+            print(report.as_text())
+            if report.judged:
+                print(f"\n— было:\n{report.original[:1200]}")
+                print(f"\n— стало:\n{report.replayed[:1200]}")
+            return 0 if report.ok else 1
+        finally:
+            await app.aclose()
+
+    print(f"! неизвестное действие {action}", file=sys.stderr)
+    return 2
+
+
 def _cmd_tools() -> int:
-    from aegis.agents.tools import builtin  # noqa: F401
+    from aegis.agents.tools import builtin, repro  # noqa: F401
     from aegis.agents.tools.registry import registry
 
     for spec in registry.all():
@@ -395,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_ask(" ".join(args.text), args.owner_id))
         if args.command == "tools":
             return _cmd_tools()
+        if args.command == "repro":
+            return asyncio.run(_cmd_repro(args.repro_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

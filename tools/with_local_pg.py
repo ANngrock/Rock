@@ -34,20 +34,44 @@ def _alembic(url: str) -> int:
 
 
 def _migration_sql() -> str:
-    """Текст upgrade()-блока миграции 0001 (единственный файл на шаге 1).
+    """SQL всех миграций подряд (0001, 0002, …) — то, что выполнил бы ``alembic upgrade head``.
 
-    Берём ровно тройную кавычку сразу после ``op.execute(`` — неdocstring модуля, не downgrade.
+    раньше брался ровно один файл и ровно один блок: с появлением 0002 тестовая база молча
+    осталась бы без таблиц журнала, и «интеграция зелёная» означала бы «мы не туда посмотрели».
+    Поэтому — все тройные SQL-блоки внутри ``upgrade()`` каждой миграции, по порядку файлов.
     """
-    files = sorted((ROOT / "migrations" / "versions").glob("0001_*.py"))
+    files = sorted((ROOT / "migrations" / "versions").glob("0*.py"))
     if not files:
-        raise SystemExit("миграция 0001 не найдена")
-    lines = files[0].read_text().splitlines()
-    upgrade = next(i for i, ln in enumerate(lines) if ln.startswith("def upgrade"))
-    call = next(i for i in range(upgrade, len(lines)) if "op.execute(" in lines[i])
-    fence = [i for i in range(call, len(lines)) if lines[i].strip() == '"""']
-    if len(fence) < 2:
-        raise SystemExit("не нашёл SQL-блок миграции — поменялся формат 0001_*.py")
-    return "\n".join(lines[fence[0] + 1 : fence[1]])
+        raise SystemExit("миграции не найдены")
+    parts: list[str] = []
+    for path in files:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        starts = [i for i, ln in enumerate(lines) if ln.startswith("def upgrade")]
+        if not starts:
+            raise SystemExit(f"в {path.name} нет upgrade() — формат миграции поменялся")
+        ends = [i for i, ln in enumerate(lines) if ln.startswith("def downgrade")]
+        stop = min((i for i in ends if i > starts[0]), default=len(lines))
+        i = starts[0]
+        while i < stop:
+            if "op.execute(" not in lines[i]:
+                i += 1
+                continue
+            fence = next((j for j in (i, i + 1) if '"""' in lines[j]), None)
+            if fence is None:
+                raise SystemExit(
+                    f"{path.name}:{i + 1}: op.execute без тройной кавычки — перепиши харнесс"
+                )
+            if lines[fence].count('"""') == 2:
+                inner = lines[fence].split('"""')[1]
+                parts.append(inner)
+                i += 1
+                continue
+            close = next((j for j in range(fence + 1, stop) if lines[j].strip() == '"""'), None)
+            if close is None:
+                raise SystemExit(f"{path.name}: не закрыт SQL-блок миграции")
+            parts.append("\n".join(lines[fence + 1 : close]))
+            i = close + 1
+    return "\n".join(parts)
 
 
 def _strip(sql: str) -> str:

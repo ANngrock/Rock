@@ -12,84 +12,10 @@ import pytest
 from openai import APIStatusError
 
 from aegis.platform.config import Settings
-from aegis.platform.gateway.client import LLMCallRecord, ModelGateway, ModelUnavailable
-from aegis.platform.gateway.cost import BudgetExceeded, CostGovernor
+from aegis.platform.gateway.client import ModelUnavailable
+from aegis.platform.gateway.cost import BudgetExceeded
 from aegis.platform.gateway.models import CATALOG
-from conftest import FakeKV
-
-
-class FakeCompletions:
-    def __init__(self, script: list[Any]) -> None:
-        self.script = list(script)
-        self.requests: list[dict[str, Any]] = []
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.requests.append(kwargs)
-        item = self.script.pop(0) if self.script else AssertionError("скрипт исчерпан")
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-
-def response(
-    content: str | None = "ответ", *, prompt_tokens: int = 1000, completion_tokens: int = 500
-) -> Any:
-    message = SimpleNamespace(
-        content=content,
-        tool_calls=None,
-        model_dump=lambda exclude_none: {"role": "assistant", "content": content},
-    )
-    return SimpleNamespace(
-        model="glm-test",
-        usage=SimpleNamespace(
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=0
-        ),
-        choices=[SimpleNamespace(message=message, finish_reason="stop")],
-    )
-
-
-def api_error(status: int) -> APIStatusError:
-    import httpx
-
-    request = httpx.Request("POST", "https://api.example/v1/chat/completions")
-    return APIStatusError(
-        f"status {status}", response=httpx.Response(status, request=request), body=None
-    )
-
-
-def make_gateway(
-    primary_script: list[Any],
-    *,
-    fallback_script: list[Any] | None = None,
-    cfg: Settings | None = None,
-    budget: float = 10.0,
-) -> tuple[ModelGateway, FakeKV, FakeCompletions, list[LLMCallRecord], dict[str, Any]]:
-    cfg = cfg or Settings(_env_file=None, _env_prefix="T_", glm_api_key="k", llm_backoff_s=0.05)
-    kv = FakeKV()
-    cost = CostGovernor(kv, daily_limit_usd=budget)  # type: ignore[arg-type]
-    gateway = ModelGateway(cfg, cost)
-    primary = FakeCompletions(primary_script)
-    gateway.primary = SimpleNamespace(  # type: ignore[assignment]
-        chat=SimpleNamespace(completions=primary), embeddings=None, close=_noop
-    )
-    fallback_client = None
-    if fallback_script is not None:
-        fallback = FakeCompletions(fallback_script)
-        gateway.fallback = SimpleNamespace(chat=SimpleNamespace(completions=fallback), close=_noop)  # type: ignore[assignment]
-        fallback_client = fallback
-    records: list[LLMCallRecord] = []
-
-    async def record(item: LLMCallRecord) -> None:
-        records.append(item)
-
-    gateway.recorder = record
-    meta = {"primary": primary, "fallback": fallback_client}
-    return gateway, kv, primary, records, meta
-
-
-async def _noop() -> None:
-    return None
-
+from conftest import api_error, make_gateway, noop, response
 
 # ------------------------------------------------------------------ успех
 
@@ -238,7 +164,7 @@ async def test_embed_records_usage_and_returns_vectors() -> None:
         )
 
     gateway.primary = SimpleNamespace(  # type: ignore[assignment]
-        chat=None, embeddings=SimpleNamespace(create=create), close=_noop
+        chat=None, embeddings=SimpleNamespace(create=create), close=noop
     )
     vectors = await gateway.embed(["а", "б"])
     assert vectors == [[0.1, 0.2], [0.1, 0.2]]
@@ -259,7 +185,7 @@ async def test_embed_failure_raises_model_unavailable() -> None:
         )
 
     gateway.primary = SimpleNamespace(
-        chat=None, embeddings=SimpleNamespace(create=create), close=_noop
+        chat=None, embeddings=SimpleNamespace(create=create), close=noop
     )  # type: ignore[assignment]
     with pytest.raises(ModelUnavailable):
         await gateway.embed(["а"])
@@ -342,7 +268,7 @@ async def test_embeddings_use_their_own_client() -> None:
         embeddings=SimpleNamespace(create=embed_create)
     )
     gateway.primary = SimpleNamespace(  # type: ignore[assignment]
-        embeddings=SimpleNamespace(create=primary_create), close=_noop
+        embeddings=SimpleNamespace(create=primary_create), close=noop
     )
     assert await gateway.embed(["текст"]) == [[0.0] * 4]
     assert used == ["embed"]
@@ -362,7 +288,7 @@ async def test_embeddings_fall_back_to_primary_endpoint() -> None:
 
         return Resp()
 
-    gateway.primary = SimpleNamespace(embeddings=SimpleNamespace(create=create), close=_noop)  # type: ignore[assignment]
+    gateway.primary = SimpleNamespace(embeddings=SimpleNamespace(create=create), close=noop)  # type: ignore[assignment]
     gateway.embed_client = gateway.primary
     assert await gateway.embed(["текст"]) == [[0.1] * 2]
 

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import orjson
 import pytest
+from openai import APIStatusError  # общий двойник транспорта
 
 os.environ.setdefault("ENV", "test")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://aegis:aegis@localhost:5432/aegis")
@@ -29,7 +31,12 @@ from aegis.governance.policy import PolicyEngine  # noqa: E402
 from aegis.knowledge.notes import Note, NoteHit  # noqa: E402
 from aegis.memory.facts import Fact  # noqa: E402
 from aegis.platform.config import Settings, override_settings  # noqa: E402
-from aegis.platform.gateway.client import ChatResult, ToolCall  # noqa: E402
+from aegis.platform.gateway.client import (  # noqa: E402
+    ChatResult,
+    LLMCallRecord,
+    ModelGateway,
+    ToolCall,
+)
 from aegis.platform.gateway.cost import CostGovernor  # noqa: E402
 from aegis.platform.gateway.dlp import DLP  # noqa: E402
 
@@ -229,4 +236,100 @@ def policy() -> PolicyEngine:
     return PolicyEngine(auto_allow_low_risk=True)
 
 
-__all__ = ["FakeFacts", "FakeGateway", "FakeKV", "FakeNotes", "make_chat_result"]
+# ------------------------------------------------------------------ шлюз
+
+#: Двойники для тестов ModelGateway: сеть подменяется целиком, остальная логика (retry, budget,
+#: DLP, учёт стоимости, журнал вызовов) — настоящая. Живут здесь, потому что нужны не только
+#: test_gateway: снимки полезной нагрузки проверяют и тесты воспроизводимости.
+
+
+class FakeCompletions:
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.requests: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        item = self.script.pop(0) if self.script else AssertionError("скрипт исчерпан")
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def response(
+    content: str | None = "ответ", *, prompt_tokens: int = 1000, completion_tokens: int = 500
+) -> Any:
+    message = SimpleNamespace(
+        content=content,
+        tool_calls=None,
+        model_dump=lambda **kwargs: {"role": "assistant", "content": content},
+    )
+    return SimpleNamespace(
+        model="glm-test",
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=0
+        ),
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+    )
+
+
+def api_error(status: int) -> APIStatusError:
+    import httpx
+
+    request = httpx.Request("POST", "https://api.example/v1/chat/completions")
+    return APIStatusError(
+        f"status {status}", response=httpx.Response(status, request=request), body=None
+    )
+
+
+async def noop() -> None:
+    return None
+
+
+def make_gateway(
+    primary_script: list[Any],
+    *,
+    fallback_script: list[Any] | None = None,
+    cfg: Settings | None = None,
+    budget: float = 10.0,
+) -> tuple[ModelGateway, FakeKV, FakeCompletions, list[LLMCallRecord], dict[str, Any]]:
+    """Шлюз с подменённым клиентом и собранными записями вызовов.
+
+    Возвращаем и ``records`` (то, что ушло в аудит/журнал), и ``meta`` с резервным клиентом: тесты
+    fallback проверяют, какой именно клиент получил запрос, а не только то, что ответ пришёл.
+    """
+    cfg = cfg or Settings(_env_file=None, _env_prefix="T_", glm_api_key="k", llm_backoff_s=0.05)
+    kv = FakeKV()
+    cost = CostGovernor(kv, daily_limit_usd=budget)  # type: ignore[arg-type]
+    gateway = ModelGateway(cfg, cost)
+    primary = FakeCompletions(primary_script)
+    gateway.primary = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=primary), embeddings=None, close=noop
+    )
+    fallback_client = None
+    if fallback_script is not None:
+        fallback = FakeCompletions(fallback_script)
+        gateway.fallback = SimpleNamespace(chat=SimpleNamespace(completions=fallback), close=noop)  # type: ignore[assignment]
+        fallback_client = fallback
+    records: list[LLMCallRecord] = []
+
+    async def record(item: LLMCallRecord) -> None:
+        records.append(item)
+
+    gateway.recorder = record
+    meta = {"primary": primary, "fallback": fallback_client}
+    return gateway, kv, primary, records, meta
+
+
+__all__ = [
+    "FakeCompletions",
+    "FakeFacts",
+    "FakeGateway",
+    "FakeKV",
+    "FakeNotes",
+    "api_error",
+    "make_chat_result",
+    "make_gateway",
+    "noop",
+    "response",
+]

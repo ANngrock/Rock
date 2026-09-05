@@ -19,12 +19,13 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import openai
+import orjson
 import structlog
 from openai import AsyncOpenAI
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from aegis.platform.config import Settings
 from aegis.platform.gateway.cost import CostGovernor
@@ -37,11 +38,29 @@ from aegis.platform.gateway.models import (
     spec_for_name,
 )
 
-__all__ = ["ChatResult", "LLMCallRecord", "ModelGateway", "ModelUnavailable", "ToolCall"]
+__all__ = [
+    "ChatResult",
+    "LLMCallRecord",
+    "ModelGateway",
+    "ModelUnavailable",
+    "ToolCall",
+    "extract_json",
+]
 
 log = structlog.get_logger(__name__)
 
+#: PEP 695 (`def f[T](...)`) не используем: песочница разработчика на 3.11, а runtime-минимум
+#: проекта — 3.12; TypeVar работает в обеих и не требует проверять, чем запущен контейнер.
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
 _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: сколько раз просить модель переделать ответ, если он не прошёл схему. Два: один ретрай
+#: лечает «модель обернула JSON в ```», второй обычно уже означает, что промпт плохой,
+#: и крутиться дальше — только жечь бюджет.
+_JSON_ATTEMPTS = 2
+
+_FENCE_OPEN = ("```json", "```")
 
 
 class ModelUnavailable(RuntimeError):
@@ -92,6 +111,12 @@ class LLMCallRecord:
     error: str | None = None
     provider: str = "primary"
     attempt: int = 0
+    #: Снимки «что именно ушло в API» и «что оттуда пришло» — для журнала решений (M1).
+    #: Заполняются только при ``REPRO_RECORD_PAYLOAD``; аудит их не читает, и это намеренно:
+    #: метрики и содержимое — разные по объёму вещи, и держать их в одной таблице значит раздувать
+    #: запрос «сколько стоило сегодня».
+    request: dict[str, Any] | None = None
+    response: dict[str, Any] | None = None
 
 
 Recorder = Callable[[LLMCallRecord], Awaitable[None]]
@@ -190,6 +215,7 @@ class ModelGateway:
                     host=host_of(self.cfg.fallback_base_url or self.cfg.glm_base_url),
                 )
             kwargs: dict[str, Any] = {**base_kwargs, "model": model_name}
+            request = self._snapshot(kwargs)
             # нестандартные параметры (thinking) провайдер fallback может не понимать
             if spec.supports_thinking and provider == "primary" and self.cfg.llm_thinking_param:
                 # у thinking-always-on моделей «выключить» — не настройка, а ошибка 400:
@@ -219,6 +245,7 @@ class ModelGateway:
                             error=last_error[:2000],
                             provider=provider,
                             attempt=attempt,
+                            request=request,
                         )
                     )
                     if not _is_retryable(exc):
@@ -238,10 +265,65 @@ class ModelGateway:
                     trace=trace,
                     dlp_map=dlp_map,
                     started=started,
+                    request=request,
                 )
         raise ModelUnavailable(
             f"все провайдеры недоступны; последняя ошибка: {last_error}",
             cause=last_error or "",
+        )
+
+    async def chat_json(
+        self,
+        role: ChatRole,
+        messages: Sequence[dict[str, Any]],
+        schema: type[_ModelT],
+        *,
+        thinking: bool = False,
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        trace_id: str | None = None,
+    ) -> _ModelT:
+        """Вызов, обязанный вернуться валидным ``schema``; иначе — один ретрай с текстом ошибки.
+
+        Почему в шлюзе, а не в каждом вызывающем: разбор ответа по месту — это N slightly
+        different парсеров и N способов молча получить ``None``. Заодно схема описывает контракт
+        промпта типом, а не абзацем текста.
+        """
+        convo: list[dict[str, Any]] = [dict(m) for m in messages]
+        last_error = ""
+        for attempt in range(_JSON_ATTEMPTS):
+            result = await self.chat(
+                role,
+                convo,
+                response_format={"type": "json_object"},
+                thinking=thinking,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=trace_id,
+            )
+            try:
+                return schema.model_validate(extract_json(result.content or ""))
+            except (ValidationError, ValueError) as exc:
+                last_error = str(exc)[:400]
+                log.info(
+                    "gateway.json_retry",
+                    role=role,
+                    attempt=attempt,
+                    error=last_error[:160],
+                    trace_id=trace_id,
+                )
+                convo = [
+                    *convo,
+                    {"role": "assistant", "content": result.content or ""},
+                    {
+                        "role": "user",
+                        "content": "Ответ не проходит схему. Верни только JSON без пояснений. "
+                        f"Ошибка: {last_error[:300]}",
+                    },
+                ]
+        raise ModelUnavailable(
+            f"модель не вернула валидный JSON за {_JSON_ATTEMPTS} попытки: {last_error[:200]}",
+            cause=last_error,
         )
 
     async def embed(
@@ -383,6 +465,7 @@ class ModelGateway:
         trace: str,
         dlp_map: dict[str, str],
         started: float,
+        request: dict[str, Any] | None = None,
     ) -> ChatResult:
         latency_ms = int((time.perf_counter() - started) * 1000)
         choice = resp.choices[0]
@@ -408,6 +491,10 @@ class ModelGateway:
                 ok=True,
                 provider=provider,
                 attempt=attempt,
+                request=request,
+                # не «всегда»: без REPRO_RECORD_PAYLOAD тратить сериализацию ответа незачем,
+                # и падать из-за журнала в основном пути — тем более
+                response=_response_snapshot(resp) if request is not None else None,
             )
         )
         raw: dict[str, Any] = message.model_dump(exclude_none=True)
@@ -434,6 +521,17 @@ class ModelGateway:
             truncated=choice.finish_reason == "length",
         )
 
+    def _snapshot(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        """Чем именно мы дёргали API: model, messages (после DLP), tools, параметры.
+
+        Ключей тут быть не может — заголовок Authorization живёт в клиенте, а не в kwargs.
+        Возвращаем тот же объект, что ушёл в SDK: записывать «как мы думаем, оно выглядело» —
+        значит вести журнал догадок.
+        """
+        if not self.cfg.repro_record_payload:
+            return None
+        return dict(kwargs)
+
     def _mask_messages(
         self, messages: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -459,6 +557,79 @@ class ModelGateway:
         in_tokens = chars / 3.5
         out_tokens = float(max_tokens or 700)
         return (in_tokens * spec.in_usd_per_m + out_tokens * spec.out_usd_per_m) / 1_000_000
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    """Терпеливо достать объект из ответа: код-блок, обрамляющая проза, ``{...}`` в середине.
+
+    ``response_format=json_object`` у части провайдеров не гарантирован (GLM принимает параметр, но
+    при thinking может добавить пояснение). Валидация схемы строже парсера: сначала вытаскиваем
+    границы объекта, потом разбираем — иначе проза превращалась бы в «судья не ответил».
+    """
+    raw = (text or "").strip()
+    for fence in _FENCE_OPEN:
+        if raw.startswith(fence):
+            raw = raw[len(fence) :].strip()
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
+    for candidate in _candidates(raw):
+        try:
+            parsed = orjson.loads(candidate)
+        except orjson.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return dict(parsed)
+    raise ValueError(f"в ответе нет JSON-объекта: {raw[:160]!r}")
+
+
+def _candidates(raw: str) -> list[str]:
+    out = [raw]
+    start, end = raw.find("{"), raw.rfind("}")
+    if 0 <= start < end:
+        inner = raw[start : end + 1]
+        if inner != raw:
+            out.append(inner)
+    return out
+
+
+def _json_dump(obj: Any) -> dict[str, Any] | None:
+    """``model_dump`` SDK'а в JSON-совместимый dict, если объект это умеет.
+
+    Сначала с ``mode="json"`` (иначе в журнал попадут datetime/enum, которые orjson не примет),
+    потом без аргументов: старый SDK и простые двойники его не принимают.
+    """
+    dump = getattr(obj, "model_dump", None)
+    if not callable(dump):
+        return None
+    for kwargs in ({"mode": "json"}, {}):
+        try:
+            data = dump(**kwargs)
+        except TypeError:
+            continue
+        return dict(data) if isinstance(data, dict) else None
+    return None
+
+
+def _response_snapshot(resp: Any) -> dict[str, Any]:
+    """Ответ провайдера в том виде, в каком его видно из OpenAI-совместимого SDK."""
+    dumped = _json_dump(resp)
+    if dumped is not None:
+        return dumped
+    choices: list[dict[str, Any]] = []
+    for choice in list(getattr(resp, "choices", None) or [])[:1]:
+        message = getattr(choice, "message", None)
+        body = _json_dump(message) or {
+            "role": str(getattr(message, "role", "assistant") or "assistant"),
+            "content": str(getattr(message, "content", "") or ""),
+        }
+        choices.append(
+            {"finish_reason": str(getattr(choice, "finish_reason", "") or ""), "message": body}
+        )
+    return {
+        "model": str(getattr(resp, "model", "") or ""),
+        "id": str(getattr(resp, "id", "") or ""),
+        "choices": choices,
+    }
 
 
 def _is_retryable(exc: BaseException) -> bool:

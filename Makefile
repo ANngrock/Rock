@@ -68,8 +68,9 @@ check: ## полный офлайн-контур качества (то, что 
 	$(MAKE) test
 	$(MAKE) evals
 
-evals: ## золотые наборы (роутинг/политика/DLP/рендер), без сети
+evals: ## золотые наборы (роутинг/политика/DLP/рендер) + хэши журнала, без сети
 	python evals/run_golden.py
+	python evals/run_repro.py
 
 type:
 	mypy src

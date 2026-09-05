@@ -101,6 +101,7 @@ aegis/
 | [0005](ADR/0005-temporal-for-long-running.md) | Temporal для всего, что живёт дольше одного запроса |
 | [0006](ADR/0006-confirmations.md) | подтверждения через pending_actions (Redis, TTL) + inline-кнопки; решает policy engine |
 | [0007](ADR/0007-web-stack.md) | self-hosted SearXNG + trafilatura; встроенный поиск GLM — резерв; SSRF-фильтр обязателен |
+| [0008](ADR/0008-decision-journal.md) | журнал решений в Postgres: контент-адресные блобы, хэш-цепочка, якорь дня; replay с замороженным миром |
 
 ## 7. Что явно не делаем
 
