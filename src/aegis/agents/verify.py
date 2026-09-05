@@ -152,6 +152,15 @@ def _norm_date(day: str, month: str, year: str) -> str | None:
     return f"{d:02d}.{m:02d}.{y or 'гггг'}"
 
 
+def _display(claim: str) -> str:
+    """Как показывать владельцу нормализованную дату: `05.03.гггг` → `05.03`.
+
+    Канон нужен для сравнения, а не для чтения: «в ответе есть «05.03.гггг», чего нет в
+    источниках» — строчка, после которой предупреждениям перестают верить.
+    """
+    return re.sub(r"\.гггг$", "", claim)
+
+
 _SEVERITY_ORDER = {"none": 0, "minor": 1, "critical": 2, "unavailable": 1}
 
 
@@ -240,16 +249,28 @@ def extract_claims(text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+_DATE_CANON_RE = re.compile(r"(\d{2}\.\d{2})\.(гггг|\d{4})")
+
+
 def find_unverified(claims: Sequence[str], haystacks: Sequence[str]) -> list[str]:
     """Что из ``claims`` не находится ни в одном источнике (сравнение по нормализованному виду)."""
     pool = " | ".join(_normalize(item) for item in haystacks)
+    # даты источника — отдельным множеством: «не повторили год» и «перепутали год» для поиска
+    # подстроки выглядят одинаково, а значат ровно противоположное
+    pool_dates = set(_DATE_CANON_RE.findall(pool))
     missing: list[str] = []
     for claim in claims:
         if claim in pool:
             continue
-        # год могли не повторить: «03.09.2026» против «3 сентября» в источнике — не выдумка
-        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", claim) and claim[:6] in pool:
-            continue
+        match = _DATE_CANON_RE.fullmatch(claim)
+        if match:
+            daymonth, year = match.groups()
+            # год могли не повторить — с любой из сторон; требовать его нельзя: источник имеет
+            # право написать «3 сентября», а ответ — «03.09.2026»
+            if any(dm == daymonth and y == "гггг" for dm, y in pool_dates):
+                continue
+            if year == "гггг" and any(dm == daymonth for dm, _ in pool_dates):
+                continue
         missing.append(claim)
     return missing
 
@@ -316,7 +337,9 @@ class Verifier:
         skipped = max(0, len(all_claims) - len(claims))
         haystacks = [*sources, question]
         missing = find_unverified(claims, haystacks)
-        problems = [f"в ответе есть «{item}», чего нет в источниках" for item in missing[:6]]
+        problems = [
+            f"в ответе есть «{_display(item)}», чего нет в источниках" for item in missing[:6]
+        ]
         if skipped:
             problems.append(f"и ещё {skipped} чисел не проверялись (лимит сверки)")
         severity: Literal["none", "minor", "critical", "unavailable"] = (

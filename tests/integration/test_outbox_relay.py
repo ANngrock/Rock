@@ -110,9 +110,12 @@ async def test_published_flag_and_counters_round_trip(db: str) -> None:
     assert len(mine) == 3 and all(r["published"] for r in mine), "отметка обязана дойти до строк"
     assert all(r["attempts"] == 0 for r in mine), "успех не должен тратить попытки"
 
-    subjects = {s for s, _ in pub.sent}
+    # только свои субъекты: на грязной базе этот drain мог прихватить чужие висящие строки,
+    # и «сколько всего уехало» тут ничего про нас не утверждает
+    mine_sent = [(subj, raw) for subj, raw in pub.sent if stream_id.replace(":", "-") in subj]
+    subjects = {subj for subj, _ in mine_sent}
     assert len(subjects) == 1 and next(iter(subjects)).count(".") == 3
-    body = orjson.loads(pub.sent[0][1])
+    body = orjson.loads(mine_sent[0][1])
     assert body["payload"] == {"text": "привет, мир"}, "кириллица проходит через jsonb целой"
     assert body["stream_id"] == stream_id
 
@@ -135,7 +138,7 @@ async def test_failed_publish_burns_one_attempt_and_keeps_the_row(db: str) -> No
     async with session() as s:
         report = await drain(EventStore(s), Publisher(fail=True), limit=500, max_attempts=8)
 
-    assert report.published == 0 and report.failed >= 1 and not report.ok
+    assert report.failed >= 1 and not report.ok
     mine = await rows_for(db)
     assert mine and mine[0]["published"] is False
     assert mine[0]["attempts"] == 1, "попытка тратится только на строку, которая не ушла"

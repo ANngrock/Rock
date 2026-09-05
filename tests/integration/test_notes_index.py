@@ -103,8 +103,14 @@ async def test_pass_fills_queue_and_empties_it(db: str) -> None:
     embed = Embedder()
     report = await index_pending(repo, embed, limit=500, batch=2)
     assert report.ok and report.indexed >= 2, report.summary()
-    assert len(embed.seen[0]) == 2, "пакет = один запрос на две заметки"
-    assert "Отчёт за квартал" in embed.seen[0][0], "в индекс уходит заголовок и тело"
+    # пакеты смотрим «в каком-нибудь», а не «в первом»: на переиспользованной базе в очередь
+    # могли лежать чужие заметки, и порядок пакетов — не свойство индекса
+    assert max(len(batch) for batch in embed.seen) <= 2, "размер пакета не соблюдается"
+    assert any(len(batch) > 1 for batch in embed.seen), (
+        "заметки должны уходить пакетами, а не по одной"
+    )
+    mine = next(text for batch in embed.seen for text in batch if "Отчёт за квартал" in text)
+    assert "цифры и выводы" in mine, "в индекс уходит заголовок и тело"
 
     assert await embedded(first.id) == (True, True)
     left = [n.id for n in await repo.pending_embeddings(limit=500)]

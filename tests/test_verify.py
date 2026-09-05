@@ -214,3 +214,32 @@ def test_judgement_shape_is_strict() -> None:
         VerifyJudgement.model_validate({"consistent": True, "severity": "катастрофа"})
     with pytest.raises(ValidationError):
         VerifyJudgement.model_validate({"severity": "minor"})
+
+
+def test_date_without_year_in_answer_is_not_called_a_mismatch() -> None:
+    """«5 марта» в ответе и «05.03.2026» в источнике — это одно и то же число.
+
+    Канон ответа без года выглядит как `05.03.гггг`, и сравнение подстроки его не прощает:
+    владелец получил бы «в ответе есть 05.03.гггг, чего нет в источниках» на корректный ответ.
+    """
+    claims = extract_claims("Оплата прошла 5 марта.")
+    assert "05.03.гггг" in claims
+    assert find_unverified(claims, ["Платёж 05.03.2026 на 900 грн"]) == []
+
+
+def test_wrong_year_is_a_mismatch_even_if_day_and_month_match() -> None:
+    """Прощаем отсутствие года, но не его подмену: 2025 против 2026 — это другая оплата.
+
+    Старое правило «достаточно совпадения `дд.мм.`» делало проверку дат декоративной; тест нужен,
+    чтобы смягчение не вернули «для тишины».
+    """
+    claims = extract_claims("Оплата прошла 5 марта 2025.")
+    assert find_unverified(claims, ["Платёж 5 марта 2026 на 900 грн"]) == ["05.03.2025"]
+
+
+def test_placeholder_year_never_reaches_the_owner() -> None:
+    from aegis.agents.verify import _display
+
+    assert _display("05.03.гггг") == "05.03"
+    assert _display("1234.56") == "1234.56"
+    assert "гггг" not in Verdict(ok=False, problems=("в ответе есть «05.03», чего нет",)).notice()

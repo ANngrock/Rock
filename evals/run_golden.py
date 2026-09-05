@@ -17,11 +17,16 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SET = HERE / "golden_v1.jsonl"
+#: v2 — «взрослые» сюжеты шага 2: даты (их считает код, а не модель), разбор котировок из реальных
+#: форм ответов банков и сверка чисел/дат ответа с источниками. Тот же офлайн-контракт.
+V2_SET = HERE / "golden_v2.jsonl"
+SETS = (DEFAULT_SET, V2_SET)
 
 
 @dataclass(slots=True)
@@ -200,6 +205,9 @@ def check_injection(case: Case) -> str | None:
 
     wrapped = wrap_untrusted("eval", str(case.payload["input"]))
     expect = case.payload["expect"]
+    for needle in expect.get("absent", []):
+        if str(needle) in wrapped:
+            return f"в контейнере осталось {needle!r}"
     if wrapped.count("<untrusted") != int(expect["single_open"]):
         return f"открывающих тегов: {wrapped.count('<untrusted')}"
     if wrapped.count("</untrusted>") != int(expect["single_close"]):
@@ -276,8 +284,139 @@ def check_intent(case: Case) -> str | None:
     return None
 
 
+def check_schedule(case: Case) -> str | None:
+    """«Когда» считает код, и ошибаться он обязан громко: сверка с фиксированным «сейчас».
+
+    Три обещания в каждой строке набора: время местное (не UTC и не серверное), дополненное время
+    суток помечено в `note`, а прошлое и невнятица — отказ, а не «поставим на вчера».
+    """
+    from zoneinfo import ZoneInfo
+
+    from aegis.planning.schedule import WhenNotParsed, parse_when
+
+    data = case.payload
+    now = datetime.fromisoformat(str(data["now"])).replace(tzinfo=ZoneInfo("UTC"))
+    zone = str(data.get("timezone", "Europe/Kiev"))
+    expect = data.get("expect", {})
+    try:
+        when = parse_when(str(data["input"]), now=now, timezone=zone)
+    except WhenNotParsed as exc:
+        if not expect.get("refuse"):
+            return f"не распознано: {exc}"
+        needle = str(expect.get("reason_contains", ""))
+        return None if not needle or needle in str(exc) else f"в отказе нет {needle!r}: {exc}"
+    if expect.get("refuse"):
+        return f"ожидался отказ, а получили {when.at.isoformat()}"
+    local = when.at.astimezone(ZoneInfo(zone))
+    # `local` — без смещения: смещение проверяется отдельным ключом, и «2026-09-05T10:20+03:00»
+    # в датасете означало бы, что мы записали два факта одной строкой и сравниваем их дважды
+    got: dict[str, object] = {
+        "local": local.strftime("%Y-%m-%dT%H:%M"),
+        "offset": local.isoformat()[-6:],
+        "matched": when.matched,
+        "note": when.note,
+    }
+    for key, want in expect.items():
+        if key in ("refuse", "reason_contains"):
+            continue
+        if got.get(key) != want:
+            return f"{key}: ожидалось {want!r}, получилось {got.get(key)!r}"
+    return None
+
+
+def _quote_dict(quote: Any) -> dict[str, object]:
+    return {
+        "base": quote.base,
+        "quote": quote.quote,
+        "buy": quote.buy,
+        "sell": quote.sell,
+        "mid": quote.mid,
+        "kind": quote.kind,
+        "as_of": quote.as_of,
+        "note": quote.note,
+    }
+
+
+def check_rates(case: Case) -> str | None:
+    """Разбор ответов банков на реальных формах JSON — без сети и без httpx.
+
+    Здесь живут правила, которые легко потерять при «улучшении парсера»: деление на `units` у НБУ,
+    переворот обратной котировки у Привата, и то, что спред в пределах допуска — не конфликт.
+    """
+    from aegis.web import rates
+
+    data = case.payload
+    op = str(data["op"])
+    expect = data.get("expect", {})
+    got: object
+    if op == "nbu":
+        quote = rates._pick_nbu(list(data["rows"]), str(data["code"]))
+        got = None if quote is None else _quote_dict(quote)
+    elif op == "privat":
+        found = rates._pick_privat(
+            list(data["rows"]), str(data["base"]).upper(), str(data["quote"]).upper()
+        )
+        got = None if found is None else {"buy": found[0], "sell": found[1]}
+    elif op == "verdict":
+        quotes = [rates.RateQuote(**row) for row in data["quotes"]]
+        state, deviation, gap = rates._verdict(quotes, tolerance=float(data["tolerance"]))
+        got = {
+            "verdict": state,
+            "deviation": round(deviation, 3),
+            "gap": round(gap, 3) if gap is not None else None,
+        }
+    elif op == "cross":
+        question = rates.RateQuestion(**data["question"])
+        quotes = [rates.RateQuote(**row) for row in data["quotes"]]
+        derived = rates._derive_crosses(quotes, question)
+        got = None if not derived else _quote_dict(derived[0])
+    else:
+        return f"неизвестный op {op!r}"
+    if got is None:
+        return None if expect.get("none") else f"разбор не нашёл котировку, а ждали {expect!r}"
+    if not isinstance(got, dict):  # pragma: no cover - защита от новой формы возврата
+        return f"неожиданный результат: {got!r}"
+    for key, want in expect.items():
+        if key == "none":
+            continue
+        value = got.get(key)
+        if isinstance(want, (int, float)) and isinstance(value, (int, float)):
+            if abs(float(value) - float(want)) > 1e-6:
+                return f"{key}: ожидалось {want}, получилось {value}"
+        elif value != want:
+            return f"{key}: ожидалось {want!r}, получилось {value!r}"
+    return None
+
+
+def check_claims(case: Case) -> str | None:
+    """Что считается утверждением и что из этого не подтверждено источником.
+
+    Проверяются обе стороны ошибки: число из ответа, которого нет в источниках, обязано найтись;
+    дата без года в ответе — не обязана, иначе верификатор кричит на корректные ответы.
+    """
+    from aegis.agents.verify import _MONEY_HINT, extract_claims, find_unverified
+
+    data = case.payload
+    answer = str(data["answer"])
+    claims = list(extract_claims(answer))
+    expect = data.get("expect", {})
+    if "claims" in expect and claims != list(expect["claims"]):
+        return f"claims: ожидалось {expect['claims']}, получилось {claims}"
+    if "max_claims" in expect and len(claims) > int(expect["max_claims"]):
+        return f"слишком длинный список утверждений: {len(claims)}"
+    missing = find_unverified(claims, [str(item) for item in data.get("sources", [])])
+    if "missing" in expect and missing != list(expect["missing"]):
+        return f"missing: ожидалось {expect['missing']}, получилось {missing}"
+    if "money" in expect and bool(_MONEY_HINT.search(answer)) != bool(expect["money"]):
+        return f"денег в ответе: {bool(_MONEY_HINT.search(answer))}, ждали {expect['money']}"
+    return None
+
+
 CHECKERS = {
     "routing": check_routing,
+    "schedule": check_schedule,
+    "rates": check_rates,
+    "claims": check_claims,
     "intent": check_intent,
     "policy": check_policy,
     "dlp": check_dlp,
@@ -291,11 +430,36 @@ CHECKERS = {
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="прогон золотого набора aegis (офлайн)")
-    parser.add_argument("--set", dest="dataset", default=str(DEFAULT_SET), type=Path)
+    parser.add_argument(
+        "--set",
+        dest="datasets",
+        action="append",
+        default=None,
+        type=Path,
+        help="jsonl с кейсами; по умолчанию прогоняются все наборы evals/",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
-    cases = load_cases(args.dataset)
+    failures: list[tuple[str, str]] = []
+    passed = total_all = 0
+    for dataset in args.datasets or SETS:
+        cases = load_cases(dataset)
+        ok, outcome = _run_cases(cases, args.verbose)
+        failures.extend(outcome)
+        passed += ok
+        total_all += len(cases)
+        line = f"{dataset.stem}: {ok}/{len(cases)} кейсов пройдено" + (
+            f", провалов: {len(outcome)}" if outcome else ""
+        )
+        print(line, file=sys.stderr if outcome else sys.stdout)
+    if total_all and not failures:
+        print(f"итого: {passed}/{total_all} — офлайн-контракт поведения держится")
+    return 1 if failures else 0
+
+
+def _run_cases(cases: list[Case], verbose: bool) -> tuple[int, list[tuple[str, str]]]:
+    """Прогон одного набора: падение чекера = провал кейса, а не исключение наружу."""
     failures: list[tuple[str, str]] = []
     passed = 0
     for case in cases:
@@ -309,18 +473,13 @@ def main(argv: list[str] | None = None) -> int:
             problem = f"{type(exc).__name__}: {exc}"
         if problem is None:
             passed += 1
-            if args.verbose:
+            if verbose:
                 print(f"  ok   {case.id} ({case.kind})")
         else:
             failures.append((case.id, problem))
             print(f"  FAIL {case.id} ({case.kind}): {problem}", file=sys.stderr)
 
-    total = len(cases)
-    print(
-        f"golden_v1: {passed}/{total} кейсов пройдено"
-        + (f", провалов: {len(failures)}" if failures else "")
-    )
-    return 1 if failures else 0
+    return passed, failures
 
 
 if __name__ == "__main__":

@@ -466,7 +466,7 @@ class RateSources:
                 raise ValueError(f"приват вернул не список (csid={csid})")
             rows = [row for row in data if isinstance(row, dict)]
             for code in codes:
-                found = self._pick_privat(rows, code.upper(), "UAH")
+                found = _pick_privat(rows, code.upper(), "UAH")
                 if found is None:
                     continue
                 buy, sell = found
@@ -501,7 +501,7 @@ class RateSources:
                 raise ValueError(f"приват вернул не список (csid={csid})")
             rows = [row for row in data if isinstance(row, dict)]
             for base, quote in self._pairs_needed(question):
-                found = self._pick_privat(rows, base, quote)
+                found = _pick_privat(rows, base, quote)
                 if found is None:
                     if base == question.base and quote == question.quote:
                         raise ValueError(f"в фиде ПриватБанка нет пары {base}/{quote}")
@@ -532,30 +532,6 @@ class RateSources:
             return [(question.base.upper(), "UAH")]
         # кросс: банку известна только пара к гривне, поэтому считаем из двух котировок
         return [(question.base.upper(), "UAH"), (question.quote.upper(), "UAH")]
-
-    def _pick_privat(
-        self, rows: list[dict[str, Any]], base: str, quote: str
-    ) -> tuple[float | None, float | None] | None:
-        for row in rows:
-            if str(row.get("ccy", "")).upper() != base:
-                continue
-            if str(row.get("base_ccy", "")).upper() != quote:
-                continue
-            buy, sell = _number(row.get("buy")), _number(row.get("sale"))
-            if buy is None and sell is None:
-                return None
-            return buy, sell
-        # у Привата есть и обратные котировки (UAH/PLN) — попробуем перевернуть
-        for row in rows:
-            if str(row.get("ccy", "")).upper() != quote:
-                continue
-            if str(row.get("base_ccy", "")).upper() != base:
-                continue
-            buy, sell = _number(row.get("buy")), _number(row.get("sale"))
-            if not buy or not sell:
-                return None
-            return (round(1 / sell, 6), round(1 / buy, 6))
-        return None
 
     async def _nbu(self, client: httpx.AsyncClient, question: RateQuestion) -> RateQuote | None:
         if question.quote.upper() != "UAH":
@@ -608,6 +584,36 @@ def _pick_nbu(rows: list[Any], code: str) -> RateQuote | None:
             as_of=str(row.get("exchangedate") or ""),
             kind="official",
         )
+    return None
+
+
+def _pick_privat(
+    rows: list[dict[str, Any]], base: str, quote: str
+) -> tuple[float | None, float | None] | None:
+    """Котировка Привата за 1 единицу `base` в `quote`; `self` не нужен — разбор чист по данным.
+
+    Вынесен из класса не ради красоты: этот разбор проверяется golden-набором на реальных формах
+    ответа (включая обратную котировку, которую приходится переворачивать) — и без сети.
+    """
+    for row in rows:
+        if str(row.get("ccy", "")).upper() != base:
+            continue
+        if str(row.get("base_ccy", "")).upper() != quote:
+            continue
+        buy, sell = _number(row.get("buy")), _number(row.get("sale"))
+        if buy is None and sell is None:
+            return None
+        return buy, sell
+    # у Привата есть и обратные котировки (UAH/PLN) — попробуем перевернуть
+    for row in rows:
+        if str(row.get("ccy", "")).upper() != quote:
+            continue
+        if str(row.get("base_ccy", "")).upper() != base:
+            continue
+        buy, sell = _number(row.get("buy")), _number(row.get("sale"))
+        if not buy or not sell:
+            return None
+        return (round(1 / sell, 6), round(1 / buy, 6))
     return None
 
 

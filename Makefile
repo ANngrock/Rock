@@ -41,8 +41,8 @@ doctor: ## локальная самодиагностика конфигура�
 test: ## только юнит-тесты (без БД)
 	pytest -q
 
-test-live: ## интеграции на переносном Postgres (без Docker; ставится с extra dev)
-	$(PY) tools/with_local_pg.py --strip-ext -- pytest -q -m integration
+test-live: ## интеграции на переносном Postgres (без Docker; база каждый раз чистая)
+	$(PY) tools/with_local_pg.py --strip-ext --fresh -- pytest -q -m integration
 
 test-all: ## юниты + интеграции: есть AEGIS_TEST_DATABASE_URL/докер — он, иначе portable-PG
 	@if [ -n "$$AEGIS_TEST_DATABASE_URL" ]; then \
