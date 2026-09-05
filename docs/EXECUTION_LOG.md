@@ -516,9 +516,19 @@ files`)/`lint-imports` (3 контракта) — чисто; `make evals` — g
 **Дальше (за владельцем).** `git pull` → `docker compose -f deploy/docker-compose.yml run --rm bot alembic
 upgrade head` (0002 обязательна: без неё `/replay` и `explain_decision` честно скажут «журнала нет») →
 `aegis doctor` → `aegis ask "что нового"` и проверить, что в `platform.blobs` появились строки →
-`aegis repro verify --days 1` → поставить в cron `aegis repro anchor` (строка в `.env.example`) и
-опубликовать корень первого дня. `REPRO_RECORD_PAYLOAD=false` — если диск жалко, но тогда replay
+`aegis repro verify --days 1` → поставить якорь по таймеру (`deploy/systemd/aegis-repro-anchor.timer`, 03:10,
+после бэкапа; cron-строка — в Runbook §12) и опубликовать корень первого дня туда, где его не переписать. `REPRO_RECORD_PAYLOAD=false` — если диск жалко, но тогда replay
 становится сравнением метрик, а не ответов, и `/replay` обязан это говорить.
+
+**CI падает не из-за кода (проверено).** Все прогоны репозитория — `startup_failure`, `path:
+BuildFailed`, пустое имя workflow, и так с 04.09, то есть и до правок `.github/workflows/ci.yml` в этой
+серии. Пустое имя означает, что GitHub не дошёл до разбора файла: сам файл валиден (PyYAML, отдельная
+проверка на дубликаты ключей, набор `on`/`jobs`/`steps` по схеме Actions). Для private-репы это либо
+выключенные Actions (Settings → Actions → General → Allow all actions and reusable workflows), либо
+отсутствие минут на счёте; у токена песочницы нет прав даже прочитать это (`/actions/permissions` → 403).
+Следствие для нас: пока это не починено, единственные ворота — `make check` и `make test-live`, и в логе
+CI нигде не числится зелёным. В этой серии в CI добавлен только второй золотой набор
+(`evals/run_repro.py`) — он начнёт что-то значить в тот день, когда джобы снова начнут запускаться.
 
 ## Шаг 2 — Ядро агента 2.0 (следующий; начинать после 1.11)
 
