@@ -44,7 +44,11 @@ jobs:
           TELEGRAM_OWNER_ID: "1"
           GLM_API_KEY: ci-key
       - name: evals (офлайн-золотые наборы)
-        run: python evals/run_golden.py
+        # run_repro — закреплённые байты и хэши журнала: смена канонизации обязана валить CI,
+        # иначе журнал тихо станет неверифицируемым
+        run: |
+          python evals/run_golden.py
+          python evals/run_repro.py
 
   integration:
     name: Postgres/Redis интеграция
