@@ -131,3 +131,65 @@ def test_slo_status_and_alerts(db_url: str) -> None:
     assert _run("slo", "status") in (0, 1)  # 1 — пейдж; в тихой тестовой базе ожидаем 0
     assert _run("slo", "alerts") == 0
     assert _run("slo", "tick", "--dry-run") in (0, 1)
+
+
+# ------------------------------------------------------------------ ходы (F1)
+
+
+def _in_process(coro_fn: object) -> object:
+    """Один asyncio.run = свой loop; пул движка привязывается к нему, поэтому reset — с двух сторон.
+
+    Без этого следующий `_run` получает «Future attached to a different loop» — тот же контракт,
+    который заставляет _run сбрасывать движок, распространяется на любую подготовку в тесте.
+    """
+    import asyncio
+
+    reset_engine()
+    try:
+        return asyncio.run(coro_fn())  # type: ignore[operator]
+    finally:
+        reset_engine()
+
+
+def test_turns_status_release_and_drain(db_url: str) -> None:
+    import uuid
+
+    from sqlalchemy import text
+
+    from aegis.governance.turns import SqlTurnLedger
+    from aegis.platform.db import session
+
+    owner = 999101
+    trace = str(uuid.uuid4())
+    stranded_trace = str(uuid.uuid4())
+
+    async def prep() -> None:
+        await SqlTurnLedger().begin(trace, owner_id=owner)
+        async with session() as s:
+            await s.execute(
+                text(
+                    "INSERT INTO governance.turn_queue"
+                    " (owner_id, trace_id, kind, payload, status, attempts, claimed_at)"
+                    " VALUES (:o, CAST(:t AS uuid), 'message', '{}'::jsonb, 'claimed', 1,"
+                    " now() - interval '120 seconds')"
+                ).bindparams(o=owner, t=stranded_trace)
+            )
+            await s.commit()
+
+    _in_process(prep)
+
+    assert _run("turns", "status") == 1  # есть осиротевший claimed — сигнал, не шум
+    assert _run("turns", "release", trace) == 0
+    assert _run("turns", "release", trace) == 1  # закрыто; второй раз освобождать нечего
+    assert _run("turns", "release", "не-uuid") == 2
+    assert _run("turns", "drain", str(owner)) == 0  # план: показать, не трогая
+    assert _run("turns", "drain", str(owner), "--execute") == 0
+    assert _run("turns", "status") == 0  # возврат в queued — бот доберёт сам
+    assert _run("migrate", "status") == 0
+
+    async def check_queue() -> None:
+        item = await SqlTurnLedger().pop_next(owner)
+        assert item is not None and str(item.trace_id) == stranded_trace
+        assert item.attempts == 2  # возврат не «обнуляет историю»: попытка уже была
+
+    _in_process(check_queue)

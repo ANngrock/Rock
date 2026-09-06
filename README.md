@@ -80,7 +80,7 @@ src/aegis/
 
 ## Операционный контур (шаг 2.5+)
 
-Восемь команд для тех, что решаются данными, а не рестартом — все работают и с живой БД, и
+Девять команд для того, что решается данными, а не рестартом — все работают и с живой БД, и
 честно говорят «база не отвечает» (код возврата 1), и все покрыты интеграционным прогоном
 (`tests/integration/test_cli_ops.py`):
 
@@ -93,6 +93,7 @@ aegis events dlq|replay FROM_SEQ [--type T]           # разбор dead-letter
 aegis migrate status                                  # head vs БД, висячие бэкфиллы, dangling NOT NULL
 aegis backfill status|run --rounds N|pause NAME       # бэкфиллы с лизингом, прогрессом и паузой
 aegis slo status|alerts --write F|tick [--dry-run]    # burn-rate: состояние, артефакт алертов, тик
+aegis turns status|release TRACE|drain OWNER [--execute]  # аренда ходов и залипшая очередь (F1)
 ```
 
 ## Качество

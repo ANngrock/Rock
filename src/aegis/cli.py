@@ -231,6 +231,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "tick", help="применить декларируемую деградацию к runtime_overrides (для таймера)"
     )
     slt.add_argument("--dry-run", action="store_true", help="показать, что включилось бы")
+
+    tn = sub.add_parser(
+        "turns", help="ходы (F1): кто держит аренду, залипшие claimed, ручная расчистка"
+    )
+    tn_actions = tn.add_subparsers(dest="turns_action", required=True)
+    tn_actions.add_parser("status", help="активные заявки и осиротевшие элементы очереди")
+    tnr = tn_actions.add_parser("release", help="закрыть ход без токена — путь CLI-расчистки")
+    tnr.add_argument("trace", help="trace_id (uuid) активного хода")
+    tnd = tn_actions.add_parser(
+        "drain", help="вернуть осиротевшие claimed-элементы очереди владельцу"
+    )
+    tnd.add_argument("owner_id", type=int, help="владелец, чью очередь проверяем")
+    tnd.add_argument(
+        "--execute", action="store_true", help="применить (по умолчанию — только план)"
+    )
     return parser
 
 
@@ -2004,6 +2019,127 @@ async def _cmd_slo(action: str, args: argparse.Namespace) -> int:
     return await _db_guard(go)
 
 
+async def _cmd_turns(action: str, args: argparse.Namespace) -> int:
+    """Ходы (F1) глазами оператора: аренда, залипшие claimed, ручная расчистка.
+
+    ``release`` использует незащищённый финал специально: оператор, снимающий зависший ход,
+    не может знать текущий fencing-токен — это путь, помеченный в turns.py как «CLI-расчистка».
+    """
+    from sqlalchemy import text
+
+    from aegis.platform.db import session
+
+    async def go() -> int:
+        import uuid as _uuid  # noqa: PLC0415
+
+        from aegis.governance.turns import SqlTurnLedger  # noqa: PLC0415
+
+        ledger = SqlTurnLedger()
+        if action == "status":
+            st = await ledger.status()
+            print("сводка: " + " · ".join(f"{k} {v}" for k, v in sorted(st.items())))
+            async with session() as s:
+                claims = (
+                    (
+                        await s.execute(
+                            text(
+                                "SELECT owner_id, trace_id::text AS trace, step,"
+                                " GREATEST(0, EXTRACT(EPOCH FROM (lease_until - now()))::int)"
+                                " AS lease_s"
+                                " FROM governance.turn_claims WHERE status = 'active'"
+                                " ORDER BY lease_until"
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                stranded = (
+                    (
+                        await s.execute(
+                            text(
+                                "SELECT id, owner_id, trace_id::text AS trace, attempts,"
+                                " EXTRACT(EPOCH FROM (now() - claimed_at))::int AS idle_s"
+                                " FROM governance.turn_queue"
+                                " WHERE status = 'claimed' AND claimed_at < now()"
+                                "   - make_interval(secs => 60) ORDER BY id"
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                await s.commit()
+            for row in claims:
+                print(
+                    f"  активный ход: владелец {row['owner_id']} · trace {str(row['trace'])[:8]}"
+                    f" · шаг {row['step']} · аренда ещё {row['lease_s']}s"
+                )
+            for row in stranded:
+                print(
+                    f"  осиротевший claim очереди: id {row['id']} · владелец {row['owner_id']}"
+                    f" · попыток {row['attempts']} · висит {row['idle_s']}s — aegis turns drain"
+                )
+            if not claims and not stranded:
+                print("ни активных заявок, ни осиротевших элементов — ходы идут как надо")
+            return 1 if stranded else 0
+        if action == "release":
+            raw = str(args.trace).strip()
+            try:
+                trace = str(_uuid.UUID(raw))
+            except ValueError:
+                print("! trace_id должен быть uuid", file=sys.stderr)
+                return 2
+            closed = await ledger.finish(trace)
+            if closed:
+                print(f"ход {trace[:8]} закрыт — владелец свободен, очередь разберёт бот")
+                return 0
+            print(f"активного хода {trace[:8]} нет — освобождать нечего", file=sys.stderr)
+            return 1
+        if action == "drain":
+            owner = int(args.owner_id)
+            async with session() as s:
+                ids = list(
+                    (
+                        await s.execute(
+                            text(
+                                "SELECT id FROM governance.turn_queue WHERE owner_id = :o"
+                                " AND status = 'claimed'"
+                                " AND claimed_at < now() - make_interval(secs => 60)"
+                                " ORDER BY id"
+                            ).bindparams(o=owner)
+                        )
+                    ).scalars()
+                )
+                if not ids:
+                    await s.commit()
+                    print(
+                        f"владелец {owner}: осиротевших элементов нет — очередь"
+                        " разберёт бот на следующем ходе"
+                    )
+                    return 0
+                if not args.execute:
+                    await s.commit()
+                    print(
+                        f"владелец {owner}: {len(ids)} осиротевших claim'ов (id "
+                        + ", ".join(str(x) for x in ids[:10])
+                        + "); apply без --execute — тот же план"
+                    )
+                    return 0
+                moved: Any = await s.execute(
+                    text(
+                        "UPDATE governance.turn_queue SET status = 'queued', claimed_at = NULL"
+                        " WHERE id = ANY(CAST(:ids AS bigint[])) AND status = 'claimed'"
+                    ).bindparams(ids=ids)
+                )
+                await s.commit()
+                print(f"владелец {owner}: возвращено в очередь {moved.rowcount} — бот подхватит")
+                return 0
+        return 2
+
+    return await _db_guard(go)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -2041,6 +2177,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_backfill(args.backfill_action, args))
         if args.command == "slo":
             return asyncio.run(_cmd_slo(args.slo_action, args))
+        if args.command == "turns":
+            return asyncio.run(_cmd_turns(args.turns_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130
