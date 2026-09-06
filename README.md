@@ -78,6 +78,23 @@ src/aegis/
 Дорожная карта и статус: [docs/EXECUTION_LOG.md](docs/EXECUTION_LOG.md). Ключевые решения:
 [docs/ADR/](docs/ADR). Полный план: [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md).
 
+## Операционный контур (шаг 2.5+)
+
+Восемь команд для тех, что решаются данными, а не рестартом — все работают и с живой БД, и
+честно говорят «база не отвечает» (код возврата 1), и все покрыты интеграционным прогоном
+(`tests/integration/test_cli_ops.py`):
+
+```bash
+aegis principals list|kind|grant|revoke|kill|budget   # права, бюджеты, kill-switch по принципалам
+aegis flags list|set KEY --percent N|stale            # перцентили, allow/deny, контроль протухших
+aegis policy lint|shadow [--limit]|golden            # правила как код: lock-сверка и теневой прогон
+aegis retention plan|hold|forget|shreds|keyring       # dry-run→plan→apply; legal-hold; crypto-shredding
+aegis events dlq|replay FROM_SEQ [--type T]           # разбор dead-letter и переигровка окна
+aegis migrate status                                  # head vs БД, висячие бэкфиллы, dangling NOT NULL
+aegis backfill status|run --rounds N|pause NAME       # бэкфиллы с лизингом, прогрессом и паузой
+aegis slo status|alerts --write F|tick [--dry-run]    # burn-rate: состояние, артефакт алертов, тик
+```
+
 ## Качество
 
 `make check` = ruff + mypy --strict + import-linter + юниты + golden-evals (то же, что требует CI).

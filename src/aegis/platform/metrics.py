@@ -247,7 +247,7 @@ def render_otlp_json(samples: list[MetricSample], *, service: str = "aegis") -> 
     """
     metrics: list[dict[str, Any]] = []
     for sample in samples:
-        base = {"name": sample.name}
+        base: dict[str, Any] = {"name": sample.name}
         if sample.kind == "counter":
             base["sum"] = {
                 "dataPoints": [

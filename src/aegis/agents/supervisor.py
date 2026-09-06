@@ -20,7 +20,8 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import Token
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -1131,7 +1132,11 @@ class Supervisor:
         return outcome.decision, outcome.reason, outcome.rule
 
     async def _run_once(
-        self, ctx: ToolContext, spec: Any, args: dict[str, Any], fn: Any
+        self,
+        ctx: ToolContext,
+        spec: Any,
+        args: dict[str, Any],
+        fn: Callable[[], Awaitable[ToolResult]],
     ) -> ToolResult:
         """Идемпотентность побочного эффекта (F8): activity_id = trace+шаг+инструмент.
 
@@ -1476,7 +1481,7 @@ class Supervisor:
 # --------------------------------------------------------------- helpers
 
 
-def _scope_for(msg: Inbound, snapshot: PrincipalSnapshot) -> object:
+def _scope_for(msg: Inbound, snapshot: PrincipalSnapshot) -> Token[PrincipalScope]:
     """Пересвязка contextvar на реальный kind принципала. Возвращает токен для finally.
 
     Функция, а не метод: состояние хода живёт в asyncio-контексте задачи, а не на Supervisor

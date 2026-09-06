@@ -80,6 +80,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106", "B008"]
+# SQL миграций живёт одной физической строкой намеренно: harness tools/with_local_pg.py вырезает
+# целые строки (pg_trgm/pgcrypto), перенос разорвал бы выражение, а ruff format строку в строковом
+# литерале не переносит — E501 здесь следствие формата SQL, а не неряшливости
+"migrations/versions/*" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -89,8 +93,14 @@ warn_unreachable = true
 files = ["src", "migrations"]
 
 [[tool.mypy.overrides]]
-module = ["trafilatura.*", "nats.*", "temporalio.*"]
+module = ["trafilatura.*", "nats.*", "temporalio.*", "yaml", "jsonschema"]
 ignore_missing_imports = true
+
+# Temporal-декораторы приходят Any при отсутствующем пакете (durable extra) — функция от этого
+# не «untyped», это свойство опциональной зависимости, а не кода
+[[tool.mypy.overrides]]
+module = ["aegis.workflows.temporal_runtime"]
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

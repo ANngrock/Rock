@@ -226,6 +226,7 @@ def build_app(
     from aegis.platform.flags import EnvFlagSource, FlagEngine, SqlFlagSource  # noqa: PLC0415
     from aegis.platform.metrics import MetricsRegistry, SqlMetricsStore  # noqa: PLC0415
     from aegis.workflows.ledger import NullLedger, SqlLedger  # noqa: PLC0415
+
     metrics = MetricsRegistry()
     metrics_store = SqlMetricsStore() if db_ready else None
     flag_source = (

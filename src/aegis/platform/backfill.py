@@ -305,7 +305,7 @@ class SqlBackfillStore:
             batch_size=int(row["batch_size"]),
             rows_done=int(row["rows_done"] or 0),
             rounds=0,
-            cursor=dict(cursor_raw or {}),  # type: ignore[arg-type]
+            cursor=dict(cursor_raw or {}),
         )
 
     async def finish_batch(

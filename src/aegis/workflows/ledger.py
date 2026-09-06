@@ -54,64 +54,10 @@ class Ledger(Protocol):
 
         Гонка «два процесса одновременно» решается ON CONFLICT: победитель вставки исполняет,
         проигравший читает состояние и либо получает готовый результат (done), либо видит чужой
-        running (пропускаем — дедупликация важнее скорости).
+        running (пропускаем — дедупликация важнее скорости). Реализация — в SqlLedger:
+        туловище внутри Protocol означает два источника правды при первой же правке.
         """
-        sql = """
-        INSERT INTO platform.activity_ledger (activity_id, trace_id, state, fencing_token, owner)
-        VALUES (:id, CAST(:trace AS uuid), 'running', :fence, :owner)
-        ON CONFLICT (activity_id) DO NOTHING
-        RETURNING activity_id
-        """
-        async with self._session() as s:
-            taken = await s.scalar(
-                text(sql).bindparams(
-                    id=activity_id[:240],
-                    trace=trace_id if _is_uuid(trace_id) else None,
-                    fence=int(fencing_token),
-                    owner=self._owner(),
-                )
-            )
-            await s.commit()
-            if taken is not None:
-                return None
-            row = (
-                (
-                    await s.execute(
-                        text(
-                            "SELECT state, fencing_token, result FROM platform.activity_ledger"
-                            " WHERE activity_id = :id"
-                        ).bindparams(id=activity_id[:240])
-                    )
-                )
-                .mappings()
-                .first()
-            )
-            if row is None:  # гонка «до меня успели и отпустили»
-                return None
-            state = str(row["state"])
-            result = row["result"] if isinstance(row["result"], dict) else None
-            if state == "failed":
-                # «падал» ≠ «чужой навсегда»: забираем терминальную строку себе новым токеном.
-                # Условие по state в UPDATE — та же CAS, что у reminders: два реактиватора не
-                # разминутся
-                grabbed = await s.scalar(
-                    text(
-                        "UPDATE platform.activity_ledger SET state = 'running',"
-                        " fencing_token = :fence, owner = :owner, attempts = attempts + 1"
-                        " WHERE activity_id = :id AND state = 'failed' RETURNING activity_id"
-                    ).bindparams(
-                        id=activity_id[:240], fence=int(fencing_token), owner=self._owner()
-                    )
-                )
-                await s.commit()
-                if grabbed is not None:
-                    return None
-            return ActivityState(
-                activity_id=activity_id,
-                state=state,
-                fencing_token=int(row["fencing_token"] or 0),
-                result=dict(result or {}),
-            )
+        ...
 
     async def complete(
         self, activity_id: str, result: dict[str, Any], *, fencing_token: int = 0

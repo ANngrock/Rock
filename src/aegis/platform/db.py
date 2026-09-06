@@ -78,10 +78,11 @@ def _attach_rls_hook(engine: AsyncEngine) -> None:
         return
     _rls_hooked = True
     del engine
+    from sqlalchemy.engine import Connection
     from sqlalchemy.orm import Session as SyncSession  # noqa: PLC0415
 
     @event.listens_for(SyncSession, "after_begin")
-    def _set_rls_gucs(session: object, transaction: object, connection: object) -> None:
+    def _set_rls_gucs(session: object, transaction: object, connection: Connection) -> None:
         from aegis.platform.rls import effective_scope, guc_statements  # noqa: PLC0415
 
         del session, transaction

@@ -20,7 +20,7 @@ import html as html_lib
 import re
 import sys
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from aiogram import Bot, Dispatcher, F, Router
@@ -418,10 +418,11 @@ async def on_appeal(callback: CallbackQuery, app: App, bot: Bot) -> None:
         "Отправлено владельцу" if delivered else "Апелляция устарела — спросите заново"
     )
     if delivered and callback.message is not None:
-        # кнопка гасится независимо от типа сообщения: «сообщение может быть не Message»
-        # здесь невозможно (это callback), а «не погасил» означало бы вторую подачу той же апелляции
+        # «сообщение может быть InaccessibleMessage» — тип aiogram, а не жизнь: для callback это
+        # всегда Message. Не погасить кнопку = вторая подача той же апелляции, поэтому гасим
+        # безусловно (cast — дань декоратору типов, не поведению).
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await cast(Message, callback.message).edit_reply_markup(reply_markup=None)
         except TelegramAPIError:
             pass
 
@@ -541,13 +542,19 @@ async def _deliver_appeal(app: App, bot: Bot, chat_id: int, appeal_id: str) -> b
     return True
 
 
-async def _drain_queue(app: App, bot: Bot, chat_id: int, owner_id: int) -> None:
+async def _drain_queue(app: App, bot: Bot | None, chat_id: int, owner_id: int) -> None:
     """Разбор очереди «один ход на владельца» (F1): сообщившие во время хода не потеряны.
+
+    ``bot is None`` = боту нечем отвечать (деградация на остановке) — очередь переживёт это
+    в БД, drained здесь не «съедает» сообщения.
 
     Не рекурсия в run(), а цикл: лимит известен заранее, и «хвост из пяти сообщений» обязан
     обработать ровно пять, а не «сколько успеет до падения». Каждое следующее — через тот же
     supervisor.handle, то есть со всеми правами, флагами и журналом обычного хода.
     """
+
+    if bot is None:
+        return
     limit = int(getattr(app.cfg, "turn_drain_limit", 3) or 0)
     for _ in range(limit):
         try:
@@ -756,7 +763,7 @@ async def main() -> None:
         # Старт не блокируем: без схемы бот полезен, но оператор должен узнать сразу, а не по
         # «Сбой: ...» в каждом ответе (connect-ok != schema-ok).
         await app.probe_schema()
-    flush_task: asyncio.Task | None = None
+    flush_task: asyncio.Task[None] | None = None
     if app.db_ready and int(getattr(app.cfg, "metrics_flush_seconds", 0) or 0) > 0:
         # метрики живут в процессе; в БД попадает снапшот — «окно SLO» читается из metric_samples.
         # Задача фоновая и молчаливая: наблюдаемость не имеет права уронить ответы (принцип 5)

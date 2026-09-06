@@ -32,10 +32,13 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import orjson
 import structlog
+
+if TYPE_CHECKING:
+    from aegis.platform.crypto import BlobCipher
 from sqlalchemy import text
 
 from aegis.governance.turns import NullTurnLedger, SqlTurnLedger, TurnHandle, TurnLedger
@@ -413,6 +416,16 @@ class NullDecisionRecorder:
 
     async def record_input(self, record: Mapping[str, Any]) -> Any:
         return None
+
+    async def system_event(
+        self,
+        *,
+        owner_id: int,
+        note: str,
+        params: Mapping[str, Any] | None = None,
+        kind: RecordKind = "system",
+    ) -> None:
+        del owner_id, note, params, kind  # без БД журнала нет — честный no-op, не «мнимая запись»
 
     async def stats(self) -> dict[str, Any]:
         return {"enabled": False, "records": 0, "blobs": 0, "blob_bytes": 0, "anchors": 0}
@@ -1109,7 +1122,7 @@ class BlobStore:
         session_factory: SessionFactory | None = None,
         *,
         max_bytes: int = 1_048_576,
-        cipher: Any = None,
+        cipher: BlobCipher | None = None,
     ) -> None:
         self._sm = session_factory
         self.max_bytes = max(1024, int(max_bytes))

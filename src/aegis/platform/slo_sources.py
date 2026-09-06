@@ -194,7 +194,8 @@ async def collect_observations(
         async def _safe(minutes: int, *, src: Any = source, sp: Any = spec) -> WindowStats:
             try:
                 if src is not None:
-                    return await src(smo, minutes)
+                    stats: WindowStats = await src(smo, minutes)
+                    return stats
                 return await _from_metrics(metrics_store, sp, minutes)
             except Exception:  # noqa: BLE001 — см. докстринг: источник обязан молчать, а не кричать
                 return WindowStats()

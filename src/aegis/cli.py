@@ -1395,7 +1395,7 @@ async def _cmd_flags(action: str, args: argparse.Namespace) -> int:
             return 0
         if action == "stale":
             async with session() as s:
-                rows = (
+                stale_rows = (
                     await s.execute(
                         text(
                             "SELECT key, percent, (now() - created_at)::bigint AS age_s"
@@ -1406,7 +1406,7 @@ async def _cmd_flags(action: str, args: argparse.Namespace) -> int:
                         ).bindparams(days=int(getattr(args, "days", None) or cfg.flag_stale_days))
                     )
                 ).mappings()
-                stale = [dict(r) for r in rows]
+                stale: list[dict[str, Any]] = [dict(r) for r in stale_rows]
             if not stale:
                 print("протухших флагов нет")
                 return 0
@@ -1632,15 +1632,15 @@ async def _cmd_retention(action: str, args: argparse.Namespace) -> int:
                 print(f"hold выставлен: {scope}={value} — ротация эти строки не тронет")
             return 0
         if action == "forget":
-            plan = await plan_forget(int(args.owner_id))
-            print(plan.summary())
+            fplan = await plan_forget(int(args.owner_id))
+            print(fplan.summary())
             if not args.execute:
                 print("это план; --execute шредит DEK и пишет манифесты")
                 return 0
             from aegis.governance.recorder import SqlDecisionRecorder
 
             recorder = SqlDecisionRecorder(cfg)
-            result = await apply_forget(plan, recorder=recorder, dry_run=False)
+            result = await apply_forget(fplan, recorder=recorder, dry_run=False)
             print(result.summary() if hasattr(result, "summary") else result)
             return 0
         if action == "rewrap":
@@ -1798,7 +1798,7 @@ async def _cmd_migrate(action: str, args: argparse.Namespace) -> int:
                     await s.rollback()
                 dangling: list[dict[str, Any]] = []
                 try:
-                    rows = (
+                    dangling_rows = (
                         await s.execute(
                             text(
                                 "SELECT table_schema||'.'||table_name||'.'||column_name AS col"
@@ -1810,7 +1810,7 @@ async def _cmd_migrate(action: str, args: argparse.Namespace) -> int:
                             )
                         )
                     ).scalars()
-                    dangling = [{"col": c} for c in rows]
+                    dangling = [{"col": c} for c in dangling_rows]
                 except Exception:
                     await s.rollback()
         except Exception as exc:  # noqa: BLE001 - единый ответ «база не отвечает»
@@ -1859,25 +1859,25 @@ async def _cmd_backfill(action: str, args: argparse.Namespace) -> int:
             if not jobs:
                 print("заданий нет: их регистрирует мигратор при expand-релизе")
                 return 0
-            for job in jobs:
-                spec = BACKFILL_SPECS.get(job.name)
+            for bj in jobs:
+                spec = BACKFILL_SPECS.get(bj.name)
                 remaining = None
                 if spec is not None:
                     remaining = await store.count_remaining(spec)
                 print(
-                    f"  {job.name:<18} {job.status:<8} строк {job.rows_done:>8}"
+                    f"  {bj.name:<18} {bj.status:<8} строк {bj.rows_done:>8}"
                     + (f", осталось {remaining}" if remaining is not None else "")
-                    + f" — {getattr(job, 'target', '')}"
+                    + f" — {getattr(bj, 'target', '')}"
                 )
             return 0
         if action == "pause":
             store = SqlBackfillStore()
             jobs = await store.status()
-            job = next((j for j in jobs if j.name == args.name), None)
-            if job is None:
+            wanted = next((j for j in jobs if j.name == args.name), None)
+            if wanted is None:
                 print(f"! задания {args.name} нет в работе", file=sys.stderr)
                 return 2
-            await store.pause(job)
+            await store.pause(wanted)
             print(f"{args.name}: пауза — следующий claim его не возьмёт, прогресс сохранён")
             return 0
         if action == "run":

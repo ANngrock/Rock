@@ -204,7 +204,7 @@ def parse_roster(spec: str) -> dict[int, PrincipalKind]:
         if not head or tail not in ("owner", "member", "guest", "service"):
             continue
         try:
-            out[int(head)] = tail  # type: ignore[assignment]
+            out[int(head)] = tail
         except ValueError:
             continue
     return out
@@ -559,7 +559,7 @@ class PrincipalSnapshot:
 
 
 async def snapshot_for(
-    governance: PrincipalGovernance | None, principal: Principal, *, fallback_limit: float
+    governance: PrincipalGovernance | None, principal: Principal, *, fallback_limit: float | None
 ) -> PrincipalSnapshot:
     if governance is None:
         return PrincipalSnapshot(principal=principal, budget_limit=fallback_limit)

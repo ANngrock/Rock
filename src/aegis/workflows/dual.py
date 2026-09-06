@@ -11,13 +11,23 @@ merger'а.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegis.workflows.plan import CODE_VERSION, plan_from_journal
+from aegis.workflows.plan import CODE_VERSION, PlannedStep, plan_from_journal, row_to_step
 
 __all__ = ["TraceComparison", "compare_trace", "summarize"]
+
+
+def _keys(steps: Iterable[PlannedStep | None]) -> list[str]:
+    """Канон «ключ шага» для обеих сторон сравнения; None-ряды (не шаги) отбрасываются."""
+    out: list[str] = []
+    for s in steps:
+        if s is None:
+            continue
+        out.append(f"{s.seq}:{s.kind}" + (f":{s.tool}" if s.tool else ""))
+    return out
 
 
 @dataclass(slots=True)
@@ -52,8 +62,10 @@ def compare_trace(trace_id: str, journal_rows: Sequence[Mapping[str, Any]]) -> T
     «детерминатор разучился видеть то, что делает код», и именно это ищит dual-run.
     """
     plan_steps = plan_from_journal(journal_rows)
-    journal_keys = [f"{r.get('turn_no')}:{r.get('kind')}" for r in journal_rows]
-    plan_keys = [f"{s.seq}:{s.kind}" for s in plan_steps]
+    # «исполнено» читается из журнала теми же правилами, что «запланировано» — иначе стороны
+    # сравнивались бы в разных словари (tool_run vs tool) и шумели бы ложно
+    journal_keys = _keys(row_to_step(r) for r in journal_rows)
+    plan_keys = _keys(plan_steps)
     comparison = TraceComparison(trace_id=trace_id)
     for key in journal_keys:
         if key not in plan_keys:

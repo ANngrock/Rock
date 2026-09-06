@@ -262,7 +262,7 @@ class EventStore:
         params: dict[str, Any] = {"from_seq": int(from_seq), "event_type": event_type}
         if to_seq is not None:
             params["to_seq"] = int(to_seq)
-        result = await self._s.execute(text(sql), params)
+        result: Any = await self._s.execute(text(sql), params)
         return int(result.rowcount or 0)
 
     async def dlq_rows(self, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -306,7 +306,7 @@ class EventStore:
         return {"pending": int(r[0]), "stuck": int(r[1]), "abandoned": int(r[2] or 0)}
 
 
-async def dlq_stats(session_factory: SessionFactory | None = None) -> dict[str, int]:
+async def dlq_stats(session_factory: SessionFactory | None = None) -> dict[str, Any]:
     """Счётчики DLQ для doctor'а: всего, новых (не переигранных), самая свежая причина."""
     sm = session_factory or session
     async with sm() as s:

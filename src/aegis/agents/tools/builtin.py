@@ -163,9 +163,7 @@ async def search_notes(args: SearchNotesArgs, ctx: ToolContext) -> str:
         ctx.extras["embed_warning"] = repr(exc)[:200]
     # F6: право на гибрид спрашиваем у флага хода — включается перцентилями по actor'у
     # и гасится одним UPDATE в БД, без рестарта. Флаг выключен = ровно старый путь.
-    hybrid_on = bool(
-        ((ctx.extras.get("flags") or {}).get("notes.hybrid_search") or {}).get("on")
-    )
+    hybrid_on = bool(((ctx.extras.get("flags") or {}).get("notes.hybrid_search") or {}).get("on"))
     hits: Any = None
     if hybrid_on:
         hybrid = getattr(ctx.services.notes, "search_hybrid", None)

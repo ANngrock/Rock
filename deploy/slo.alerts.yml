@@ -1,0 +1,82 @@
+# СГЕНЕРИРОВАНО из deploy/slo.yml — не править руками: `aegis slo alerts`
+version: 1
+groups:
+  - name: aegis-slos
+    rules:
+      - alert: turn_latency_p95_page
+        expr: aegis:slo_bad_ratio{slo="turn-latency-p95"} > 0.72
+        for: 60m
+        labels:
+          severity: page
+          slo: turn-latency-p95
+        annotations:
+          summary: "p95 хода (запрос → готовый ответ) не дольше 8 секунд"
+          description: >-
+            burn-rate 14.4× бюджета за 60m
+            (окно 60m), objective 0.950
+      - alert: turn_latency_p95_ticket
+        expr: aegis:slo_bad_ratio{slo="turn-latency-p95"} > 0.3
+        for: 60m
+        labels:
+          severity: ticket
+          slo: turn-latency-p95
+        annotations:
+          summary: "p95 хода (запрос → готовый ответ) не дольше 8 секунд"
+          description: >-
+            burn-rate 6× бюджета за 360m
+            (окно 60m), objective 0.950
+      - alert: stream_abort_rate_page
+        expr: aegis:slo_bad_ratio{slo="stream-abort-rate"} > 0.288
+        for: 60m
+        labels:
+          severity: page
+          slo: stream-abort-rate
+        annotations:
+          summary: "обрванный стрим (edit 4xx/timeout) — не чаще 2% ответов с живым ответом"
+          description: >-
+            burn-rate 14.4× бюджета за 60m
+            (окно 60m), objective 0.980
+      - alert: stream_abort_rate_ticket
+        expr: aegis:slo_bad_ratio{slo="stream-abort-rate"} > 0.12
+        for: 60m
+        labels:
+          severity: ticket
+          slo: stream-abort-rate
+        annotations:
+          summary: "обрванный стрим (edit 4xx/timeout) — не чаще 2% ответов с живым ответом"
+          description: >-
+            burn-rate 6× бюджета за 360m
+            (окно 60m), objective 0.980
+      - alert: outbox_lag_p95_ticket
+        expr: aegis:slo_bad_ratio{slo="outbox-lag-p95"} > 0.3
+        for: 60m
+        labels:
+          severity: ticket
+          slo: outbox-lag-p95
+        annotations:
+          summary: "95% событий публикуются из outbox за 60 секунд"
+          description: >-
+            burn-rate 6× бюджета за 360m
+            (окно 60m), objective 0.950
+      - alert: unverified_answer_share_ticket
+        expr: aegis:slo_bad_ratio{slo="unverified-answer-share"} > 0.6
+        for: 60m
+        labels:
+          severity: ticket
+          slo: unverified-answer-share
+        annotations:
+          summary: "доля ответов, не сверенных с источниками без явной причины, ≤ 10%"
+          description: >-
+            burn-rate 6× бюджета за 360m
+            (окно 60m), objective 0.900
+      - alert: tool_failure_rate_ticket
+        expr: aegis:slo_bad_ratio{slo="tool-failure-rate"} > 0.06
+        for: 60m
+        labels:
+          severity: ticket
+          slo: tool-failure-rate
+        annotations:
+          summary: "инструменты падают не чаще 1% вызовов"
+          description: >-
+            burn-rate 6× бюджета за 360m
+            (окно 60m), objective 0.990

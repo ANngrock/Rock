@@ -226,12 +226,12 @@ class NotesRepo:
         sm = self._sm or session
         try:
             async with sm() as s:
-                text_rows = (
+                text_rows: Any = (
                     await s.execute(_TEXT_SEARCH_V.bindparams(query=query, limit=pool))
                     if query.strip()
                     else []
                 )
-                vec_rows = (
+                vec_rows: Any = (
                     await s.execute(
                         _VECTOR_SEARCH_V.bindparams(embedding=str(embedding), limit=pool)
                     )

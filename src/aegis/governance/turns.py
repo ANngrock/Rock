@@ -118,10 +118,19 @@ UPDATE governance.turn_claims
 RETURNING step
 """
 
+#: :func:`_reactivate_params` — из params begin'а для UPDATE-переактивации: только те ключи,
+#: которые есть в SQL (owner_id там не нужен и не определён)
+
+
+def _reactivate_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in params.items() if k != "owner_id"}
+
+
 _FINISH_CLAIM = """
 UPDATE governance.turn_claims
    SET status = 'finished', finished_at = now(), updated_at = now()
  WHERE trace_id = CAST(:trace AS uuid) AND status = 'active' AND fencing_token = :fence
+RETURNING fencing_token
 """
 
 _ENQUEUE = """
@@ -129,21 +138,38 @@ INSERT INTO governance.turn_queue (owner_id, trace_id, kind, payload)
 VALUES (:owner_id, CAST(:trace AS uuid), :kind, CAST(:payload AS jsonb))
 """
 
+#: claimed = «drain забрал, ещё не довёл до финала»: статус нужен, чтобы два потребителя
+#: не обработали одно сообщение дважды; осиротевшие claimed (крах процесса между pop и close)
+#: возвращаются в игру теми же pop'ами, пока attempts не исчерпан
 _POP_NEXT = """
 WITH picked AS (
     SELECT id
       FROM governance.turn_queue
-     WHERE owner_id = :owner_id AND status = 'queued'
+     WHERE owner_id = :owner_id
+       AND (
+           status = 'queued'
+           OR (
+               status = 'claimed'
+               AND attempts < :max_attempts
+               AND claimed_at < now() - make_interval(secs => :stale_secs)
+           )
+       )
      ORDER BY id
      FOR UPDATE SKIP LOCKED
      LIMIT 1
 )
 UPDATE governance.turn_queue AS q
-   SET status = 'running', claimed_at = now(), attempts = q.attempts + 1
+   SET status = 'claimed', claimed_at = now(), attempts = q.attempts + 1
   FROM picked
  WHERE q.id = picked.id
 RETURNING q.id, q.trace_id::text AS trace_id, q.kind, q.payload, q.attempts
 """
+
+#: «пока не закроют» = максимум 3 попытки на сообщение; осиротевший claim — это тот, чей
+#: владелец умер между pop и close: его возвращают в игру не раньше, чем через stale-окно,
+#: иначе два живых потребителя видят одно сообщение дважды
+_QUEUE_MAX_ATTEMPTS = 3
+_QUEUE_CLAIM_STALE_SECS = 60
 
 _CLOSE_ITEM = """
 UPDATE governance.turn_queue SET status = 'done' WHERE id = :id
@@ -396,7 +422,11 @@ class SqlTurnLedger:
                     .first()
                 )
                 if existing is not None and existing["status"] != "active":
-                    token = await s.scalar(text(_REACTIVATE_CLAIM).bindparams(**params))
+                    # owner у переактивации не переставляется, и в UPDATE его параметра нет:
+                    # «bindparams всем словарём» здесь — источник ArgumentError вместо хода
+                    token = await s.scalar(
+                        text(_REACTIVATE_CLAIM).bindparams(**_reactivate_params(params))
+                    )
                 elif existing is not None:
                     token = await s.scalar(
                         text(_LEASE_TOUCH).bindparams(
@@ -406,7 +436,9 @@ class SqlTurnLedger:
                         )
                     )
                     if token is None:  # «активная» строка успела закрыться — восстанавливаем
-                        token = await s.scalar(text(_REACTIVATE_CLAIM).bindparams(**params))
+                        token = await s.scalar(
+                            text(_REACTIVATE_CLAIM).bindparams(**_reactivate_params(params))
+                        )
                 else:
                     token = await s.scalar(text(_INSERT_CLAIM).bindparams(**params))
                 await s.commit()
@@ -485,7 +517,15 @@ class SqlTurnLedger:
     async def pop_next(self, owner_id: int) -> TurnQueueItem | None:
         async with self._session() as s:
             row = (
-                (await s.execute(text(_POP_NEXT).bindparams(owner_id=int(owner_id))))
+                (
+                    await s.execute(
+                        text(_POP_NEXT).bindparams(
+                            owner_id=int(owner_id),
+                            max_attempts=_QUEUE_MAX_ATTEMPTS,
+                            stale_secs=_QUEUE_CLAIM_STALE_SECS,
+                        )
+                    )
+                )
                 .mappings()
                 .first()
             )
