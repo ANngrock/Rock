@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Self, cast
 
@@ -65,6 +65,44 @@ class App:
     db_ready: bool
     #: свой ли KV-клиент: чужой (инжектированный тестом) не закрываем
     owns_kv: bool = True
+    #: fallback-дедуп апдейтов без БД (см. seen_update); dict как ordered set
+    _dedup_mem: dict[int, None] = field(default_factory=dict)
+
+    async def seen_update(self, update_id: int, chat_id: int, *, kind: str = "message") -> bool:
+        """Впервые ли этот апдейт (F1 «update_id дедуплицируется в Postgres»).
+
+        True — обработать, False — дубль (молча проглотить). Два процесса на одной базе
+        конкурируют на INSERT...ON CONFLICT: победитель ровно один. Без БД — in-memory-множество
+        в этом процессе: «помним только про себя» должно быть свойством режима, а не тайным
+        обещанием, поэтому durable-ответ здесь возвращает None и мидлвари это видно.
+        """
+        if self.db_ready:
+            from sqlalchemy import text
+
+            from aegis.platform.db import session
+
+            sql = (
+                "INSERT INTO platform.telegram_updates (update_id, chat_id, kind)"
+                " VALUES (:uid, :chat, :kind) ON CONFLICT (update_id) DO NOTHING"
+                " RETURNING update_id"
+            )
+            try:
+                async with session() as s:
+                    fresh = await s.scalar(
+                        text(sql).bindparams(uid=int(update_id), chat=int(chat_id), kind=kind)
+                    )
+                    await s.commit()
+                return fresh is not None
+            except Exception as exc:  # noqa: BLE001 — сбой дедупа не право ронять ответ
+                log.warning("updates.dedup_db_failed", err=repr(exc)[:200])
+        # память процесса: LRU-порядок dict'а + жёсткий потолок — «когда-то видели» переживает
+        # часы, но не вечность, и 10k апдейтов не раздувают RSS
+        if update_id in self._dedup_mem:
+            return False
+        self._dedup_mem[update_id] = None
+        if len(self._dedup_mem) > 10_000:
+            self._dedup_mem.pop(next(iter(self._dedup_mem)))
+        return True
 
     async def probe_schema(self) -> bool:
         """Есть ли таблицы платформы. Connect-ok не равен schema-ok: без этого шага бот

@@ -69,10 +69,17 @@ _HELP = (
 
 
 class OwnerOnly:
-    """Пускаем ровно одного человека. Остальные — молча, без «я тебя не знаю»."""
+    """Пускаем владельца и roster. Остальные — молча, без «я тебя не знаю».
 
-    def __init__(self, owner_id: int) -> None:
+    `roster` (F2) — ids из ``AEGIS_PRINCIPAL_ROSTER``: гость/член семьи попадает в тот же
+    конвейер, но с чужим actor_id: «доступно» решает принципал, а не тот факт, что сообщение
+    дошло до хендлера. Молчание в отказе сохранено: бот не подтверждает существование себя
+    посторонним.
+    """
+
+    def __init__(self, owner_id: int, roster: frozenset[int] = frozenset()) -> None:
         self._owner_id = owner_id
+        self._roster = roster
 
     async def __call__(
         self,
@@ -81,11 +88,50 @@ class OwnerOnly:
         data: dict[str, Any],
     ) -> Any:
         user = data.get("event_from_user")
-        # сравниваем строки: любое «не похоже на владельца» = отказ, а не исключение в мидлвари
+        # сравниваем строки: любое «не похоже на пускаемого» = отказ, а не исключение в мидлвари
         user_id = getattr(user, "id", None)
-        if user_id is None or str(user_id) != str(self._owner_id):
-            log.warning("owner_only.rejected", user_id=getattr(user, "id", None))
+        if user_id is None:
+            log.warning("owner_only.rejected", user_id=None)
             return None
+        if str(user_id) != str(self._owner_id) and not self._in_roster(user_id):
+            log.warning("owner_only.rejected", user_id=user_id)
+            return None
+        return await handler(event, data)
+
+    def _in_roster(self, user_id: Any) -> bool:
+        # нечисловой id чужого мессенджера — повод отказать, не повод уронить мидлварь
+        if not self._roster:
+            return False
+        try:
+            return int(user_id) in self._roster
+        except (TypeError, ValueError):
+            return False
+
+
+class UpdateDedup:
+    """Дедуп update_id (F1): повторная доставка апдейта не запускает ход второй раз.
+
+    «Telegram доставляет at-least-once» — не гипотеза, а документированное свойство; с двумя
+    процессами на одной базе оно превращается в «платёж дважды». Мидлварь уровня update —
+    единственное место, где дубль виден ДО того, как он стал чьим-то side effect'ом. Отказ БД =
+    деградация на память процесса (см. ``App.seen_update``), а не отказ отвечать.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        update_id = getattr(event, "update_id", None)
+        if update_id is not None:
+            chat = getattr(getattr(event, "message", None), "chat", None)
+            if not await self._app.seen_update(int(update_id), int(getattr(chat, "id", 0) or 0)):
+                log.info("update.deduped", update_id=int(update_id))
+                return None
         return await handler(event, data)
 
 
@@ -106,9 +152,9 @@ async def send_reply(bot: Bot, chat_id: int, reply: Reply) -> Message | None:
     last: Message | None = None
     chunks = render_for_telegram(reply.text).chunks or [reply.text]
     for index, chunk in enumerate(chunks):
-        markup = None
-        if reply.needs_confirmation and index == len(chunks) - 1 and reply.pending_id:
-            markup = _confirm_keyboard(reply.pending_id, len(reply.pending))
+        # кнопка живёт на последнем куске длинного ответа: первая же правка разметки
+        # Telegram считает только на конкретном сообщении
+        markup = _reply_markup(reply) if index == len(chunks) - 1 else None
         try:
             last = await bot.send_message(
                 chat_id, chunk, reply_markup=markup, link_preview_options=None
@@ -287,7 +333,7 @@ async def on_image(message: Message, bot: Bot, app: App) -> None:
     await run(
         message,
         app,
-        Inbound(text=text, owner_id=message.from_user.id, attachments=attachments),
+        _inbound(app, message, text=text, attachments=attachments),
         bot,
     )
 
@@ -328,6 +374,20 @@ def _unknown_command(text: str) -> str | None:
     return None if name in KNOWN_COMMANDS else name
 
 
+def _inbound(
+    app: App, message: Message, *, text: str = "", attachments: list[Any] | None = None
+) -> Inbound:
+    """Ход исполняется для household'а (owner_id) и от имени спросившего (actor_id).
+
+    Пока бот одновладелецен, значения совпадают и поведение идентично историческому; с
+    появлением семьи расхождение уже в данных — journal, бюджет и RLS читают его, а не угадывают.
+    """
+    actor = int(message.from_user.id) if message.from_user else 0
+    cfg = getattr(app, "cfg", None)
+    house = int(getattr(cfg, "telegram_owner_id", None) or actor)
+    return Inbound(text=text, owner_id=house, actor_id=actor, attachments=list(attachments or []))
+
+
 @router.message(F.text)
 async def on_text(message: Message, app: App, bot: Bot) -> None:
     if message.from_user is None or not message.text:
@@ -342,7 +402,28 @@ async def on_text(message: Message, app: App, bot: Bot) -> None:
             )
         await message.answer(text)
         return
-    await run(message, app, Inbound(text=message.text, owner_id=message.from_user.id), bot)
+    await run(message, app, _inbound(app, message, text=message.text), bot)
+
+
+@router.callback_query(F.data.regexp(r"^ap:"))
+async def on_appeal(callback: CallbackQuery, app: App, bot: Bot) -> None:
+    """Кнопка «Обжаловать» у гостя: пересылаем владельцу и гасим кнопку (одна подача)."""
+    if callback.from_user is None or not callback.data:
+        return
+    appeal_id = callback.data.split(":", 1)[1]
+    delivered = await _deliver_appeal(
+        app, bot, callback.message.chat.id if callback.message else 0, appeal_id
+    )
+    await callback.answer(
+        "Отправлено владельцу" if delivered else "Апелляция устарела — спросите заново"
+    )
+    if delivered and callback.message is not None:
+        # кнопка гасится независимо от типа сообщения: «сообщение может быть не Message»
+        # здесь невозможно (это callback), а «не погасил» означало бы вторую подачу той же апелляции
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
 
 
 @router.callback_query(F.data.regexp(r"^(ok|no):"))
@@ -373,7 +454,15 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
     """
     bot = bot or message.bot
     status = await message.answer(PLACEHOLDER)
-    stream = make_stream(status, app.cfg)
+    # F6/F7: право стримить спрашиваем у флага и у деградации, а не только у env:
+    # «SLO горит → перестали рисовать хвосты» обязан работать без рестарта процесса
+    try:
+        stream_allowed = await app.supervisor.allow_streaming(
+            inbound.owner_id, inbound.actor_id or inbound.owner_id
+        )
+    except Exception:  # noqa: BLE001 - не готов спросить — значит старый предсказуемый путь
+        stream_allowed = bool(app.cfg.stream_replies)
+    stream = make_stream(status, app.cfg) if stream_allowed else None
     try:
         reply = await app.supervisor.handle(inbound, on_delta=stream.push if stream else None)
     except Exception as exc:  # noqa: BLE001 - владельцу показываем деградацию, а не traceback
@@ -389,12 +478,9 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         )
         await notify_failure(app, bot, exc)
     if stream is not None:
-        markup = (
-            _confirm_keyboard(reply.pending_id, len(reply.pending))
-            if reply.needs_confirmation and reply.pending_id is not None
-            else None
-        )
+        markup = _reply_markup(reply)
         if await stream.finish(reply.text, markup=markup):
+            await _drain_queue(app, bot, message.chat.id, inbound.owner_id)
             return
     try:
         await status.delete()
@@ -402,6 +488,84 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         pass
     if bot is not None:
         await send_reply(bot, message.chat.id, reply)
+    await _drain_queue(app, bot, message.chat.id, inbound.owner_id)
+
+
+def _reply_markup(reply: Reply) -> InlineKeyboardMarkup | None:
+    """Клавиатура ответа: подтверждение — первее апелляции, апелляция — есть только у гостя."""
+    if reply.needs_confirmation and reply.pending_id is not None:
+        return _confirm_keyboard(reply.pending_id, len(reply.pending))
+    if reply.appeal_id is not None:
+        return _appeal_keyboard(reply.appeal_id)
+    return None
+
+
+def _appeal_keyboard(appeal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗨 Обжаловать владельцу", callback_data=f"ap:{appeal_id}")]
+        ]
+    )
+
+
+async def _deliver_appeal(app: App, bot: Bot, chat_id: int, appeal_id: str) -> bool:
+    """Доставка апелляции владельцу: тот же pending-ключ, что у подтверждений, тот же резолв.
+
+    Возвращает «дошло ли»: False = снимок истёк — кнопку надо погасить, а не делать вид, что
+    владелец получил. Сообщение уходит В ЧАТ ВЛАДЕЛЬЦА, а не в чат гостя: резолвер обязан
+    решать там, где решение видно ему, а не публиковаться сторонним.
+    """
+    snapshot = await app.supervisor.appeal_snapshot(appeal_id)
+    if snapshot is None:
+        return False
+    owner = int(getattr(app.cfg, "telegram_owner_id", 0) or 0)
+    actions = list(snapshot.get("actions") or [])
+    lines = [
+        f"⚖️ Апелляция <code>{appeal_id}</code>: "
+        f"actor <code>{snapshot.get('actor_id')}</code> просит разрешить отказанное:"
+    ]
+    for action in actions[:6]:
+        reason = str(action.get("reason") or "")[:160]
+        rule = str(action.get("rule") or "")[:40]
+        lines.append(f"• <b>{action.get('tool')}</b> — {reason} <i>{rule}</i>")
+    lines.append("«Выполнить» — действие исполнится от вашего имени; молчание = отказ по TTL.")
+    try:
+        await bot.send_message(
+            owner or chat_id,
+            "\n".join(lines),
+            reply_markup=_confirm_keyboard(appeal_id, max(len(actions), 1)),
+        )
+    except TelegramAPIError as exc:  # noqa: BLE001 - не дошло уведомление ≠ не дошло решение
+        log.warning("appeal.notify_failed", err=repr(exc)[:200])
+        return False
+    return True
+
+
+async def _drain_queue(app: App, bot: Bot, chat_id: int, owner_id: int) -> None:
+    """Разбор очереди «один ход на владельца» (F1): сообщившие во время хода не потеряны.
+
+    Не рекурсия в run(), а цикл: лимит известен заранее, и «хвост из пяти сообщений» обязан
+    обработать ровно пять, а не «сколько успеет до падения». Каждое следующее — через тот же
+    supervisor.handle, то есть со всеми правами, флагами и журналом обычного хода.
+    """
+    limit = int(getattr(app.cfg, "turn_drain_limit", 3) or 0)
+    for _ in range(limit):
+        try:
+            nxt = await app.supervisor.drain_next(owner_id)
+        except Exception as exc:  # noqa: BLE001 - очередь не имеет права ронять бота
+            log.warning("queue.drain_failed", err=repr(exc)[:200])
+            return
+        if nxt is None:
+            return
+        try:
+            reply = await app.supervisor.handle(nxt)
+            await send_reply(bot, chat_id, reply)
+        except Exception as exc:  # noqa: BLE001 - сбой хода в очереди — в чат, как и обычного
+            log.exception("queue.turn_failed")
+            try:
+                await bot.send_message(chat_id, f"⚠️ Очередной ход не удался: {type(exc).__name__}")
+            except TelegramAPIError:
+                pass
 
 
 def _stream_label(cfg: Any) -> str:
@@ -540,7 +704,18 @@ def build_dispatcher(app: App) -> tuple[Bot, Dispatcher]:
     )
     dp = Dispatcher(app=app)
     if app.cfg.telegram_owner_id is not None:
-        dp.update.outer_middleware(OwnerOnly(app.cfg.telegram_owner_id))
+        roster_ids: set[int] = set()
+        raw_roster = str(getattr(app.cfg, "principal_roster", "") or "")
+        if raw_roster:
+            try:
+                from aegis.governance.principals import parse_roster  # noqa: PLC0415
+
+                roster_ids = set(parse_roster(raw_roster))
+            except Exception as exc:  # noqa: BLE001 - кривая строка = только владелец, как раньше
+                log.warning("roster.parse_failed", err=repr(exc)[:160])
+        dp.update.outer_middleware(OwnerOnly(app.cfg.telegram_owner_id, frozenset(roster_ids)))
+    # дедуп — после гейта: отсеянные чужие не должны уметь забивать таблицу «виденных» ids
+    dp.update.outer_middleware(UpdateDedup(app))
     dp.include_router(router)
     return bot, dp
 

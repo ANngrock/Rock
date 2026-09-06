@@ -1,0 +1,349 @@
+{
+  "envelope": {
+    "$id": "urn:aegis:envelope:1",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": true,
+    "properties": {
+      "causation_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "event_id": {
+        "description": "ключ дедупликации",
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        "type": "string"
+      },
+      "event_type": {
+        "pattern": "^[a-z][a-z0-9_.]{2,80}$",
+        "type": "string"
+      },
+      "occurred_at": {
+        "minLength": 10,
+        "type": "string"
+      },
+      "payload": {
+        "type": "object"
+      },
+      "schema_version": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "stream_id": {
+        "pattern": "^[A-Za-z0-9_:.@-]{1,160}$",
+        "type": "string"
+      },
+      "stream_type": {
+        "pattern": "^[A-Za-z0-9_:.@-]{1,160}$",
+        "type": "string"
+      },
+      "version": {
+        "description": "номер в потоке (порядок внутри потока)",
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "event_id",
+      "event_type",
+      "schema_version",
+      "occurred_at",
+      "stream_type",
+      "stream_id",
+      "version",
+      "payload"
+    ],
+    "type": "object"
+  },
+  "events": {
+    "action.confirmation_requested": {
+      "payload": {
+        "properties": {
+          "pending_id": {
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pending_id"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "action.confirmation_resolved": {
+      "payload": {
+        "properties": {
+          "approved": {
+            "type": "boolean"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "approved"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "action.confirmation_unavailable": {
+      "payload": {
+        "properties": {
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "answer.verified": {
+      "payload": {
+        "properties": {
+          "mode": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "problems": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "severity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "conversation.reset": {
+      "payload": {
+        "properties": {},
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "conversation.turn_answered": {
+      "payload": {
+        "properties": {
+          "text": {
+            "maxLength": 8000,
+            "type": "string"
+          },
+          "trace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "conversation.turn_received": {
+      "payload": {
+        "properties": {
+          "attachments": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_version": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "source_trust": {
+            "enum": [
+              "owner",
+              "untrusted",
+              "system"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4000,
+            "type": "string"
+          },
+          "thinking": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "intent.answered": {
+      "payload": {
+        "properties": {
+          "intent": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "note.added": {
+      "payload": {
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "integer",
+              "object"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "policy.decision": {
+      "payload": {
+        "properties": {
+          "decision": {
+            "enum": [
+              "allow",
+              "confirm",
+              "deny"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "quarantine.instructions": {
+      "payload": {
+        "properties": {
+          "found": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "tool.executed": {
+      "payload": {
+        "properties": {
+          "decision": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "result": {
+            "maxLength": 4000,
+            "type": "string"
+          },
+          "result_len": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "trust": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    },
+    "tool.failed": {
+      "payload": {
+        "properties": {
+          "err": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "type": "object"
+      },
+      "schema_version": 1
+    }
+  }
+}

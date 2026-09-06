@@ -147,6 +147,9 @@ class Reply:
     appealable: bool = False
     #: ход исполнялся через воркфлоу-раннер (F8): видно в журнале и в /status
     workflow: str = ""
+    #: id staged-апелляции (F5): бот вешает кнопку «обжаловать», владелец резолвит тем же
+    # ok/no-механизмом, что и обычные подтверждения
+    appeal_id: str | None = None
 
     @property
     def needs_confirmation(self) -> bool:
@@ -325,7 +328,13 @@ class Supervisor:
         # сверяются advance/finish (fencing: украденная аренда не двигает чужой счётчик)
         ctx.extras["fencing"] = handle.fencing_token if handle else None
         ctx.extras["flags"] = flags
+        # actor в extras обязателен обоим путям (handle и resume): журнал, апелляция и бюджеты
+        # читают его оттуда, и «resume знает, а handle нет» = молча потерянный автор хода
+        ctx.extras["actor_id"] = msg.actor
         ctx.extras["principal"] = snapshot.principal
+        # _decide читает СНИМОК (kill/budget живут на нём), а не только principal: без этой
+        # строки RBAC-вход policy был бы вечно пустым — «права проверяются» только на словах
+        ctx.extras["principal_snapshot"] = snapshot
         ctx.extras["budget_ratio"] = snapshot.ratio()
         await self._event(
             owner_id=msg.owner_id,
@@ -349,9 +358,18 @@ class Supervisor:
                 await self._record_turn(ctx, messages, fast, route=route)
                 return fast
             reply = await self._guarded_loop(messages, ctx, route=route, on_delta=on_delta)
-            # F5: любой отказ в этом ходу (не только pending) даёт право на апелляцию владельцу
-            if ctx.extras.get("appealable") and not reply.needs_confirmation:
+            # F5: отказ не-владельцу — право подать апелляцию; снимок отказанных действий
+            # стейджится в KV ровно как pending-подтверждение, чтобы резолвил его тот же
+            # механизм (кнопки ok/no владельца), а не второй, «почти такой же»
+            if (
+                ctx.extras.get("appealable")
+                and not reply.needs_confirmation
+                and ctx.extras.get("denied")
+            ):
                 reply.appealable = True
+                reply.appeal_id = await self._stage_appeal(
+                    messages, ctx, list(ctx.extras["denied"])
+                )
             await self._verify_reply(reply, ctx, question=msg.text)
             notes = _notes_of(ctx)
             _append_notices(reply, ctx)
@@ -757,12 +775,19 @@ class Supervisor:
                 if decision is Decision.DENY:
                     messages.append(_tool_message(call.id, f"DENIED: {reason}"))
                     await self._audit_tool(ctx, spec.name, args, "deny", reason, ok=True)
-                    # F5: отказ — не приговор без права голоса. Гость/член семьи может
-                    # обжаловать владельцу (inline-кнопка → on_confirm владельца уже построен)
-                    ctx.extras["appealable"] = bool(
-                        ctx.extras.get("actor_id") is not None
-                        and int(ctx.extras.get("actor_id") or 0) != int(ctx.owner_id)
-                    )
+                    # F5: отказ — не приговор без права голоса. Не-владелец может обжаловать
+                    # владельцу: отказ записывается в extras, кнопка появится на ответе
+                    if int(ctx.extras.get("actor_id") or ctx.owner_id) != int(ctx.owner_id):
+                        ctx.extras["appealable"] = True
+                        ctx.extras.setdefault("denied", []).append(
+                            {
+                                "tool": spec.name,
+                                "args": args,
+                                "call_id": call.id,
+                                "reason": reason,
+                                "rule": rule_tag,
+                            }
+                        )
                     continue
                 if decision is Decision.CONFIRM:
                     # placeholder обязателен: у каждого tool_call должен быть свой tool-ответ
@@ -799,6 +824,54 @@ class Supervisor:
             iterations=iterations,
             degraded=True,
         )
+
+    async def _stage_appeal(
+        self,
+        messages: list[dict[str, Any]],
+        ctx: ToolContext,
+        denied: list[dict[str, Any]],
+    ) -> str | None:
+        """Зарегистрировать апеллию: снимок отказанных действий живёт там же, где подтверждения.
+
+        Возвращает id для кнопки или None, если KV лежит — «обжаловать нельзя» честнее кнопки,
+        которая обещает и не может (тот же принцип, что у подтверждения без снимка).
+        """
+        appeal_id = uuid.uuid4().hex[:12]
+        payload = {
+            "pid": appeal_id,
+            "owner_id": ctx.owner_id,
+            "actor_id": ctx.extras.get("actor_id"),
+            "trace_id": ctx.trace_id,
+            "appeal": True,
+            "actions": denied,
+            "messages": orjson.loads(orjson.dumps(messages)),
+        }
+        stored = await self._kv_ok(
+            "appeal.set",
+            self.kv.set(
+                pending_key(appeal_id), orjson.dumps(payload), ex=self.cfg.pending_ttl_seconds
+            ),
+        )
+        if not stored:
+            return None
+        return appeal_id
+
+    async def appeal_snapshot(self, appeal_id: str) -> dict[str, Any] | None:
+        """Снимок апелляции для бота: «сколько действий под кнопкой» и жива ли ещё она.
+
+        Чтение через тот же KV и тот же ключ, что у подтверждений: с TTL-истечением кнопка
+        должна отвечать «истекло», а не тихо срабатывать на пустоте.
+        """
+        raw = await self._kv("appeal.get", self.kv.get(pending_key(appeal_id)), None)
+        if not raw:
+            return None
+        try:
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not data.get("appeal"):
+            return None
+        return data
 
     async def _request_confirmation(
         self,

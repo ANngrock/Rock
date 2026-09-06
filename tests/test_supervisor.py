@@ -388,6 +388,85 @@ async def test_iterations_are_capped() -> None:
 # ------------------------------------------------------------------ подтверждения
 
 
+async def test_guest_denial_stages_appeal_that_owner_can_resolve() -> None:
+    """Отказ гостю ≠ окончательный отказ: снимок живёт как pending, резолвит тот же resume."""
+    h = harness(
+        [
+            make_chat_result(None, [("c1", "finance_pay", {"value": "10"})]),
+            make_chat_result("нельзя"),  # продолжение цикла после DENY
+            make_chat_result("готово"),  # продолжение после резолва апелляции
+        ]
+    )
+    h.tool("finance_pay", writes=True, risk=Risk.HIGH)
+    reply = await h.handle("заплати", owner_id=1, actor_id=7)
+    assert not reply.needs_confirmation, "у гостя нет кнопки «подтвердить»"
+    assert reply.appealable and reply.appeal_id, "отказ должен быть обжалуем"
+    assert h.recorder.calls == []
+
+    snap = await h.supervisor.appeal_snapshot(reply.appeal_id or "")
+    assert snap is not None and snap["appeal"] is True
+    assert snap["owner_id"] == 1 and snap["actor_id"] == 7
+    assert snap["actions"][0]["tool"] == "finance_pay"
+    assert any(m.get("role") == "tool" for m in snap["messages"]), "история с DENIED сохраняется"
+
+    final = await h.resume(reply.appeal_id or "", True, owner_id=1)
+    assert [c[0] for c in h.recorder.calls] == ["finance_pay"], (
+        "разрешённое владельцем исполняется ровно раз"
+    )
+    assert "готово" in final.text
+    assert await h.supervisor.appeal_snapshot(reply.appeal_id or "") is None, (
+        "резолненная апелляция гаснет: второй ok не имеет права исполнять снова"
+    )
+
+
+async def test_appeal_snapshot_absent_or_foreign_resolves_to_nothing() -> None:
+    """Истёкшая или чужая апелляция: ни кнопки, ни исполнения — и неизвестный id не резолвится."""
+    h = harness(
+        [
+            make_chat_result(None, [("c1", "finance_pay", {"value": "10"})]),
+            make_chat_result("нельзя"),
+        ]
+    )
+    h.tool("finance_pay", writes=True, risk=Risk.HIGH)
+    reply = await h.handle("заплати", owner_id=1, actor_id=7)
+    aid = reply.appeal_id or ""
+    assert aid and await h.supervisor.appeal_snapshot("нет-такого") is None
+    # чужой резолвер (не владелец) — отказ, действие не исполняется
+    hijack = await h.resume(aid, True, owner_id=999)
+    assert "другому диалогу" in hijack.text, "чужой резолвер получает отказ, а не исполнение"
+    assert h.recorder.calls == [], "чужой ok не имеет права исполнять"
+
+
+async def test_owner_denial_never_stages_appeal_to_himself() -> None:
+    """Владельцу отказывают не «для протокола»: апелляция самому себе — шум, а не контроль."""
+    h = harness([make_chat_result(None, [("c1", "pay", {"value": "10"})])])
+    h.tool("pay", writes=True, risk=Risk.HIGH)
+    reply = await h.handle("заплати", owner_id=1)  # actor == owner
+    assert reply.needs_confirmation  # обычный путь: владелец подтверждает сам
+    assert reply.appeal_id is None
+
+
+async def test_appeal_staging_survives_kv_failure_by_disappearing() -> None:
+    """KV лежит — кнопки нет. Обещание «обжалуешь», которое нельзя исполнить, хуже её отсутствия."""
+
+    class BrokenKV(FakeKV):
+        async def set(self, key: str, value: bytes, ex: int | None = None) -> bool:
+            raise ConnectionError("redis down")
+
+    h = harness(
+        [
+            make_chat_result(None, [("c1", "finance_pay", {"value": "10"})]),
+            make_chat_result("нельзя"),
+        ]
+    )
+    h.tool("finance_pay", writes=True, risk=Risk.HIGH)
+    # меняем KV ДО handle: supervisor читает self.kv в момент стейджинга
+    h.supervisor.kv = BrokenKV()  # noqa: SLF001
+    reply = await h.handle("заплати", owner_id=1, actor_id=7)
+    assert reply.appeal_id is None, "битый KV не должен оставить висячую кнопку"
+    assert reply.appealable, "право обжаловать у гостя остаётся — просто канал доставки упал"
+
+
 async def test_high_risk_write_waits_for_owner() -> None:
     h = harness([make_chat_result(None, [("c1", "pay", {"value": "1000"})])])
     h.tool("pay", writes=True, risk=Risk.HIGH)

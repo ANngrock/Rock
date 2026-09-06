@@ -1,0 +1,49 @@
+{
+  "name": "aegis-default",
+  "rules": {
+    "budget-critical": {
+      "verdict": "deny",
+      "version": 1
+    },
+    "confirm-default": {
+      "verdict": "confirm",
+      "version": 1
+    },
+    "grant-missing": {
+      "verdict": "deny",
+      "version": 1
+    },
+    "high-risk": {
+      "verdict": "confirm",
+      "version": 1
+    },
+    "killswitch": {
+      "verdict": "deny",
+      "version": 1
+    },
+    "low-confidence": {
+      "verdict": "confirm",
+      "version": 1
+    },
+    "low-risk-auto": {
+      "verdict": "allow",
+      "version": 1
+    },
+    "medium-risk": {
+      "verdict": "confirm",
+      "version": 1
+    },
+    "readonly": {
+      "verdict": "allow",
+      "version": 1
+    },
+    "system-idempotent": {
+      "verdict": "allow",
+      "version": 1
+    },
+    "untrusted-write": {
+      "verdict": "confirm",
+      "version": 1
+    }
+  }
+}

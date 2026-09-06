@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -60,6 +61,7 @@ KNOWN_ACTIONS: frozenset[str] = frozenset(
         "web:read",
         "tool:pay",
         "journal:read",
+        "journal:anchor",
         "export:langfuse",
         "admin:policy",
         "admin:killswitch",
@@ -79,17 +81,38 @@ _MEMBER_GRANTS = frozenset(
         "reminders:read",
         "web:read",
         "journal:read",
+        "journal:anchor",
     }
 )
 
 _GUEST_GRANTS = frozenset({"notes:read"})
 
-#: домен инструмента из имени: ``notes.save`` → ``notes``. Имена в реестре уже образуют
-#  пару «домен.действие», и выводить из неё права надёжнее, чем заводить третий список
+#: домен инструмента из имени: ``notes.save`` → ``notes``. Реестр, однако, запрещает точки
+#: в именах (требование OpenAI), так что для существующих инструментов домен выводится
+#: первым сегментом по ``_``; явные имена с нестандартным написанием перечислены ниже.
+#: Парность «каждый writes-инструмент имеет грант» сторожит CI (tests/test_principals.py),
+#: иначе «новый платёжный инструмент без RBAC» — это дырка, а не опечатка в маппинге.
+_TOOL_EXPLICIT: dict[str, str] = {
+    "add_note": "notes:write",
+    "search_notes": "notes:read",
+    "list_notes": "notes:read",
+    "save_link": "notes:write",
+    "remember_fact": "memory:write",
+    "list_facts": "memory:read",
+    "forget_fact": "memory:write",
+    "web_search": "web:read",
+    "fetch_page": "web:read",
+    "analyze_image": "web:read",
+    "exchange_rate": "web:read",
+    "get_datetime": "",
+    "anchor_journal": "journal:anchor",
+}
+
 _TOOL_DOMAINS = {
     "notes": ("notes:read", "notes:write"),
     "memory": ("memory:read", "memory:write"),
     "reminders": ("reminders:read", "reminders:write"),
+    "reminder": ("reminders:read", "reminders:write"),  # реальные имена — set/cancel_reminder
     "web": ("web:read", "web:read"),
     "image": ("web:read", "web:read"),
     "finance": ("memory:read", "tool:pay"),
@@ -119,13 +142,19 @@ def allows(grants: Iterable[str], action: str) -> bool:
 
 
 def permission_for_tool(tool: str, *, writes: bool) -> str:
-    """Какое действие требует вызов инструмента. Пустая строка — read-only без гранта (поиск и
-    т.п.)."""
-    domain = tool.split(".", 1)[0]
-    pair = _TOOL_DOMAINS.get(domain)
-    if pair is None:
-        return ""
-    return pair[1] if writes else pair[0]
+    """Какое действие требует вызов инструмента. Пустая строка — «грант не нужен» (время, поиск).
+
+    Порядок: явная карта имён → доменный префикс (``finance_pay`` → ``tool:pay`` при writes).
+    Неизвестное writes-имя без гранта здесь — сигнал дописать маппинг, но молча «разрешить
+    всё» он не должен превращаться в дырку: тест сверяет реестр целиком.
+    """
+    if tool in _TOOL_EXPLICIT:
+        return _TOOL_EXPLICIT[tool]
+    for segment in re.split(r"[._]", tool):
+        pair = _TOOL_DOMAINS.get(segment)
+        if pair is not None:
+            return pair[1] if writes else pair[0]
+    return ""
 
 
 @dataclass(frozen=True, slots=True)

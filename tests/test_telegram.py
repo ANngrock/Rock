@@ -15,8 +15,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aegis.agents.supervisor import Inbound, PendingAction, Reply
 from aegis.interaction.telegram.bot import (
     OwnerOnly,
+    UpdateDedup,
     _confirm_keyboard,
+    _drain_queue,
+    _inbound,
+    _reply_markup,
     _stream_label,
+    on_appeal,
     run,
     send_reply,
 )
@@ -377,3 +382,272 @@ def test_status_names_the_answer_mode() -> None:
 
     assert "выключен" in _stream_label(off)  # type: ignore[arg-type]
     assert _stream_label(on) == "включён, правка раз в 1500 мс"  # type: ignore[arg-type]
+
+
+# ------------------------------------------------------------- F1: дедуп апдейтов
+
+
+class _SeqApp:
+    """App-двойник: seen_update отдаёт заранее заготовленные ответы."""
+
+    def __init__(self, answers: list[bool]) -> None:
+        self._answers = answers
+        self.seen: list[tuple[int, int]] = []
+
+    async def seen_update(self, update_id: int, chat_id: int, *, kind: str = "message") -> bool:
+        self.seen.append((update_id, chat_id))
+        return self._answers.pop(0)
+
+
+async def test_update_dedup_swallows_repeats() -> None:
+    calls: list[str] = []
+
+    async def handler(event: Any, data: dict[str, Any]) -> str:
+        calls.append("run")
+        return "ok"
+
+    app = _SeqApp([True, False])
+    middleware = UpdateDedup(app)
+    event = SimpleNamespace(update_id=77, message=SimpleNamespace(chat=SimpleNamespace(id=-1001)))
+    assert await middleware(handler, event, {}) == "ok"
+    assert await middleware(handler, event, {}) is None, (
+        "повтор того же update_id не доходит до хендлера"
+    )
+    assert calls == ["run"]
+    assert app.seen == [(77, -1001), (77, -1001)]
+
+
+async def test_update_dedup_passes_events_without_update_id() -> None:
+    async def handler(event: Any, data: dict[str, Any]) -> str:
+        return "ok"
+
+    app = _SeqApp([])
+    assert await UpdateDedup(app)(handler, SimpleNamespace(update_id=None), {}) == "ok"
+    assert app.seen == []
+
+
+async def test_seen_update_memory_fallback_is_process_local_and_bounded() -> None:
+    """Без БД дедуп остаётся, но только «в этом процессе»: это деградация, и она ограничена.»"""
+    from aegis.runtime import App
+
+    fake = SimpleNamespace(db_ready=False, _dedup_mem={})
+    assert await App.seen_update(fake, 10, 1) is True
+    assert await App.seen_update(fake, 10, 1) is False
+    # заполняем до потолка — старые ids вытесняются, место не растёт бесконечно
+    fake._dedup_mem = {i: None for i in range(10_000)}
+    assert await App.seen_update(fake, 99_999, 1) is True
+    assert len(fake._dedup_mem) == 10_000 and 0 not in fake._dedup_mem
+
+
+# ------------------------------------------------------------- F2: roster в гейте
+
+
+async def test_owner_only_admits_roster_and_no_one_else() -> None:
+    async def handler(event: Any, data: dict[str, Any]) -> str:
+        return "ok"
+
+    gate = OwnerOnly(42, frozenset({7}))
+    assert (
+        await gate(handler, SimpleNamespace(), {"event_from_user": SimpleNamespace(id=42)}) == "ok"
+    )
+    assert (
+        await gate(handler, SimpleNamespace(), {"event_from_user": SimpleNamespace(id=7)}) == "ok"
+    )
+    assert (
+        await gate(handler, SimpleNamespace(), {"event_from_user": SimpleNamespace(id=9)}) is None
+    )
+    assert (
+        await gate(handler, SimpleNamespace(), {"event_from_user": SimpleNamespace(id="7x")})
+        is None
+    )
+
+
+def test_inbound_separates_household_from_actor() -> None:
+    app = SimpleNamespace(cfg=SimpleNamespace(telegram_owner_id=1))
+    message = SimpleNamespace(from_user=SimpleNamespace(id=7))
+    inbound = _inbound(app, message, text="привет")
+    assert inbound.owner_id == 1 and inbound.actor_id == 7
+    # приложения без конфига (юнит-двойники) не должны падать: household = сам спрашивающий
+    loose = _inbound(SimpleNamespace(), message, text="привет")
+    assert loose.owner_id == 7 and loose.actor_id == 7
+
+
+# ------------------------------------------------------------- F5: апелляция в чате
+
+
+def test_reply_markup_prefers_confirmation_over_appeal() -> None:
+    appeal = Reply(text="нельзя", appeal_id="a1", appealable=True)
+    markup = _reply_markup(appeal)
+    assert markup is not None
+    button = markup.inline_keyboard[0][0]
+    assert button.callback_data == "ap:a1"
+
+    with_pending = Reply(
+        text="подтверди",
+        pending=[PendingAction(tool="pay", args={}, reason="r", rule="x", call_id="c1")],
+        pending_id="p1",
+        appealable=True,
+        appeal_id="a2",
+    )
+    data = _reply_markup(with_pending).inline_keyboard[0]
+    assert data[0].callback_data == "ok:p1", (
+        "пока есть прямое подтверждение, апелляция не дублирует выбор"
+    )
+
+
+async def test_on_appeal_delivers_to_owner_and_extinguishes_button() -> None:
+    sent: list[tuple[int, str, Any]] = []
+    edits: list[Any] = []
+
+    class Msg:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(id=-1)
+
+        async def edit_reply_markup(self, *, reply_markup: Any = None) -> None:
+            edits.append(reply_markup)
+
+    async def snapshot(appeal_id: str) -> dict[str, Any] | None:
+        return {
+            "appeal": True,
+            "owner_id": 42,
+            "actor_id": 7,
+            "actions": [
+                {"tool": "finance_pay", "reason": "нет права tool:pay", "rule": "grant-missing@1"}
+            ],
+        }
+
+    class Bot:
+        async def send_message(
+            self, chat_id: int, text: str, reply_markup: Any = None, **kw: Any
+        ) -> None:
+            sent.append((chat_id, text, reply_markup))
+
+    class Callback:
+        def __init__(self) -> None:
+            self.data = "ap:a1"
+            self.from_user = SimpleNamespace(id=7)
+            self.message = Msg()
+            self.answered: str | None = None
+
+        async def answer(self, text: str | None = None, **kw: Any) -> None:
+            self.answered = text
+
+    app = SimpleNamespace(
+        cfg=SimpleNamespace(telegram_owner_id=42),
+        supervisor=SimpleNamespace(appeal_snapshot=snapshot),
+    )
+    cb = Callback()
+    await on_appeal(cb, app, Bot())  # type: ignore[arg-type]
+
+    assert len(sent) == 1
+    chat_id, text, markup = sent[0]
+    assert chat_id == 42 and "finance_pay" in text
+    row = markup.inline_keyboard[0]
+    assert row[0].callback_data == "ok:a1" and row[1].callback_data == "no:a1"
+    assert edits == [None], "кнопка «обжаловать» гасится после подачи"
+    assert cb.answered == "Отправлено владельцу"
+
+
+async def test_on_appeal_expired_snapshot_answers_honestly() -> None:
+    class Bot:
+        async def send_message(self, *a: Any, **k: Any) -> None:
+            raise AssertionError("истёкшую апелляцию нельзя доставлять")
+
+    async def snapshot(appeal_id: str) -> None:
+        return None
+
+    class Callback:
+        data = "ap:gone"
+        from_user = SimpleNamespace(id=7)
+        message = None
+
+        def __init__(self) -> None:
+            self.answered: str | None = None
+
+        async def answer(self, text: str | None = None, **kw: Any) -> None:
+            self.answered = text
+
+    cb = Callback()
+    app = SimpleNamespace(
+        cfg=SimpleNamespace(telegram_owner_id=42),
+        supervisor=SimpleNamespace(appeal_snapshot=snapshot),
+    )
+    await on_appeal(cb, app, Bot())  # type: ignore[arg-type]
+    assert "устарела" in (cb.answered or "")
+
+
+# ------------------------------------------------------------- F1: очередь ходов
+
+
+async def test_drain_queue_processes_backlog_in_order_and_stops_when_empty() -> None:
+    class QueueSup:
+        def __init__(self) -> None:
+            self.pending = [Inbound(text="второе", owner_id=1), Inbound(text="третье", owner_id=1)]
+            self.seen: list[str] = []
+
+        async def drain_next(self, owner_id: int) -> Inbound | None:
+            return self.pending.pop(0) if self.pending else None
+
+        async def handle(self, inbound: Inbound, **kw: Any) -> Reply:
+            self.seen.append(inbound.text)
+            return Reply(text=f"ответ: {inbound.text}")
+
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, str]] = []
+
+        async def send_message(self, chat_id: int, text: str, **kw: Any) -> None:
+            self.sent.append((chat_id, text))
+
+    sup = QueueSup()
+    bot = Bot()
+    app = SimpleNamespace(cfg=SimpleNamespace(turn_drain_limit=5), supervisor=sup)
+    await _drain_queue(app, bot, -1, 1)  # type: ignore[arg-type]
+    assert sup.seen == ["второе", "третье"]
+    assert [t for _, t in bot.sent] == ["ответ: второе", "ответ: третье"]
+
+
+async def test_drain_queue_limit_is_a_hard_cap() -> None:
+    class Never:
+        async def drain_next(self, owner_id: int) -> Inbound | None:
+            return Inbound(text="ещё", owner_id=1)
+
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send_message(self, chat_id: int, text: str, **kw: Any) -> None:
+            self.sent.append(text)
+
+    async def handle(inbound: Inbound, **kw: Any) -> Reply:
+        return Reply(text="ок")
+
+    sup = SimpleNamespace(drain_next=Never().drain_next, handle=handle)
+    bot = Bot()
+    app = SimpleNamespace(cfg=SimpleNamespace(turn_drain_limit=3), supervisor=sup)
+    await _drain_queue(app, bot, -1, 1)  # type: ignore[arg-type]
+    assert len(bot.sent) == 3, "бесконечная очередь не имеет права удерживать чат вечно"
+
+
+async def test_drain_queue_failure_is_reported_not_raised() -> None:
+    class Boom:
+        async def drain_next(self, owner_id: int) -> Inbound:
+            return Inbound(text="x", owner_id=1)
+
+        async def handle(self, inbound: Inbound, **kw: Any) -> Reply:
+            raise RuntimeError("модель легла")
+
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send_message(self, chat_id: int, text: str, **kw: Any) -> None:
+            self.sent.append(text)
+
+    app = SimpleNamespace(
+        cfg=SimpleNamespace(turn_drain_limit=2),
+        supervisor=Boom(),
+    )
+    bot = Bot()
+    await _drain_queue(app, bot, -1, 1)  # type: ignore[arg-type]
+    assert any("не удался" in t for t in bot.sent), "сбой очереди виден в чате, а не только в логе"

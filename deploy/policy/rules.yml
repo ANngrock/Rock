@@ -1,0 +1,96 @@
+# Policy как код (F5). Файл — источник истины для прода; встроенный набор в коде — только
+# фолбэк «нет файла = бот живёт» (принцип 5). Ужесточение/ослабление правила требует bump
+# version; ослабление вердикта — golden-кейс в evals/policy_rules_v1.jsonl, иначе CI краснеет
+# (aegis policy lint сравнивает с deploy/policy/rules.lock.json).
+name: aegis-default
+rules:
+- id: killswitch
+  version: 1
+  when:
+    writes: true
+    kill_switch: true
+  verdict: deny
+  reason: 'kill switch активен: записи приостановлены владельцем'
+  note: 'Стоп — про записи, а не про доступ: чтение живёт и при активном флаге.'
+- id: readonly
+  version: 1
+  when:
+    writes: false
+  verdict: allow
+  reason: read-only
+  note: 'Раньше killswitch: /halt обязан оставлять поиск и чтение заметок рабочими.'
+- id: grant-missing
+  version: 1
+  when:
+    writes: true
+    permission_missing: true
+  verdict: deny
+  reason: нет права {action} для этого принципала
+  note: 'RBAC проверяется до всякой оценки риска: гостю не помогает даже low-risk.'
+- id: untrusted-write
+  version: 1
+  when:
+    writes: true
+    source_trust:
+    - untrusted
+  verdict: confirm
+  reason: запрос на запись пришёл из внешнего контента
+  note: 'Prompt-injection путь: внешний текст не получает право писать без человека.'
+- id: budget-critical
+  version: 1
+  when:
+    writes: true
+    budget_ratio_gte: 1.0
+  verdict: deny
+  reason: личный бюджет на день исчерпан
+  note: 'Право на деградацию: сначала объясни отказ, потом ломай лимит.'
+- id: high-risk
+  version: 1
+  when:
+    writes: true
+    risk_in:
+    - high
+  verdict: confirm
+  reason: высокий риск
+- id: medium-risk
+  version: 1
+  when:
+    writes: true
+    risk_in:
+    - medium
+  verdict: confirm
+  reason: средний риск
+- id: low-confidence
+  version: 1
+  when:
+    writes: true
+    confidence_lt: 0.8
+  verdict: confirm
+  reason: низкая уверенность извлечения
+- id: low-risk-auto
+  version: 1
+  when:
+    writes: true
+    risk_in:
+    - low
+    auto_allow_low_risk: true
+  verdict: allow
+  reason: низкий риск, авто-разрешено
+  note: Флаг auto_allow читается условием, а не веткой if — иначе «код и правила» разойдутся.
+- id: system-idempotent
+  version: 1
+  when:
+    writes: true
+    source_trust:
+    - system
+    idempotent: true
+  verdict: allow
+  reason: идемпотентная системная запись
+- id: confirm-default
+  version: 1
+  when:
+    writes: true
+    always: true
+  verdict: confirm
+  reason: 'по умолчанию: подтвердить'
+  note: deny-by-default на unknown — здесь; фолбэк обязан быть последним.
