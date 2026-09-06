@@ -272,6 +272,65 @@ async def _scalar(sql: str, **params: Any) -> Any:
         return await s.scalar(text(sql), params or None)
 
 
+async def _turns_report() -> dict[str, Any]:
+    """Аренды ходов (F1): «зависший ход» и «сообщение, застрявшее в claimed».
+
+    ok=False — ровно у мёртвых claimed (attempts исчерпан: их никто не вернёт без руки
+    оператора, и сообщение не дойдёт никогда). Просроченная аренда заявки — не беда: begin
+    чистит их сам (_EXPIRE_CLAIM), владельцу об этом сказать — note. Таблица отсутствует —
+    миграция 0005 не выкатана, и это тоже note: бот без очереди ходов живёт по-старому.
+    """
+    out: dict[str, Any] = {"ok": True}
+    try:
+        ready = await _scalar("SELECT to_regclass('governance.turn_claims') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - настоящая ошибка БД уже в проверке postgres
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        out["hint"] = "детали — в проверке postgres"
+        return out
+    if not ready:
+        out["state"] = "нет таблиц ходов"
+        out["hint"] = (
+            "docker compose ... alembic upgrade head (миграция 0005)"
+            " — или ignore, если актив-актив не нужен"
+        )
+        return out
+    expired = int(
+        await _scalar(
+            "SELECT count(*)::int FROM governance.turn_claims"
+            " WHERE status = 'active' AND lease_until < now()"
+        )
+        or 0
+    )
+    dead = int(
+        await _scalar(
+            "SELECT count(*)::int FROM governance.turn_queue"
+            " WHERE status = 'claimed' AND attempts >= 3"
+            "   AND claimed_at < now() - interval '60 seconds'"
+        )
+        or 0
+    )
+    recovering = int(
+        await _scalar(
+            "SELECT count(*)::int FROM governance.turn_queue"
+            " WHERE status = 'claimed' AND attempts < 3"
+            "   AND claimed_at < now() - interval '60 seconds'"
+        )
+        or 0
+    )
+    out["active_expired"] = expired
+    out["queue_dead"] = dead
+    if dead:
+        out["ok"] = False
+        out["hint"] = f"aegis turns drain <owner> --execute вернёт {dead} в очередь"
+    elif recovering:
+        out["note"] = f"{recovering} claimed переберутся сами через 60s"
+    elif expired:
+        out["note"] = f"{expired} просроченных аренд — освободятся на первом begin"
+    else:
+        out["note"] = "ни зависших ходов, ни осиротевших элементов"
+    return out
+
+
 async def _reminders_report(cfg: Any) -> dict[str, Any]:
     """Расписание напоминаний: таблица, настроен ли инструмент, догоняет ли тик.
 
@@ -690,6 +749,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["reminders"] = await _reminders_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
+        report["checks"]["turns"] = await _turns_report()
         report["checks"]["langfuse"] = await _langfuse_report(cfg)
 
         try:

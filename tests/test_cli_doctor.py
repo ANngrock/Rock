@@ -202,6 +202,7 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_notes_index_report", ok)
     monkeypatch.setattr(cli, "_outbox_report", ok)
     monkeypatch.setattr(cli, "_langfuse_report", ok)
+    monkeypatch.setattr(cli, "_turns_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(report["checks"]) == {
@@ -210,6 +211,7 @@ async def test_quick_skips_every_live_probe(
         "reminders",
         "notes_index",
         "outbox",
+        "turns",
         "langfuse",
     }, report["checks"]
     assert report["checks"]["redis"]["backend"] == "memory"
@@ -597,3 +599,54 @@ def _doctor_cfg() -> Any:
     from aegis.platform.config import Settings
 
     return Settings(_env_file=None, _env_prefix="T_", search_engines="searxng,zai")
+
+
+# ------------------------------------------------------------------ проба ходов (F1)
+
+
+@pytest.mark.asyncio
+async def test_turns_report_flags_dead_claims(monkeypatch) -> None:
+    from aegis import cli  # noqa: PLC0415 — локальный импорт, как в остальных пробах файла
+
+    async def fake_scalar(sql, params=None):
+        if "to_regclass" in sql:
+            return True
+        if "turn_claims" in sql:
+            return 0  # ни одной просроченной аренды
+        return 2 if "attempts >= 3" in sql else 1  # 2 мёртвых, 1 на автомате
+
+    monkeypatch.setattr(cli, "_scalar", fake_scalar)
+    report = await cli._turns_report()
+    assert report["ok"] is False and "drain" in report["hint"], (
+        "исчерпавшие попытки claimed — единственное состояние, где сообщение не дойдёт само"
+    )
+    assert report["queue_dead"] == 2
+
+
+@pytest.mark.asyncio
+async def test_turns_report_is_green_but_tells(monkeypatch) -> None:
+    from aegis import cli  # noqa: PLC0415
+
+    async def fake_scalar(sql, params=None):
+        if "to_regclass" in sql:
+            return True
+        if "turn_claims" in sql:
+            return 1  # просроченная аренда: begin починит сам
+        return 3 if "attempts < 3" in sql else 0
+
+    monkeypatch.setattr(cli, "_scalar", fake_scalar)
+    report = await cli._turns_report()
+    assert report["ok"] is True and report["note"] == "3 claimed переберутся сами через 60s"
+
+
+@pytest.mark.asyncio
+async def test_turns_report_without_migration_is_note_not_fault(monkeypatch) -> None:
+    from aegis import cli  # noqa: PLC0415
+
+    async def fake_scalar(sql, params=None):
+        assert "to_regclass" in sql  # дальше не ходим
+        return False
+
+    monkeypatch.setattr(cli, "_scalar", fake_scalar)
+    report = await cli._turns_report()
+    assert report["ok"] is True and report["state"] == "нет таблиц ходов"
