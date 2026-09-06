@@ -81,7 +81,7 @@ FLAG_CATALOG: dict[str, FlagSpec] = {
         ),
         FlagSpec(
             "notes.hybrid_search",
-            "гибридный поиск BM25/trgm + вектор через RRF + rerank (ADR-0022)",
+            "гибридный поиск BM25/trgm + вектор через RRF + rerank (ADR-0015)",
             golden=("flag-hybrid-off", "flag-hybrid-on"),
             env_default=None,
         ),

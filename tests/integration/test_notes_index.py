@@ -198,3 +198,84 @@ async def test_dimension_guard_rejects_a_wrong_vector(db: str) -> None:
     assert not report.ok and "размерность" in (report.stopped or "")
     assert await embedded(note.id) == (False, False)
     assert isinstance(repo, Indexable), "магазин заметок обязан подходить индексатору структурой"
+
+
+# ------------------------------------------------------------- F9: алиас и гибрид
+
+
+async def test_alias_flip_hides_stale_rows_and_shows_reindexed(db: str) -> None:
+    """Видимость = index_version == активной версии. Rollback — flip обратно, данные целы."""
+    repo = NotesRepo()
+    note = await add(db, "Алиас-заметка", "текст про квантовый тостер")
+    await repo.set_embedding(note.id, spike(9))
+    assert await repo.alias_version() == 1
+
+    async with session() as s:
+        plain = await s.execute(
+            text("SELECT count(*) FROM knowledge.notes WHERE :t = ANY(tags)").bindparams(t=db)
+        )
+        assert plain.scalar() == 1
+
+    stale = 2
+    assert await repo.flip_alias(stale, note="проверка hide-stale")
+    try:
+        async with session() as s:
+            hidden = await s.execute(
+                text("SELECT count(*) FROM knowledge.notes_search WHERE :t = ANY(tags)").bindparams(
+                    t=db
+                )
+            )
+            assert hidden.scalar() == 0, "строка старой версии не видна через алиас"
+        # строка при этом жива и помечена «к переиндексации»
+        pending = await repo.notes_older_than_alias()
+        assert any(p.id == note.id for p in pending)
+        await repo.mark_indexed(note.id, stale)
+        async with session() as s:
+            shown = await s.execute(
+                text("SELECT count(*) FROM knowledge.notes_search WHERE :t = ANY(tags)").bindparams(
+                    t=db
+                )
+            )
+            assert shown.scalar() == 1, "после mark_indexed строка вернулась в алиас"
+    finally:
+        assert await repo.flip_alias(1, note="rollback после проверки")
+        async with session() as s:
+            await s.execute(
+                text(
+                    "UPDATE knowledge.notes SET index_version = 1 WHERE :t = ANY(tags)"
+                ).bindparams(t=db)
+            )
+
+
+async def test_search_hybrid_merges_lexical_and_vector_hits(db: str) -> None:
+    """Гибрид не «или/или»: то, что видит хотя бы один ранжер, — находится."""
+    repo = NotesRepo()
+    both = await add(db, "Квантовый тостер", "тостер облучённый но хлеб греет")
+    vector_only = await add(db, "Заметка ЙЦУКЕН", "аппарат для подогрева хлеба")
+    await repo.set_embedding(both.id, spike(31))
+    await repo.set_embedding(vector_only.id, spike(31))
+
+    hits = await repo.search_hybrid("тостер", spike(31), limit=5)
+    assert hits, "гибрид обязан найти то, что хотя бы один ранжер видит"
+    ids = [h.id for h in hits]
+    assert ids[0] == both.id, "совпадение по обоим слоям — первое"
+    assert all(h.method == "hybrid" for h in hits)
+
+    # без эмбеддинга гибрид честен: это всё ещё поиск, а не пустота
+    text_only = await repo.search_hybrid("квантовый", None, limit=5)
+    assert any(h.id == both.id for h in text_only)
+
+
+async def test_search_hybrid_without_alias_falls_back_to_plain(db: str) -> None:
+    """Нет вьюхи — тот же ответ старым путём: алиас оптимизация, а не зависимость.
+
+    Проверяем на «пол»-пути: временно гасим кэш доступности и читаем прямую таблицу —
+    гибрид поверх неё обязан совпасть с search() по составу (порядок может отличаться).
+    """
+    repo = NotesRepo()
+    note = await add(db, "Откат на прямой путь", "красный тостер снова в деле")
+    repo._alias_ok = False  # noqa: SLF001 - имитируем базу до 0007
+    hits = await repo.search_hybrid("тостер красный", None, limit=5)
+    plain = await repo.search("тостер красный", None, limit=5)
+    assert {h.id for h in hits} == {h.id for h in plain}
+    assert any(h.id == note.id for h in hits)

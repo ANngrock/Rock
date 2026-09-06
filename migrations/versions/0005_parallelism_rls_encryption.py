@@ -318,7 +318,7 @@ def upgrade() -> None:
             lease_until timestamptz,
             updated_at  timestamptz NOT NULL DEFAULT now()
         );
-        -- регистрация заданий идемпотентна:应用 каталога spec'ов при каждом старте
+        -- регистрация заданий идемпотентна: применение каталога spec'ов при каждом старте
         INSERT INTO platform.backfills (name, target, batch_size) VALUES
             ('events_owner', 'platform.events.owner_id из stream_id', 1000),
             ('journal_actor', 'governance.decision_records.actor_id = owner_id', 1000)
@@ -598,7 +598,7 @@ def upgrade() -> None:
                 END IF;
                 IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = rec.oid)
                    OR NOT (SELECT relforcerowsecurity FROM pg_class WHERE oid = rec.oid)
-                THEN  -- ENABLE/FORCE缺一不可: без FORCE политики обходятся владельцем таблицы
+                THEN  -- ENABLE/FORCE — оба обязательны: без FORCE политики обходятся владельцем таблицы
                     RAISE EXCEPTION 'RLS для % включён неполно (нужны ENABLE+FORCE)', rec.tbl;
                 END IF;
             END LOOP;

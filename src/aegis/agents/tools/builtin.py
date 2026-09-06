@@ -161,7 +161,22 @@ async def search_notes(args: SearchNotesArgs, ctx: ToolContext) -> str:
     except Exception as exc:  # noqa: BLE001 - эмбеддинги опциональны: поиск остаётся текстовым
         embedding = None
         ctx.extras["embed_warning"] = repr(exc)[:200]
-    hits = await ctx.services.notes.search(args.query, embedding, args.limit)
+    # F6: право на гибрид спрашиваем у флага хода — включается перцентилями по actor'у
+    # и гасится одним UPDATE в БД, без рестарта. Флаг выключен = ровно старый путь.
+    hybrid_on = bool(
+        ((ctx.extras.get("flags") or {}).get("notes.hybrid_search") or {}).get("on")
+    )
+    hits: Any = None
+    if hybrid_on:
+        hybrid = getattr(ctx.services.notes, "search_hybrid", None)
+        if hybrid is not None:
+            try:
+                hits = await hybrid(args.query, embedding, args.limit)
+            except Exception as exc:  # noqa: BLE001 - гибрид поверх отказа = обычный гибрид…
+                hits = None
+                ctx.extras["hybrid_warning"] = repr(exc)[:160]
+    if hits is None:
+        hits = await ctx.services.notes.search(args.query, embedding, args.limit)
     if not hits:
         return "Ничего не найдено."
     lines = [
@@ -169,6 +184,8 @@ async def search_notes(args: SearchNotesArgs, ctx: ToolContext) -> str:
     ]
     if "embed_warning" in ctx.extras:
         lines.append("(семантический индекс недоступен, искал по тексту)")
+    if "hybrid_warning" in ctx.extras:
+        lines.append("(гибридный ранжор сбойнул — откат на обычный поиск — ниже обычный поиск)")
     return "\n".join(lines)
 
 

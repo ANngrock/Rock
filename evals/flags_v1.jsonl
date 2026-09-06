@@ -1,0 +1,12 @@
+{"id": "flag-stream-off", "kind": "flag-state", "flag": "telegram.stream_replies", "state": "off", "input": "ответ на 'привет' при lie-down стриме", "expect": {"stream": "off"}}
+{"id": "flag-stream-on", "kind": "flag-state", "flag": "telegram.stream_replies", "state": "on", "input": "ответ на 'привет' при lie-down стриме", "expect": {"stream": "edit_draft"}}
+{"id": "flag-relay-off", "kind": "flag-state", "flag": "events.outbox_relay", "state": "off", "input": "домен-транзакт с outbox-строкой", "expect": {"relay": "paused"}}
+{"id": "flag-relay-on", "kind": "flag-state", "flag": "events.outbox_relay", "state": "on", "input": "домен-транзакт с outbox-строкой", "expect": {"relay": "active"}}
+{"id": "flag-verify-off", "kind": "flag-state", "flag": "agent.verify_answers", "state": "off", "input": "факт-ответ с источником", "expect": {"verify": "skipped"}}
+{"id": "flag-verify-on", "kind": "flag-state", "flag": "agent.verify_answers", "state": "on", "input": "факт-ответ с источником", "expect": {"verify": "forced"}}
+{"id": "flag-hybrid-off", "kind": "flag-state", "flag": "notes.hybrid_search", "state": "off", "input": "запрос 'курс евро' к заметкам", "expect": {"method": "fallback_text"}}
+{"id": "flag-hybrid-on", "kind": "flag-state", "flag": "notes.hybrid_search", "state": "on", "input": "запрос 'курс евро' к заметкам", "expect": {"method": "hybrid"}}
+{"id": "flag-policy-rules-off", "kind": "flag-state", "flag": "policy.rules_active", "state": "off", "input": "write среднего риска", "expect": {"engine": "builtin"}}
+{"id": "flag-policy-rules-on", "kind": "flag-state", "flag": "policy.rules_active", "state": "on", "input": "write среднего риска", "expect": {"engine": "file_rules"}}
+{"id": "flag-slo-degrade-off", "kind": "flag-state", "flag": "slo.degrade_enabled", "state": "off", "input": "окно ошибок 12%", "expect": {"degrade": "manual-only"}}
+{"id": "flag-slo-degrade-on", "kind": "flag-state", "flag": "slo.degrade_enabled", "state": "on", "input": "окно ошибок 12%", "expect": {"degrade": "auto"}}
