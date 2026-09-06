@@ -65,6 +65,18 @@ class App:
     db_ready: bool
     #: свой ли KV-клиент: чужой (инжектированный тестом) не закрываем
     owns_kv: bool = True
+    #: реестр метрик процесса (F7): счётчики/гистограммы живут здесь, в БД — только снапшоты
+    metrics: Any = None
+    #: куда flush'ить метрики (None, если БД нет): SqlMetricsStore
+    metrics_store: Any = None
+    #: движок флагов (F6) и права принципалов (F2) — App держит их, потому что CLI/doctor
+    #  обязан читать РОВНО то, чем пользуется бот, а не «почти то же самое»
+    flags: Any = None
+    principals: Any = None
+    #: переключатели деградации (F7): «что горит сейчас» — один и тот же слой у всех
+    overrides: Any = None
+    #: реестр активностей (F8): идемпотентность side-effect'ов переживает рестарт процесса
+    activity_ledger: Any = None
     #: fallback-дедуп апдейтов без БД (см. seen_update); dict как ordered set
     _dedup_mem: dict[int, None] = field(default_factory=dict)
 
@@ -205,6 +217,25 @@ def build_app(
     services = Services.build(gateway, repro=repro, reminders=reminders)
     policy = PolicyEngine.from_settings(cfg)
     kill_switch = KillSwitch(kv)
+    # --- шаг 2.5+ в бою (F2/F6/F7/F8): право, флаги, деградация, идемпотентность, метрики.
+    # Пока эти слова жили только в Supervisor'е, «фича есть в тестах и нет в приложении» было
+    # не видно. Маппинг «db_ready → магазин, иначе Null/Env» — единственный источник: у CLI и
+    # у бота он обязан собираться одинаково, иначе прод и диагностика расходятся молча.
+    from aegis.governance.degradation import MemoryOverrides, SqlOverrides  # noqa: PLC0415
+    from aegis.governance.principals import SqlPrincipalStore  # noqa: PLC0415
+    from aegis.platform.flags import EnvFlagSource, FlagEngine, SqlFlagSource  # noqa: PLC0415
+    from aegis.platform.metrics import MetricsRegistry, SqlMetricsStore  # noqa: PLC0415
+    from aegis.workflows.ledger import NullLedger, SqlLedger  # noqa: PLC0415
+    metrics = MetricsRegistry()
+    metrics_store = SqlMetricsStore() if db_ready else None
+    flag_source = (
+        SqlFlagSource(cfg, fallback=EnvFlagSource(cfg)) if db_ready else EnvFlagSource(cfg)
+    )
+    flags_engine = FlagEngine(flag_source)
+    principals_store = SqlPrincipalStore() if db_ready else None
+    overrides = SqlOverrides() if db_ready else MemoryOverrides()
+    activity_ledger = SqlLedger() if db_ready else NullLedger()
+
     supervisor = Supervisor(
         services=services,
         registry=registry,
@@ -215,6 +246,12 @@ def build_app(
         audit=audit,
         kill_switch=kill_switch,
         recorder=repro,
+        flags=flags_engine,
+        overrides=overrides,
+        principals=principals_store,
+        governance=principals_store,  # один класс на три таблицы — см. докстринг SqlPrincipalStore
+        metrics=metrics,
+        activity_ledger=activity_ledger,
     )
     log.info(
         "app.built",
@@ -238,6 +275,12 @@ def build_app(
         repro=repro,
         registry=registry,
         db_ready=db_ready,
+        metrics=metrics,
+        metrics_store=metrics_store,
+        flags=flags_engine,
+        principals=principals_store,
+        overrides=overrides,
+        activity_ledger=activity_ledger,
     )
 
 

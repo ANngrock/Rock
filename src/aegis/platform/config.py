@@ -266,6 +266,13 @@ class Settings(BaseSettings):
     slo_enforce_degradation: bool = True
     #: окно наблюдения SLO (минуты): короче — дребезг, длиннее — деградация приходит после инцидента
     slo_window_minutes: int = Field(default=60, ge=10, le=1440)
+    #: как часто процесс сбрасывает снапшот метрик в platform.metric_samples (секунды)
+    metrics_flush_seconds: int = Field(default=30, ge=5, le=3600)
+    #: TTL автоматических переключателей деградации: «галочка без expiry» = деградация навсегда
+    degradation_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+
+    # --- retention-as-code (F3) ---
+    retention_file: str = "deploy/retention.yml"
 
     # --- воркфлоу хода (F8) ---
     #: off — старый путь (супервизор сам); local — тот же код шагов через локальный воркфлоу-раннер;

@@ -276,13 +276,15 @@ class SqlPrincipalStore:
             await s.execute(
                 text(
                     "INSERT INTO platform.principals (principal_id, subject, kind, display_name)"
-                    " VALUES (:id, :subject, :kind, NULLIF(:name, ''))"
+                    " VALUES (:id, :subject, :kind, :name)"
                     " ON CONFLICT (principal_id) DO NOTHING"
                 ).bindparams(
                     id=int(principal_id),
                     subject=f"telegram:{int(principal_id)}",
                     kind=kind,
-                    name=name[:120],
+                    # NOT NULL по схеме: «безымянный» принципал — не NULL, а id: ленивый
+                    # ensure для незнакомца не имеет права падать на вставке
+                    name=(name or str(int(principal_id)))[:120],
                 )
             )
             for action in sorted(default_grants(kind)):
@@ -445,9 +447,12 @@ class SqlPrincipalStore:
                     ).bindparams(id=int(principal_id), reason=reason[:500]),
                 )
             else:
+                # НЕ NULL: колонка NOT NULL по схеме, а в строке живёт ещё и бюджет — удаление
+                # строки стёрло бы лимит вместе с паузой. Сброс = дефолт-объект без reason
                 await s.execute(
                     text(
-                        "UPDATE platform.principal_state SET kill_switch = NULL, updated_at = now()"
+                        "UPDATE platform.principal_state"
+                        " SET kill_switch = '{\"active\": false}'::jsonb, updated_at = now()"
                         " WHERE principal_id = :id"
                     ).bindparams(id=int(principal_id)),
                 )

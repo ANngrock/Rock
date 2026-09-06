@@ -127,7 +127,120 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="собрать и посчитать, но ничего не отправлять; ключи при этом не нужны",
     )
+    # --- права, флаги, политика, хранение, события, схема (шаги 2.5+) ---
+    pr = sub.add_parser("principals", help="RBAC: кто есть, что можно, kill-switch, бюджет (F2)")
+    pr_actions = pr.add_subparsers(dest="principals_action", required=True)
+    pr_actions.add_parser("list", help="принципалы с грантами, лимитами и паузой")
+    pk = pr_actions.add_parser("kind", help="сменить роль (owner/member/guest/service)")
+    pk.add_argument("id", type=int)
+    pk.add_argument("kind", choices=("owner", "member", "guest", "service"))
+    pg = pr_actions.add_parser("grant", help="выдать действие (например tool:pay)")
+    pg.add_argument("id", type=int)
+    pg.add_argument("action")
+    pv = pr_actions.add_parser("revoke", help="забрать действие")
+    pv.add_argument("id", type=int)
+    pv.add_argument("action")
+    px = pr_actions.add_parser("kill", help="персональный kill-switch: ответы на паузе")
+    px.add_argument("id", type=int)
+    px.add_argument("--off", action="store_true", help="снять паузу")
+    px.add_argument("--reason", default="вручную через CLI")
+    pb = pr_actions.add_parser("budget", help="дневной бюджет принципала в USD")
+    pb.add_argument("id", type=int)
+    pb.add_argument("--usd", type=float, default=None)
+    pb.add_argument("--clear", action="store_true", help="снять личный лимит (общий остаётся)")
+
+    fl = sub.add_parser("flags", help="feature flags: состояние, выдача, протухшие (F6)")
+    fl_actions = fl.add_subparsers(dest="flags_action", required=True)
+    fl_list = fl_actions.add_parser("list", help="каталог × БД: процент, стадии, покрытие golden")
+    fl_list.add_argument("--actor", type=int, default=None, help="оценить для конкретного id")
+    fset = fl_actions.add_parser("set", help="создать/обновить определение флага")
+    fset.add_argument("key")
+    fset.add_argument("--percent", type=int, default=None)
+    fset.add_argument("--allow", default="", help="список id через запятую")
+    fset.add_argument("--deny", default="", help="список id через запятую")
+    fset.add_argument("--stage", default="canary", choices=("shadow", "canary", "full", "retired"))
+    fset.add_argument("--reason", default="")
+    fl_actions.add_parser(
+        "stale", help="флаги на 100% старше N дней — кандидаты на удаление (CI-гигиена)"
+    )
+
+    po = sub.add_parser("policy", help="policy-as-code: lint файла правил и shadow-прогон (F5)")
+    po_actions = po.add_subparsers(dest="policy_action", required=True)
+    po_actions.add_parser("lint", help="разобрать rules-файл, сверить с lock; смягчения — с golden")
+    psh = po_actions.add_parser(
+        "shadow", help="пересобрать последние N решений и показать дельту файла против кода"
+    )
+    psh.add_argument("--limit", type=int, default=200)
+
+    rt = sub.add_parser("retention", help="retention-as-code: plan/apply/forget/holds/rewrap (F3)")
+    rt_actions = rt.add_subparsers(dest="retention_action", required=True)
+    rt_actions.add_parser("plan", help="что удалится сейчас — только чтение (legal hold учтён)")
+    rta = rt_actions.add_parser("apply", help="прогон ротации; по умолчанию dry-run")
+    rta.add_argument("--execute", action="store_true", help="собственно удаление (после plan)")
+    rta.add_argument("--limit", type=int, default=500)
+    rt_actions.add_parser("holds", help="активные legal holds")
+    rth = rt_actions.add_parser("hold", help="поставить/снять hold: scope=value")
+    rth.add_argument(
+        "spec",
+        help="scope=value: principal=777 или class=journal (других scope схема не знает)",
+    )
+    rth.add_argument("--reason", default="")
+    rth.add_argument("--release", action="store_true", help="снять вместо установки")
+    rtf = rt_actions.add_parser("forget", help="crypto-shredding по запросу «забудь меня»")
+    rtf.add_argument("owner_id", type=int)
+    rtf.add_argument("--execute", action="store_true", help="иначе — план без разрушения")
+    rt_actions.add_parser("rewrap", help="одна пачка re-wrap DEK на активный KEK (lease-батч)")
+    rt_actions.add_parser("shreds", help="журнал уничтожений (манифесты)")
+    rt_actions.add_parser("keyring", help="версии ключей и сколько блобов на каждой")
+
+    ev = sub.add_parser("events", help="шина событий: DLQ и переигрывание (F4)")
+    ev_actions = ev.add_subparsers(dest="events_action", required=True)
+    ev_actions.add_parser("dlq", help="сколько отбраковано, последние причины")
+    evr = ev_actions.add_parser(
+        "replay", help="вернуть в очередь события с seq >= N (идемпотентно по event_id)"
+    )
+    evr.add_argument("from_seq", type=int)
+    evr.add_argument("--to-seq", type=int, default=None)
+    evr.add_argument("--type", dest="etype", default=None, help="фильтр по event_type")
+    evr.add_argument("--execute", action="store_true", help="иначе — только посчитать")
+
+    mi = sub.add_parser("migrate", help="схема: версия, незакрытые бэкфиллы, подозрения (F10)")
+    mi_actions = mi.add_subparsers(dest="migrate_action", required=True)
+    mi_actions.add_parser(
+        "status", help="alembic head против файлов, pending-backfill, dangling NOT NULL"
+    )
+
+    bf = sub.add_parser("backfill", help="пакетные доводчики данных: бег с паузой (F10)")
+    bf_actions = bf.add_subparsers(dest="backfill_action", required=True)
+    bfr = bf_actions.add_parser("run", help="брать задания по lease, батчами; Ctrl-C = пауза")
+    bfr.add_argument("--name", default=None, help="только одно задание")
+    bfr.add_argument("--rounds", type=int, default=4, help="сколько батчей за запуск")
+    bfr.add_argument("--lease-secs", type=int, default=900)
+    bf_actions.add_parser("status", help="прогресс всех заданий")
+    bfp = bf_actions.add_parser(
+        "pause", help="поставить задание на паузу (следующий раунд не возьмёт)"
+    )
+    bfp.add_argument("name")
+
+    sl = sub.add_parser("slo", help="SLO: оценка окон, алерты, тик деградации (F7)")
+    sl_actions = sl.add_subparsers(dest="slo_action", required=True)
+    sl_actions.add_parser("status", help="окна и burn-rate: что сейчас горит")
+    sla = sl_actions.add_parser("alerts", help="сгенерировать алерт-правила из slo.yml")
+    sla.add_argument("--write", default=None, help="файл для записи (deploy/slo.alerts.yml)")
+    slt = sl_actions.add_parser(
+        "tick", help="применить декларируемую деградацию к runtime_overrides (для таймера)"
+    )
+    slt.add_argument("--dry-run", action="store_true", help="показать, что включилось бы")
     return parser
+
+
+def _write_text_file(path: str, body: str) -> str:
+    from pathlib import Path as _Path
+
+    target = _Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return str(target)
 
 
 async def _scalar(sql: str, **params: Any) -> Any:
@@ -1086,6 +1199,811 @@ def _cmd_tools() -> int:
     return 0
 
 
+def _flag_golden_ids() -> set[str]:
+    """Чтение evals/flags_v1.jsonl — вне event loop (блокирующий pathlib в async — мусор)."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[2]
+    out: set[str] = set()
+    try:
+        for line in (root / "evals" / "flags_v1.jsonl").read_text().splitlines():
+            if line.strip():
+                out.add(str(_json.loads(line).get("id")))
+    except OSError:
+        pass
+    return out
+
+
+# ------------------------------------------------------------------ права (F2)
+
+
+async def _db_guard(coro_factory: Callable[[], Awaitable[int]]) -> int:
+    """Общая рамка db-команд: база не отвечает = объяснение, а не стек."""
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    try:
+        return await coro_factory()
+    except Exception as exc:  # noqa: BLE001 - CLI обязан объяснить, а не показать стек
+        print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:220]}", file=sys.stderr)
+        return 1
+
+
+async def _cmd_principals(action: str, args: argparse.Namespace) -> int:
+    from aegis.governance.principals import SqlPrincipalStore
+
+    async def go() -> int:
+        store = SqlPrincipalStore()
+        if action == "list":
+            rows = await store.list_principals()
+            if not rows:
+                print("принципалов пока нет: реестр наполняется при первом ходе")
+                return 0
+            for row in rows:
+                grants = ",".join(sorted(row.get("grants") or [])) or "—"
+                mark = "⏸" if row.get("killed") else " "
+                budget = row.get("daily_budget_usd")
+                spent = row.get("spent_today")
+                print(
+                    f"{mark} {row['principal_id']:>12} {row['kind']:<7} "
+                    f"бюджет {'∞' if budget is None else f'${float(budget):.2f}'} "
+                    f"(сегодня {'?' if spent is None else '$' + format(float(spent), '.2f')}) "
+                    f"[{grants}]"
+                )
+            return 0
+        if action == "kind":
+            await store.ensure(args.id, kind=args.kind)
+            await store.set_kind(args.id, args.kind)
+            print(f"принципал {args.id}: роль = {args.kind}")
+            return 0
+        if action in ("grant", "revoke"):
+            from aegis.governance.principals import KNOWN_ACTIONS
+
+            if args.action not in KNOWN_ACTIONS:
+                print(
+                    f"! такого действия нет: {args.action}. Известные: "
+                    + ", ".join(sorted(KNOWN_ACTIONS)),
+                    file=sys.stderr,
+                )
+                return 2
+            if action == "grant":
+                await store.grant(args.id, args.action, by=1)
+                print(f"{args.action} выдано принципалу {args.id}")
+            else:
+                await store.revoke(args.id, args.action)
+                print(f"{args.action} отозвано у {args.id}")
+            return 0
+        if action == "kill":
+            active = not args.off
+            await store.set_kill_switch(args.id, active, args.reason)
+            print(f"принципал {args.id}: {'на паузе' if active else 'снова работает'}")
+            return 0
+        if action == "budget":
+            limit = None if args.clear or args.usd is None else float(args.usd)
+            await store.set_daily_budget(args.id, limit)
+            print(
+                f"бюджет {args.id}: "
+                + ("снят (действует общий)" if limit is None else f"${limit:.2f}/день")
+            )
+            return 0
+        return 2
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ флаги (F6)
+
+
+def _id_list(raw: str) -> list[int]:
+    out: list[int] = []
+    for piece in raw.replace(" ", "").split(","):
+        if piece:
+            try:
+                out.append(int(piece))
+            except ValueError:
+                continue
+    return out
+
+
+async def _cmd_flags(action: str, args: argparse.Namespace) -> int:
+    from sqlalchemy import text
+
+    from aegis.platform.config import settings
+    from aegis.platform.db import session
+    from aegis.platform.flags import FLAG_CATALOG, EnvFlagSource, FlagEngine, SqlFlagSource
+
+    async def go() -> int:
+        cfg = settings()
+        source = SqlFlagSource(cfg, fallback=EnvFlagSource(cfg))
+        engine = FlagEngine(source)
+        rows = await source.load()
+        if action == "list":
+            golden_ids = await asyncio.to_thread(_flag_golden_ids)
+            for key, spec in FLAG_CATALOG.items():
+                row = rows.get(key) or {}
+                pct = int(row.get("percent", 0))
+                allow = row.get("allow") or row.get("allow_principals") or []
+                deny = row.get("deny") or row.get("deny_principals") or []
+                stage = row.get("stage", "env" if cfg else "?")
+                covered = all(cid in golden_ids for cid in spec.golden if cid)
+                line = (
+                    f"  {key:<28} pct={pct:>3} stage={stage:<7} "
+                    f"allow={','.join(map(str, allow)) or '—'} "
+                    f"deny={','.join(map(str, deny)) or '—'}"
+                )
+                if spec.env_default:
+                    line += f" env:{spec.env_default}={getattr(cfg, spec.env_default, None)}"
+                line += "" if covered else "  ! без golden-пары"
+                print(line)
+                if args.actor is not None:
+                    decision = await engine.evaluate(key, int(args.actor))
+                    value = "ВКЛ" if decision.on else "выкл"
+                    extra = (
+                        f" bucket={decision.bucket}/{decision.percent}%"
+                        if decision.basis == "bucket"
+                        else ""
+                    )
+                    print(f"      actor {args.actor}: {value} ({decision.basis}{extra})")
+            return 0
+        if action == "set":
+            if args.key not in FLAG_CATALOG:
+                print(
+                    "! флаг вне каталога — определи его в FLAG_CATALOG (и заведи golden-пару) "
+                    "прежде чем писать в таблицу",
+                    file=sys.stderr,
+                )
+                return 2
+            async with session() as s:
+                current = await s.scalar(
+                    text("SELECT percent FROM platform.feature_flags WHERE key = :k").bindparams(
+                        k=args.key
+                    )
+                )
+                percent = args.percent if args.percent is not None else int(current or 0)
+                await s.execute(
+                    text(
+                        """
+                        INSERT INTO platform.feature_flags
+                            (key, percent, allow_principals, deny_principals, stage, description)
+                        VALUES
+                            (:k, :p, CAST(:allow AS bigint[]), CAST(:deny AS bigint[]), :st, :d)
+                        ON CONFLICT (key) DO UPDATE
+                        SET percent = EXCLUDED.percent,
+                            allow_principals = EXCLUDED.allow_principals,
+                            deny_principals = EXCLUDED.deny_principals,
+                            stage = EXCLUDED.stage,
+                            description = CASE WHEN EXCLUDED.description = ''
+                                               THEN platform.feature_flags.description
+                                               ELSE EXCLUDED.description END,
+                            updated_at = now()
+                        """
+                    ).bindparams(
+                        k=args.key,
+                        p=max(0, min(100, percent)),
+                        allow=_id_list(args.allow),
+                        deny=_id_list(args.deny),
+                        st=args.stage,
+                        d=args.reason,
+                    )
+                )
+            print(f"флаг {args.key}: percent={percent} stage={args.stage} — применён")
+            return 0
+        if action == "stale":
+            async with session() as s:
+                rows = (
+                    await s.execute(
+                        text(
+                            "SELECT key, percent, (now() - created_at)::bigint AS age_s"
+                            " FROM platform.feature_flags"
+                            " WHERE percent = 100 AND stage <> 'retired'"
+                            "   AND created_at < now() - make_interval(days => :days)"
+                            " ORDER BY created_at"
+                        ).bindparams(days=int(getattr(args, "days", None) or cfg.flag_stale_days))
+                    )
+                ).mappings()
+                stale = [dict(r) for r in rows]
+            if not stale:
+                print("протухших флагов нет")
+                return 0
+            for row in stale:
+                print(
+                    f"  {row['key']} живёт на 100% {int(row['age_s']) // 86400} дн —"
+                    " удали вместе с кодом ветвления"
+                )
+            print("! флаг, откатывать который уже некого, — мусор; см. правило гигиены F6")
+            return 1
+        return 2
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ политика как код (F5)
+
+
+async def _cmd_policy(action: str, args: argparse.Namespace) -> int:
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if action == "lint":
+        from aegis.governance.policy_rules import (
+            default_ruleset,
+            load_ruleset,
+            lock_payload,
+            plan_change_vs_lock,
+        )
+
+        try:
+            file_rules = load_ruleset(cfg.policy_rules_path)
+        except Exception as exc:  # noqa: BLE001 - показать владельцу, что файл сломан
+            print(f"! {exc}", file=sys.stderr)
+            return 1
+        if file_rules is None:
+            print(f"файл правил не задан ({cfg.policy_rules_path}) — работает вшитый набор")
+            return 0
+        lock = lock_payload(cfg.policy_lock_path)
+        changes = plan_change_vs_lock(file_rules, lock, golden_rule_ids=_rule_golden_ids())
+        print(f"{file_rules.name}: {len(file_rules.rules)} правил, sha {file_rules.sha()}")
+        if not changes:
+            print("против lock-файла изменений нет")
+            return 0
+        for change in changes:
+            mark = "⚠️" if change.relaxed else "·"
+            print(f"  {mark} {change.id}: {change.kind} {change.old} → {change.new}")
+        bad = [c for c in changes if c.relaxed]
+        if bad:
+            print(
+                "! смягчение вердикта требует golden-кейса с этим id в evals/golden_v1.jsonl "
+                f"(не хватает: {', '.join(sorted({c.id for c in bad if True}))})",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    if action == "shadow":
+        from sqlalchemy import text
+
+        from aegis.agents.tools import load_builtin_tools
+        from aegis.agents.tools.registry import UnknownTool, registry
+        from aegis.governance.policy import PolicyEngine
+        from aegis.governance.policy_rules import default_ruleset, load_ruleset
+        from aegis.platform.db import session
+
+        load_builtin_tools()
+        file_rules = load_ruleset(cfg.policy_rules_path)
+        if file_rules is None:
+            print("теневой прогон бессмыслен без файла правил: задай AEGIS_POLICY_RULES_PATH")
+            return 2
+        builtin = PolicyEngine(
+            auto_allow_low_risk=cfg.auto_allow_low_risk, ruleset=default_ruleset()
+        )
+        loaded = PolicyEngine(auto_allow_low_risk=cfg.auto_allow_low_risk, ruleset=file_rules)
+        async with session() as s:
+            rows = (
+                await s.execute(
+                    text(
+                        "SELECT tool FROM governance.tool_runs"
+                        " GROUP BY tool ORDER BY max(id) DESC LIMIT :lim"
+                    ).bindparams(lim=max(1, min(500, int(getattr(args, "limit", 200) or 200))))
+                )
+            ).scalars()
+            tools = [t for t in rows if t]
+        diffs = 0
+        for tool in tools:
+            try:
+                spec = registry.get(tool)
+            except UnknownTool:
+                continue
+            ctx = {
+                "tool": tool,
+                "risk": str(spec.risk),
+                "writes": bool(spec.writes),
+                "source_trust": "owner",
+                "confidence": 1.0,
+                "kill_switch": False,
+                "idempotent": False,
+                "permission_missing": False,
+                "non_owner": False,
+                "budget_ratio": 0.0,
+                "auto_allow_low_risk": cfg.auto_allow_low_risk,
+            }
+            left, _ = builtin.ruleset.evaluate(ctx)
+            right, _ = loaded.ruleset.evaluate(ctx)
+            if (left.verdict if left else "deny") != (right.verdict if right else "deny"):
+                diffs += 1
+                print(
+                    f"  Δ {tool}: код → {left.verdict if left else 'deny'};"
+                    f" файл → {right.verdict if right else 'deny'}"
+                )
+        if diffs == 0:
+            print(
+                f"дельта с вшитым поведением: пусто на {len(tools)} инструментах — "
+                "файл можно включать"
+            )
+            return 0
+        print(f"дельта: {diffs} — сначала golden'ы на спорные переходы, потом включение")
+        return 1
+    return 2
+
+
+def _rule_golden_ids() -> list[str]:
+    """id правил, покрытые golden-кейсами смены политики (evals/golden_v1.jsonl kind=policy)."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[2]
+    out: list[str] = []
+    try:
+        lines = (root / "evals" / "golden_v1.jsonl").read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            case = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        if case.get("kind") == "policy-change":
+            out.append(str(case.get("rule") or case.get("id") or ""))
+    return out
+
+
+# ------------------------------------------------------------------ хранение (F3)
+
+
+async def _cmd_retention(action: str, args: argparse.Namespace) -> int:
+    from aegis.platform.config import settings
+
+    async def go() -> int:
+        cfg = settings()
+        from aegis.governance.retention import (
+            SqlHoldRepository,
+            active_holds,
+            apply_forget,
+            apply_retention,
+            keyring_status,
+            list_shreds,
+            load_retention_file,
+            plan_forget,
+            plan_retention,
+            rewrap_batch,
+        )
+
+        if action == "plan":
+            policy = load_retention_file(cfg.retention_file)
+            plan = await plan_retention(policy=policy)
+            if not plan:
+                days = ", ".join(f"{k}={v}д" for k, v in sorted(policy.days.items()))
+                print(f"удалять нечего; политики: {days or '—'}")
+                return 0
+            print("к удалению (план, ничего не тронуто):")
+            for row in plan:
+                blocked = row.get("blocked_by_holds") or []
+                line = (
+                    f"  {row.get('class')}: кандидатов {row.get('candidates')},"
+                    f" берём до {row.get('limited_to')}, cutoff {str(row.get('cutoff'))[:19]}"
+                )
+                if blocked:
+                    line += f" · hold'ы: {', '.join(map(str, blocked))}"
+                print(line)
+            print("apply без --execute — тот же план; удаление только с --execute")
+            return 0
+        if action == "apply":
+            policy = load_retention_file(cfg.retention_file)
+            result = await apply_retention(
+                policy=policy, dry_run=not args.execute, limit=int(args.limit)
+            )
+            print(result.summary() if hasattr(result, "summary") else result)
+            return 0
+        if action == "holds":
+            rows = await active_holds()
+            if not rows:
+                print("legal holds нет")
+                return 0
+            for row in rows:
+                print(f"  {row.get('scope')}={row.get('value')}: {row.get('reason')}")
+            return 0
+        if action == "hold":
+            scope, _, value = args.spec.partition("=")
+            if not value:
+                print("! формат: scope=value (principal=777 / class=journal)", file=sys.stderr)
+                return 2
+            if scope.strip() not in ("principal", "class"):
+                print(
+                    f"! scope {scope.strip()!r} nonexistent: legal_holds принимает"
+                    " principal и class — и это не придирка CLI, это CHECK в схеме",
+                    file=sys.stderr,
+                )
+                return 2
+            repo = SqlHoldRepository()
+            if args.release:
+                await repo.release(scope.strip(), value.strip(), by=1)
+                print(f"hold снят: {scope}={value}")
+            else:
+                await repo.place(scope.strip(), value.strip(), args.reason or "без причины", by=1)
+                print(f"hold выставлен: {scope}={value} — ротация эти строки не тронет")
+            return 0
+        if action == "forget":
+            plan = await plan_forget(int(args.owner_id))
+            print(plan.summary())
+            if not args.execute:
+                print("это план; --execute шредит DEK и пишет манифесты")
+                return 0
+            from aegis.governance.recorder import SqlDecisionRecorder
+
+            recorder = SqlDecisionRecorder(cfg)
+            result = await apply_forget(plan, recorder=recorder, dry_run=False)
+            print(result.summary() if hasattr(result, "summary") else result)
+            return 0
+        if action == "rewrap":
+            from aegis.platform.crypto import BlobCipher, load_keks
+
+            keks = load_keks(cfg)
+            if not keks:
+                print("! AEGIS_KEK не задан — перекручивать нечем", file=sys.stderr)
+                return 2
+            cipher = BlobCipher(keks, active_version=cfg.crypto_key_version)
+            done = await rewrap_batch(cipher, limit=int(cfg.rewrap_batch))
+            print(
+                f"re-wrap: {done.get('rewrapped', 0)} завернуто заново, "
+                f"осталось {done.get('remaining', '?')} (пачки по {cfg.rewrap_batch}, SKIP LOCKED)"
+            )
+            return 0
+        if action == "shreds":
+            rows = await list_shreds()
+            if not rows:
+                print("манифестов уничтожения нет")
+                return 0
+            for row in rows:
+                print(
+                    f"  {str(row['blob_sha'])[:12]} v{row['key_version']} {row['reason']} "
+                    f"({row['shredded_at']})"
+                )
+            return 0
+        if action == "keyring":
+            status = await keyring_status()
+            for row in status.get("keys", []):
+                print(
+                    f"  KEK v{row['version']}: блобов {row['blobs']}, "
+                    + ("активен" if row.get("active") else "на покое")
+                )
+            if not status.get("keys"):
+                print("ключей в keyring нет: шифрование выключено (CRYPTO_MODE=off/auto без KEK)")
+            return 0
+        return 2
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ события (F4)
+
+
+async def _cmd_events(action: str, args: argparse.Namespace) -> int:
+    from sqlalchemy import text
+
+    from aegis.platform.db import session
+    from aegis.platform.events.store import dlq_stats, replay_from_seq
+
+    async def go() -> int:
+        if action == "dlq":
+            stats = await dlq_stats()
+            print(
+                f"DLQ: всего {stats.get('total', 0)}, не разобрано {stats.get('new', 0)}; "
+                f"последняя причина: {stats.get('last_reason') or '—'}"
+            )
+            async with session() as s:
+                rows = (
+                    await s.execute(
+                        text(
+                            "SELECT reason, count(*)::int AS n FROM platform.event_dlq"
+                            " GROUP BY reason ORDER BY n DESC LIMIT 5"
+                        )
+                    )
+                ).mappings()
+                for row in rows:
+                    print(f"  {row['n']:>4} × {row['reason'][:110]}")
+            return 1 if stats.get("new") else 0
+        if action == "replay":
+            async with session() as s:
+                count = int(
+                    await s.scalar(
+                        text(
+                            """
+                            SELECT count(*)::int
+                            FROM platform.outbox o
+                            JOIN platform.events e ON e.id = o.event_id
+                            WHERE e.id >= :from_seq
+                              AND (CAST(:to_seq AS bigint) IS NULL OR e.id <= :to_seq)
+                              AND (CAST(:etype AS text) IS NULL OR e.event_type = :etype)
+                            """
+                        ).bindparams(
+                            from_seq=int(args.from_seq),
+                            to_seq=args.to_seq if args.to_seq is not None else None,
+                            etype=args.etype or None,
+                        )
+                    )
+                    or 0
+                )
+            print(f"под переигрывание подходит {count} событий с seq >= {args.from_seq}")
+            if not args.execute:
+                print("это план; --execute сбросит published_at (повторы режет UNIQUE event_id)")
+                return 0
+            reset = await replay_from_seq(
+                int(args.from_seq), to_seq=args.to_seq, event_type=args.etype
+            )
+            print(
+                f"возвращено в очередь: {reset} — доставка at-least-once, потребитель идемпотентен"
+            )
+            return 0
+        return 2
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ схема (F10)
+
+
+def _file_revisions() -> list[tuple[str, str | None]]:
+    import re as _re
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    out: list[tuple[str, str | None]] = []
+    for path in sorted(root.glob("0*.py")):
+        text_data = path.read_text(encoding="utf-8")
+        rev = _re.search(r'^revision(?:: str)? = "([^"]+)"', text_data, _re.M)
+        down = _re.search(
+            r'^down_revision(?:: str \| None)? = (?:"([^"]+)"|None)', text_data, _re.M
+        )
+        if rev:
+            out.append((rev.group(1), down.group(1) if down and down.group(1) else None))
+    return out
+
+
+async def _cmd_migrate(action: str, args: argparse.Namespace) -> int:
+    from sqlalchemy import text
+
+    from aegis.platform.db import session
+
+    async def go() -> int:
+        revs = _file_revisions()
+        head = revs[-1][0] if revs else "?"
+        try:
+            async with session() as s:
+                try:
+                    stamped = await s.scalar(text("SELECT version_num FROM alembic_version"))
+                except Exception:
+                    stamped = None
+                    await s.rollback()
+                pending: list[dict[str, Any]] = []
+                try:
+                    rows = (
+                        await s.execute(
+                            text(
+                                "SELECT name, status, rows_done, cursor->>'last_id' AS cursor"
+                                " FROM platform.backfills WHERE status <> 'done' ORDER BY name"
+                            )
+                        )
+                    ).mappings()
+                    pending = [dict(r) for r in rows]
+                except Exception:
+                    await s.rollback()
+                dangling: list[dict[str, Any]] = []
+                try:
+                    rows = (
+                        await s.execute(
+                            text(
+                                "SELECT table_schema||'.'||table_name||'.'||column_name AS col"
+                                " FROM information_schema.columns"
+                                " WHERE table_schema IN"
+                                "   ('platform','governance','knowledge','memory','planning')"
+                                "   AND is_nullable = 'NO' AND column_default IS NULL"
+                                "   AND table_name NOT LIKE '%_archive'"
+                            )
+                        )
+                    ).scalars()
+                    dangling = [{"col": c} for c in rows]
+                except Exception:
+                    await s.rollback()
+        except Exception as exc:  # noqa: BLE001 - единый ответ «база не отвечает»
+            print(f"! база не отвечает: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+            return 1
+        print(f"миграции: файлов {len(revs)}, head = {head}, в базе = {stamped or 'не проставлен'}")
+        if stamped and stamped != head:
+            print(f"  ! база отстаёт/не совпадает: {stamped} ≠ {head} — нагони alembic upgrade")
+        if pending:
+            print("незакрытые бэкфиллы:")
+            for row in pending:
+                print(
+                    f"  {row['name']} [{row['status']}] строк {row['rows_done']}"
+                    f", курсор {row.get('cursor') or '—'}"
+                )
+        else:
+            print("бэкфиллов в работе нет")
+        if dangling:
+            print(
+                f"NOT NULL без default: {len(dangling)} — при пере-накатке с нуля это ок,"
+                " на живой таблице = замок; список:"
+            )
+            for row in dangling[:12]:
+                print(f"  {row['col']}")
+        return 0
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ backfill (F10)
+
+
+async def _cmd_backfill(action: str, args: argparse.Namespace) -> int:
+    import os
+    import socket
+
+    from sqlalchemy import text
+
+    from aegis.platform.backfill import BACKFILL_SPECS, SqlBackfillStore
+    from aegis.platform.db import session
+
+    async def go() -> int:
+        store = SqlBackfillStore()
+        if action == "status":
+            jobs = await store.status()
+            if not jobs:
+                print("заданий нет: их регистрирует мигратор при expand-релизе")
+                return 0
+            for job in jobs:
+                spec = BACKFILL_SPECS.get(job.name)
+                remaining = None
+                if spec is not None:
+                    remaining = await store.count_remaining(spec)
+                print(
+                    f"  {job.name:<18} {job.status:<8} строк {job.rows_done:>8}"
+                    + (f", осталось {remaining}" if remaining is not None else "")
+                    + f" — {getattr(job, 'target', '')}"
+                )
+            return 0
+        if action == "pause":
+            store = SqlBackfillStore()
+            jobs = await store.status()
+            job = next((j for j in jobs if j.name == args.name), None)
+            if job is None:
+                print(f"! задания {args.name} нет в работе", file=sys.stderr)
+                return 2
+            await store.pause(job)
+            print(f"{args.name}: пауза — следующий claim его не возьмёт, прогресс сохранён")
+            return 0
+        if action == "run":
+            owner = f"cli:{socket.gethostname()}:{os.getpid()}"
+            moved_total = 0
+            for _ in range(max(1, int(args.rounds))):
+                job = await store.claim(
+                    owner=owner, lease_secs=int(args.lease_secs), name=args.name
+                )
+                if job is None:
+                    break
+                spec = BACKFILL_SPECS.get(job.name)
+                if spec is None:
+                    await store.fail(job, f"нет спека {job.name} в BACKFILL_SPECS")
+                    print(f"! {job.name}: спек пропал — помечено как fail", file=sys.stderr)
+                    continue
+                try:
+                    async with session() as s:
+                        result = await s.execute(
+                            text(spec.sql).bindparams(cursor=job.cursor or {}, limit=job.batch_size)
+                        )
+                        ids = [row[0] for row in result]
+                        rows_done = len(ids)
+                        new_cursor = {"last_id": ids[-1]} if ids else job.cursor
+                    await store.finish_batch(
+                        job, rows_done, new_cursor, more=rows_done >= job.batch_size
+                    )
+                    moved_total += rows_done
+                    print(f"  {job.name}: +{rows_done} (курсор {new_cursor.get('last_id', '—')})")
+                except Exception as exc:  # noqa: BLE001 - батч не роняет задание целиком
+                    await store.fail(job, repr(exc)[:300])
+                    print(f"! {job.name}: {repr(exc)[:200]} — лизинг освобождён", file=sys.stderr)
+            if moved_total == 0:
+                print("брать нечего: очередь пуста или всё на паузе")
+            return 0
+        return 2
+
+    return await _db_guard(go)
+
+
+# ------------------------------------------------------------------ SLO (F7)
+
+
+async def _cmd_slo(action: str, args: argparse.Namespace) -> int:
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if action == "alerts":
+        from aegis.platform.slo import load_slo_file, render_alerts
+
+        try:
+            slo_set = load_slo_file(cfg.slo_path)
+        except Exception as exc:  # noqa: BLE001 - показать, что файл кривой
+            print(f"! {exc}", file=sys.stderr)
+            return 1
+        body = render_alerts(slo_set)
+        if args.write:
+            written = await asyncio.to_thread(_write_text_file, args.write, body)
+            print(f"алерты записаны: {written}")
+        else:
+            print(body, end="")
+        return 0
+
+    async def go() -> int:
+        from aegis.platform.metrics import SqlMetricsStore
+        from aegis.platform.slo import evaluate_set, load_slo_file
+        from aegis.platform.slo_sources import collect_observations
+
+        try:
+            slo_set = load_slo_file(cfg.slo_path)
+        except FileNotFoundError:
+            print(f"SLO не заведены: {cfg.slo_path} отсутствует")
+            return 0
+        observations = await collect_observations(
+            slo_set,
+            window_minutes=cfg.slo_window_minutes,
+            metrics=SqlMetricsStore() if action == "tick" else None,
+        )
+        reports = evaluate_set(
+            slo_set,
+            {name: obs.window for name, obs in observations.items()},
+            short={name: obs.short for name, obs in observations.items() if obs.short},
+            long={name: obs.long for name, obs in observations.items() if obs.long},
+        )
+        from aegis.platform.slo import summarize
+
+        print(summarize(reports))
+        if action == "status":
+            return 1 if any(r.failing and r.page for r in reports) else 0
+        # tick: право переключать поведение — за env, не за нами
+        if not cfg.slo_enforce_degradation:
+            print("SLO_ENFORCE_DEGRADATION=false — деградацию не трогаю")
+            return 0
+        from aegis.governance.degradation import DegradationController, SqlOverrides
+
+        overrides = SqlOverrides()
+        if args.dry_run:
+            from aegis.platform.slo import desired_switches
+
+            wanted = desired_switches(reports)
+            print(
+                "включилось бы: "
+                + (", ".join(f"{k}=on" for k, v in wanted.items() if v) or "ничего")
+            )
+            return 0
+        from aegis.governance.recorder import SqlDecisionRecorder
+
+        controller = DegradationController(
+            overrides,
+            journal=SqlDecisionRecorder(cfg),
+            ttl_s=cfg.degradation_ttl_seconds,
+        )
+        changes = await controller.apply(reports)
+        for note in changes:
+            print(f"  {note}")
+        if not changes:
+            print("деградация не менялась: всё в бюджете или уже переключено")
+        return 1 if any(r.failing and r.page for r in reports) else 0
+
+    return await _db_guard(go)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -1107,6 +2025,22 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_outbox(args.outbox_action, args))
         if args.command == "export":
             return asyncio.run(_cmd_export(args.export_action, args))
+        if args.command == "principals":
+            return asyncio.run(_cmd_principals(args.principals_action, args))
+        if args.command == "flags":
+            return asyncio.run(_cmd_flags(args.flags_action, args))
+        if args.command == "policy":
+            return asyncio.run(_cmd_policy(args.policy_action, args))
+        if args.command == "retention":
+            return asyncio.run(_cmd_retention(args.retention_action, args))
+        if args.command == "events":
+            return asyncio.run(_cmd_events(args.events_action, args))
+        if args.command == "migrate":
+            return asyncio.run(_cmd_migrate(args.migrate_action, args))
+        if args.command == "backfill":
+            return asyncio.run(_cmd_backfill(args.backfill_action, args))
+        if args.command == "slo":
+            return asyncio.run(_cmd_slo(args.slo_action, args))
     except KeyboardInterrupt:
         print("остановлено", file=sys.stderr)
         return 130

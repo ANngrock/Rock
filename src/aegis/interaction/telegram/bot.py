@@ -720,6 +720,25 @@ def build_dispatcher(app: App) -> tuple[Bot, Dispatcher]:
     return bot, dp
 
 
+async def _metrics_flush_loop(app: App) -> None:
+    """Тик сброса метрик: registry процесса → platform.metric_samples.
+
+    Кумулятивные счётчики пишутся как есть: окно считается на чтении (period_end), поэтому
+    пропущенный тик — это «данные придут позже», а не «окно врёт».
+    """
+    interval = max(5, int(app.cfg.metrics_flush_seconds))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            samples = app.metrics.samples() if app.metrics is not None else []
+            if samples and app.metrics_store is not None:
+                await app.metrics_store.flush(samples)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — сбой записи метрик не повод терять бота
+            log.warning("metrics.flush_failed", err=repr(exc)[:200])
+
+
 async def main() -> None:
     from aegis.agents.tools.registry import registry
 
@@ -737,6 +756,11 @@ async def main() -> None:
         # Старт не блокируем: без схемы бот полезен, но оператор должен узнать сразу, а не по
         # «Сбой: ...» в каждом ответе (connect-ok != schema-ok).
         await app.probe_schema()
+    flush_task: asyncio.Task | None = None
+    if app.db_ready and int(getattr(app.cfg, "metrics_flush_seconds", 0) or 0) > 0:
+        # метрики живут в процессе; в БД попадает снапшот — «окно SLO» читается из metric_samples.
+        # Задача фоновая и молчаливая: наблюдаемость не имеет права уронить ответы (принцип 5)
+        flush_task = asyncio.create_task(_metrics_flush_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -752,6 +776,9 @@ async def main() -> None:
         print(f"! {name}: {hint}", file=sys.stderr)
         raise SystemExit(3) from exc
     finally:
+        if flush_task is not None:
+            flush_task.cancel()
+            await asyncio.gather(flush_task, return_exceptions=True)
         await app.aclose()
 
 
