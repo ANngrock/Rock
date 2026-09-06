@@ -45,6 +45,7 @@ class EventSink(Protocol):
         event_type: str,
         payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_id: int = 0,
     ) -> None: ...
 
 
@@ -57,6 +58,7 @@ class NullEventSink:
         event_type: str,
         payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_id: int = 0,
     ) -> None:
         return None
 
@@ -75,6 +77,7 @@ class InMemoryEventSink:
         event_type: str,
         payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_id: int = 0,
     ) -> None:
         self.events.append(
             {
@@ -82,6 +85,7 @@ class InMemoryEventSink:
                 "stream_id": stream_id,
                 "type": event_type,
                 "payload": payload or {},
+                "owner_id": owner_id,
             }
         )
 
@@ -95,6 +99,7 @@ class OutboxEventSink:
         event_type: str,
         payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_id: int = 0,
     ) -> None:
         async with session() as s:
             await EventStore(s).append(
@@ -103,6 +108,7 @@ class OutboxEventSink:
                 event_type=event_type,
                 payload=payload,
                 metadata=metadata,
+                owner_id=owner_id,
             )
 
 
@@ -139,6 +145,7 @@ class BestEffortEventSink:
         event_type: str,
         payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_id: int = 0,
     ) -> None:
         try:
             await self._inner.append(
@@ -147,6 +154,7 @@ class BestEffortEventSink:
                 event_type=event_type,
                 payload=payload,
                 metadata=metadata,
+                owner_id=owner_id,
             )
         except Exception as exc:  # noqa: BLE001 - трасса не должна ронять ответ владельцу
             # ВАЖНО: ключ `event` у structlog занят под текст сообщения — называть его

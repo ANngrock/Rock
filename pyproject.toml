@@ -23,6 +23,12 @@ dependencies = [
   "orjson>=3.10",
   "python-dateutil>=2.9",
   "pillow>=10.4",
+  # конвертовое шифрование (F3): AESGCM без самодеятельной криптографии
+  "cryptography>=42.0",
+  # контракт событий (F4): проверка envelope по JSON Schema
+  "jsonschema>=4.21",
+  # политика/ретеншен/SLO как код (F5/F3/F7): декларативные файлы читаются из YAML
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

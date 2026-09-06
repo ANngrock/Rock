@@ -219,6 +219,71 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
+    # --- актив-актив (F1): один ход на владельца, сериализуемый БД, а не «мы же один процесс» ---
+    #: минуты аренды открытого хода: упавший процесс освобождает место владельцу, не дожидаясь
+    #: ручной расчистки. Дальше этого срока ход считается осиротевшим
+    turn_lease_minutes: int = Field(default=15, ge=1, le=240)
+    #: сколько отложенных ходов разбирать за один проход (drain): «не потерять второй апдейт»
+    #: означает и «не устроить лавину» после простоя
+    turn_drain_limit: int = Field(default=3, ge=1, le=16)
+
+    # --- principals и RBAC (F2) ---
+    #: telegram id членов семьи/гостей через запятую: `42:member,77:guest`. Пусто — владелец один,
+    #: и гранты owner получает полностью (исторический режим «владелец и всё»)
+    principal_roster: str = ""
+    #: роль сессии для RLS: на проде — 'member'-подобные restricted-роли; superuser RLS обходит,
+    #: и doctor обязан это показывать, а не делать вид, что изоляция работает
+    rls_expected_role: str = "aegis_app"
+
+    # --- конвертовое шифрование (F3) ---
+    #: off — не шифровать (dev/тесты); auto — шифровать, если ключ задан; enforce —
+    #: шифровать всегда, без ключа приложение не стартует. «Тихо не шифруем, потому что
+    #: забыли ключ» — ровно тот
+    #: режим, в котором блок «зашифрован» перестаёт значить что-либо
+    crypto_mode: Literal["off", "auto", "enforce"] = "auto"
+    #: активный KEK: base64 от 32 байт (env AEGIS_KEK). Для ротации старые версии читаются как
+    #: AEGIS_KEK_V7 и т.д. — ключи в БД не лежат нигде
+    crypto_kek: SecretStr | None = None
+    crypto_key_version: int = Field(default=1, ge=1, le=10_000)
+    #: размер батча rewrap-прохода: те же аренды, что у напоминаний, и тот же потолок боли
+    rewrap_batch: int = Field(default=200, ge=10, le=5000)
+
+    # --- политика как код (F5) ---
+    #: декларативные правила; пусто/нет файла — встроенный набор (поведение до F5 не меняется)
+    policy_rules_path: str = "deploy/policy/rules.yml"
+    #: lock-файл предыдущей версии правил: гейт «ослабление без golden-кейса» сверяется с ним
+    policy_lock_path: str = "deploy/policy/rules.lock.json"
+
+    # --- флаги возможностей (F6) ---
+    #: старше этого возраста флаг на 100% обязан быть удалён (CI-гигиена)
+    flag_stale_days: int = Field(default=90, ge=7, le=365)
+    #: как часто перечитывать определения флагов из БД (секунды)
+    flags_cache_s: float = Field(default=30.0, ge=0.0, le=3600.0)
+
+    # --- SLO и право на деградацию (F7) ---
+    slo_path: str = "deploy/slo.yml"
+    #: разрешено ли приложению переключать ветки (стриминг/веб-инструменты) автоматически
+    slo_enforce_degradation: bool = True
+    #: окно наблюдения SLO (минуты): короче — дребезг, длиннее — деградация приходит после инцидента
+    slo_window_minutes: int = Field(default=60, ge=10, le=1440)
+
+    # --- воркфлоу хода (F8) ---
+    #: off — старый путь (супервизор сам); local — тот же код шагов через локальный воркфлоу-раннер;
+    #: temporal — Temporal-кластер. Отсутствие кластера — норма, не авария (ADR-0021)
+    workflow_mode: Literal["off", "local", "temporal"] = "off"
+    temporal_address: str = "localhost:7233"
+    temporal_namespace: str = "aegis"
+
+    # --- качество поиска (F9) ---
+    #: кандидатов на ветку перед fusion; reranker всегда смотрит не больше rerank_limit
+    search_candidates: int = Field(default=40, ge=5, le=500)
+    rerank_limit: int = Field(default=20, ge=1, le=100)
+    #: off — только гибрид; lexical — детерминированный реранк; model — доп. вызов судьи (дорого)
+    rerank_mode: Literal["off", "lexical", "model"] = "lexical"
+    #: константа reciprocal-rank fusion; 60 — значение из оригинальной статьи, менять просто
+    #: так нельзя
+    rrf_k: int = Field(default=60, ge=1, le=1000)
+
     @field_validator("timezone")
     @classmethod
     def _check_tz(cls, v: str) -> str:
@@ -312,6 +377,11 @@ class Settings(BaseSettings):
                 "ENV=prod не может работать с kv_backend="
                 + self.kv_backend
                 + ": состояние сессий и дневной бюджет обязаны переживать рестарт процесса"
+            )
+        if self.crypto_mode == "enforce" and self.crypto_kek is None:
+            raise ConfigError(
+                "CRYPTO_MODE=enforce требует AEGIS_KEK (base64, 32 байта). Иначе «зашифровано» "
+                "означало бы «как повезёт с env» — enforce и есть способ не позволить этого"
             )
         return self
 

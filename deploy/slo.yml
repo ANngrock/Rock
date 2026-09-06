@@ -1,0 +1,77 @@
+# SLO как код (F7). Единственный источник правды: и цели, и burn-rate, и право на деградацию.
+# Алерт-правила — артефакт: `aegis slo alerts` перегенерирует deploy/slo.alerts.yml, CI сверяет,
+# что committed-файл не отстал. Менять objective, не трогая алерты, не выйдет.
+#
+# indicator.type:
+#   ratio     — доля «хороших» событий за окно (source считается в platform/slo_sources.py);
+#   quantile  — перцентиль длительности (metric + threshold в единицах метрики).
+# degrade — ветки приложения, которые деградация имеет право переключить при провале
+#   (см. SUPPORTED_SWITCHES в aegis.platform.slo). Пусто — «только сигнал, без автоматики»:
+#   для outbox это принципиально: отсечка ретраев не является деградацией ответа.
+version: 1
+slos:
+  - name: turn-latency-p95
+    description: "p95 хода (запрос → готовый ответ) не дольше 8 секунд"
+    objective: 0.95
+    indicator:
+      type: quantile
+      metric: agent.turn.latency_ms
+      quantile: 0.95
+      threshold: 8000
+    window_days: 28
+    burn_rates:
+      - {severity: page, windows: 1h,5m, budget_fraction: 14.4}
+      - {severity: ticket, windows: 6h,30m, budget_fraction: 6}
+    degrade: [fast_route_only]
+
+  - name: stream-abort-rate
+    description: "обрванный стрим (edit 4xx/timeout) — не чаще 2% ответов с живым ответом"
+    objective: 0.98
+    indicator:
+      type: ratio
+      metric: telegram.stream.completed
+      source: counter
+      bad_counter: telegram.stream.aborted
+    window_days: 28
+    burn_rates:
+      - {severity: page, windows: 1h,5m, budget_fraction: 14.4}
+      - {severity: ticket, windows: 6h,30m, budget_fraction: 6}
+    degrade: [streaming]
+
+  - name: outbox-lag-p95
+    description: "95% событий публикуются из outbox за 60 секунд"
+    objective: 0.95
+    indicator:
+      type: quantile
+      metric: events.outbox_publish_lag_s
+      quantile: 0.95
+      threshold: 60
+    window_days: 28
+    burn_rates:
+      - {severity: ticket, windows: 6h,30m, budget_fraction: 6}
+    degrade: []
+
+  - name: unverified-answer-share
+    description: "доля ответов, не сверенных с источниками без явной причины, ≤ 10%"
+    objective: 0.90
+    indicator:
+      type: ratio
+      metric: answer.verified
+      source: journal
+      unverified_note: "деградация или verify_enabled=false — не провал, а известное состояние"
+    window_days: 28
+    burn_rates:
+      - {severity: ticket, windows: 6h,30m, budget_fraction: 6}
+    degrade: [verify]
+
+  - name: tool-failure-rate
+    description: "инструменты падают не чаще 1% вызовов"
+    objective: 0.99
+    indicator:
+      type: ratio
+      metric: tool.result
+      source: journal
+    window_days: 28
+    burn_rates:
+      - {severity: ticket, windows: 6h,30m, budget_fraction: 6}
+    degrade: [web_tools]

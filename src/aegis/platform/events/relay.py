@@ -38,6 +38,7 @@ __all__ = [
     "Transport",
     "drain",
     "encode_event",
+    "prepare_event",
     "subject_for",
 ]
 
@@ -76,6 +77,11 @@ def encode_event(row: dict[str, Any]) -> bytes:
 
     `event_id` и `version` — то, по чему потребитель дедуплицирует повторную доставку и что стоит
     положить в заголовок `Nats-Msg-Id`; без них получатель вынужден сравнивать тела.
+
+    F4: `event_type` и `schema_version` — контрактные поля, по ним подписчик решает, какую
+    payload-схему применять. Старые ключи (`type`, `metadata`) остаются как дубли:
+    потребители шага 2 читают `type`, и «переименовали тихо» — breaking change,
+    которого не будет.
     """
     meta = row.get("metadata") or {}
     return orjson.dumps(
@@ -85,12 +91,67 @@ def encode_event(row: dict[str, Any]) -> bytes:
             "stream_id": row.get("stream_id"),
             "version": row.get("version"),
             "type": row.get("event_type"),
+            "event_type": row.get("event_type"),
+            "schema_version": int(row.get("schema_version") or 1),
             "occurred_at": meta.get("occurred_at"),
             "payload": row.get("payload") or {},
             "metadata": meta,
             "outbox_id": row.get("outbox_id"),
         }
     )
+
+
+def _uuidish(value: str) -> str:
+    """uuid есть uuid; нет — детерминированный uuid5 от исходного id.
+
+    Дедупликация потребителя требует UUID-формата: «ev-12» или пустой id строки превращали бы
+    каждый повтор доставки в «новый факт». Детерминизм важен: uuid5 от того же id одинаков на
+    всех попытках — replay остаётся идемпотентным без реестра замен.
+    """
+    import uuid  # noqa: PLC0415
+
+    text = (value or "").strip()
+    try:
+        return str(uuid.UUID(text))
+    except ValueError:
+        dns = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"  # NAMESPACE_DNS — стабильный якорь
+        return str(uuid.uuid5(uuid.UUID(dns), f"aegis-outbox:{text}"))
+
+
+def prepare_event(row: dict[str, Any]) -> tuple[bytes, list[str]]:
+    """Собрать канонический конверт И проверить его о контракт. (body, errors).
+
+    Проверка на публикации, а не на вставке: outbox пишет домен, и «контракт ужесточили —
+    домен упал» переложил бы вину на стреляющего. Здесь же изоляция яда: невалидное событие
+    не уходит (иначе отравленный подписчик вечно его переигрывает), а едет на DLQ-путь.
+
+    Тело = канонический envelope + legacy-дубли (`type`, `metadata`, `outbox_id`): новые поля
+    появляются, старые не исчезают — «тихий rename» и есть тот breaking change, от которого
+    контракт защищает.
+    """
+    from aegis.platform.events.contracts import build_envelope, validate_envelope  # noqa: PLC0415
+
+    legacy = orjson.loads(encode_event(row))
+    meta = dict(legacy.get("metadata") or {})
+    occurred_at = str(legacy.get("occurred_at") or "")
+    if not occurred_at or occurred_at == "None":
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        occurred_at = datetime.now(UTC).isoformat()
+    envelope = build_envelope(
+        event_id=_uuidish(str(legacy.get("event_id") or "")),
+        event_type=str(legacy.get("event_type") or legacy.get("type") or ""),
+        schema_version=int(legacy.get("schema_version") or 1),
+        occurred_at=occurred_at,
+        stream_type=str(legacy.get("stream_type") or "event"),
+        stream_id=str(legacy.get("stream_id") or "?"),
+        version=int(legacy.get("version") or 1),
+        payload=dict(legacy.get("payload") or {}),
+        causation_id=meta.get("causation_id"),
+    )
+    errors = validate_envelope(envelope)
+    body = orjson.dumps(envelope | {"metadata": meta, "outbox_id": legacy.get("outbox_id")})
+    return body, errors
 
 
 class NullTransport:
@@ -130,6 +191,7 @@ class RelayReport:
     fetched: int = 0
     stuck: int = 0
     pending: int = 0
+    dlq: int = 0
     dry_run: bool = False
     stopped: str | None = None
 
@@ -150,6 +212,8 @@ class RelayReport:
             base += f"; не доставлено: {self.failed} — останутся в очереди на следующий тик"
         if self.stuck:
             base += f"; ⚠️ {self.stuck} исчерпали попытки — нужна реакция"
+        if self.dlq:
+            base += f"; в DLQ за этот тик: {self.dlq}"
         if self.stopped:
             base += f"\n  остановлено: {self.stopped}"
         return base
@@ -201,8 +265,26 @@ async def drain(
         )
 
     published_ids: list[int] = []
+    dlq_moves = 0
     stopped: str | None = None
     for row in rows:
+        outbox_id = int(row["outbox_id"])
+        try:
+            body, contract_errors = prepare_event(row)
+        except Exception as exc:  # noqa: BLE001 - тело без конверта — яд
+            await _discard(
+                store, outbox_id, f"envelope не собран: {type(exc).__name__}: {str(exc)[:200]}", row
+            )
+            continue
+        if contract_errors:
+            # контракт нарушен издателем: это не «попробовать ещё раз» — транспорт тут ни при чём.
+            # Прямиком в DLQ, и очередь не стоит на этой строке (то, для чего max_attempts не
+            # хватило: schema-ошибка не «отвалится» через 8 тиков)
+            await _discard(
+                store, outbox_id, "contract: " + "; ".join(contract_errors[:3])[:600], row
+            )
+            dlq_moves += 1
+            continue
         subject = subject_for(
             str(row.get("stream_type") or "event"),
             str(row.get("stream_id") or "?"),
@@ -210,12 +292,16 @@ async def drain(
             prefix=prefix,
         )
         try:
-            await transport.publish(subject, encode_event(row))
+            await transport.publish(subject, body)
         except Exception as exc:  # noqa: BLE001 - транспорт лежит: остаток пакета не трогаем
-            await _mark_failed(store, int(row["outbox_id"]), exc)
+            await _mark_failed(store, outbox_id, exc)
+            attempts = int(row.get("attempts") or 0) + 1
+            if attempts >= int(max_attempts):
+                await _discard(store, outbox_id, f"исчерпаны попытки: {type(exc).__name__}", row)
+                dlq_moves += 1
             stopped = f"публикация не удалась: {type(exc).__name__}: {str(exc)[:180]}"
             break
-        published_ids.append(int(row["outbox_id"]))
+        published_ids.append(outbox_id)
 
     if published_ids:
         await store.mark_published(published_ids)
@@ -223,12 +309,14 @@ async def drain(
         pending, stuck = await _counts(store, max_attempts)
     return RelayReport(
         published=len(published_ids),
-        # не доставлено = всё, что не удалось отметить опубликованным: и упавшая строка, и остаток
-        # пакета после обрыва — иначе «сбоев: 1» маскировало бы «тик простоял впустую»
-        failed=len(rows) - len(published_ids),
+        # не доставлено = всё, что не удалось отметить опубликованным (кроме осознанно
+        # отбракованного в DLQ): и упавшая строка, и остаток пакета после обрыва — иначе «сбоев: 1»
+        # маскировало бы «тик простоял впустую»
+        failed=max(len(rows) - len(published_ids) - dlq_moves, 0),
         fetched=len(rows),
         stuck=stuck,
         pending=pending,
+        dlq=dlq_moves,
         dry_run=False,
         stopped=stopped,
     )
@@ -242,3 +330,23 @@ async def _mark_failed(store: Any, outbox_id: int, exc: BaseException) -> None:
         await mark(outbox_id, f"{type(exc).__name__}: {str(exc)[:500]}")
     except Exception as inner:  # noqa: BLE001 - счётчик попыток важнее, чем его собственная ошибка
         log.warning("outbox.mark_failed_error", err=repr(inner)[:200])
+
+
+async def _discard(store: Any, outbox_id: int, reason: str, row: dict[str, Any]) -> None:
+    """В DLQ. Магазины без DLQ (тестовые двойники прошлой эпохи) получают только mark_failed:
+    тихое «ничего» здесь хуже исключения — яд так и крутился бы в очереди. Поэтому, если ни
+    move_to_dlq, ни mark_failed нет, ошибка наружу: relay обязан сказать, что не умеет
+    утилизировать.
+    """
+    move = getattr(store, "move_to_dlq", None)
+    if move is not None:
+        await move(
+            outbox_id, reason, {"row": row, "encoded": encode_event(row).decode("utf-8", "replace")}
+        )
+        log.warning("outbox.moved_to_dlq", outbox_id=outbox_id, reason=reason[:200])
+        return
+    mark = getattr(store, "mark_failed", None)
+    if mark is None:
+        raise RelayUnavailable(f"некуда деть отбракованное событие {outbox_id}: {reason[:200]}")
+    await mark(outbox_id, reason)
+    log.warning("outbox.rejected_without_dlq", outbox_id=outbox_id, reason=reason[:200])

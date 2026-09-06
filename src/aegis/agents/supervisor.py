@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -40,12 +40,23 @@ from aegis.agents.tools.registry import (
 )
 from aegis.agents.verify import Verifier
 from aegis.governance.audit import AuditLog, NullAudit
+from aegis.governance.degradation import Overrides
 from aegis.governance.killswitch import KillSwitch
 from aegis.governance.policy import ActionContext, Decision, PolicyEngine
+from aegis.governance.principals import (
+    PrincipalGovernance,
+    PrincipalSnapshot,
+    parse_roster,
+    permission_for_tool,
+    resolve_principal,
+    snapshot_for,
+)
 from aegis.governance.recorder import DecisionRecorder, NullDecisionRecorder
+from aegis.governance.turns import NullTurnLedger, TurnBusy, TurnHandle, TurnLedger
 from aegis.platform.canonical import sha256_hex
 from aegis.platform.config import Settings, settings
 from aegis.platform.events.sink import EventSink, NullEventSink
+from aegis.platform.flags import FlagEngine
 from aegis.platform.gateway.client import ChatResult, ModelUnavailable
 from aegis.platform.gateway.cost import BudgetExceeded
 from aegis.platform.gateway.diagnose import diagnose, gateway_auth_hint
@@ -80,12 +91,22 @@ CHEAP_HINT = re.compile(r"(коротко|в одно слово|без анал
 
 @dataclass(slots=True)
 class Inbound:
-    """Сообщение владельца (+ вложения). ``source_trust`` — кто является инициатором текста."""
+    """Сообщение владельца (+ вложения). ``source_trust`` — кто является инициатором текста.
+
+    ``actor_id`` (F2) — кто СПРОСИЛ; ``owner_id`` — чьи данные обрабатываются. Пока бот
+    одновладелец, они совпадают; с появлением членов семьи расхождение обязано различаться
+    и в журнале, и в правах (actor не получает доступ к чужому «потому что бот так умеет»).
+    """
 
     text: str
     owner_id: int
     attachments: list[Attachment] = field(default_factory=list)
     source_trust: Literal["owner", "untrusted", "system"] = "owner"
+    actor_id: int | None = None
+
+    @property
+    def actor(self) -> int:
+        return int(self.actor_id if self.actor_id is not None else self.owner_id)
 
 
 @dataclass(slots=True)
@@ -95,6 +116,9 @@ class PendingAction:
     call_id: str
     reason: str
     risk: str = "none"
+    #: сработавшее правило (F5): «rule@version» уезжает в снимок и возвращается в журнал
+    #  после подтверждения — иначе подтверждённый шаг выглядит безымянным
+    rule: str = ""
 
     def render(self) -> str:
         args_json = orjson.dumps(self.args, option=orjson.OPT_INDENT_2).decode()
@@ -116,6 +140,12 @@ class Reply:
     cost_usd: float = 0.0
     iterations: int = 0
     degraded: bool = False
+    #: ход поставлен в очередь «один на владельца» (F1) — не потерян, а ждёт своего прохода
+    queued: bool = False
+    #: отказ, который имеет смысл обжаловать владельцу (F5): бот добавит кнопку апелляции
+    appealable: bool = False
+    #: ход исполнялся через воркфлоу-раннер (F8): видно в журнале и в /status
+    workflow: str = ""
 
     @property
     def needs_confirmation(self) -> bool:
@@ -145,6 +175,13 @@ class Supervisor:
         audit: AuditLog | None = None,
         kill_switch: KillSwitch | None = None,
         recorder: DecisionRecorder | None = None,
+        turns: TurnLedger | None = None,
+        flags: FlagEngine | None = None,
+        overrides: Overrides | None = None,
+        principals: Any = None,
+        governance: PrincipalGovernance | None = None,
+        metrics: Any = None,
+        activity_ledger: Any = None,
     ) -> None:
         self.services = services
         self.registry = registry
@@ -162,17 +199,84 @@ class Supervisor:
         self.repro: DecisionRecorder = recorder or NullDecisionRecorder()
         #: KV упал в этом процессе? Честно показываем в /status, а не молча «забываем» историю
         self.kv_degraded = False
+        # --- шаг 2.5: параллельность, права, флаги, деградация, идемпотентность ---
+        #: тот же ledger, что у рекордера: «открытый ход» и очередь — одна правда на оба глаза
+        self.turns: TurnLedger = turns or getattr(self.repro, "turns", None) or _memory_turns()
+        self.flags = flags
+        self.overrides = overrides
+        self.principals = principals
+        self.governance = governance
+        self.metrics = metrics
+        #: реестр исполненных активностей (F8): «платёж не уйдёт дважды» после краха процесса
+        self.activity_ledger = activity_ledger
+        #: кеш runtime-overrides на время хода: 40 запросов на tool_call — не «свежесть любой ценой»
+        self._overrides_cache: dict[str, Any] = {}
+        self._overrides_at = 0.0
+        self._degrade_notes: set[str] = set()
 
     # ------------------------------------------------ public
 
     async def handle(self, msg: Inbound, *, on_delta: TextSink | None = None) -> Reply:
         trace_id = str(uuid.uuid4())
-        bind_contextvars(trace_id=trace_id, owner_id=msg.owner_id)
+        bind_contextvars(trace_id=trace_id, owner_id=msg.owner_id, actor_id=msg.actor)
+        # F1: «один ход на владельца» — заявка в БД, а не «мы же один процесс». Пока активен
+        # чужой ход, это сообщение СТАВИТСЯ В ОЧЕРЕДЬ и будет разобрано drain'ом: апдейт не
+        # теряется ни при каком исходе, включая падение процесса на середине чужого хода
+        handle: TurnHandle | None = None
+        try:
+            handle = await self.turns.begin(
+                trace_id,
+                owner_id=msg.owner_id,
+                prompt_ids=[],
+                tools_schema_sha=None,
+            )
+        except TurnBusy:
+            await self.turns.enqueue(
+                msg.owner_id,
+                trace_id=trace_id,
+                kind="message",
+                payload={
+                    "text": (msg.text or "")[:8000],
+                    "actor_id": msg.actor,
+                    "source_trust": msg.source_trust,
+                },
+            )
+            backlog = await self.turns.queue_count(msg.owner_id)
+            return Reply(
+                text=f"Текущий ещё исполняется — добавил это в очередь (позиция {backlog}).",
+                trace_id=trace_id,
+                queued=True,
+            )
+        # F2: кто спросил и что ему можно; F7: что приложение деградировало прямо сейчас
+        snapshot = await self._principal_snapshot(msg)
+        if not snapshot.principal.usable or snapshot.kill_active:
+            # персональный kill: ход не исполняется вовсе. Отказ текстом, а не тихое молчание:
+            # «бот не отвечает гостю» без объяснения — это инцидент, который никто не найдёт
+            await self.turns.finish(trace_id, handle.fencing_token if handle else None)
+            reason = str(snapshot.killed.get("reason") or "приостановлено владельцем")
+            return Reply(
+                text=f"Мои ответы для тебя на паузе: {reason}. Снятие — только у владельца.",
+                trace_id=trace_id,
+                degraded=True,
+            )
+        if snapshot.budget_exhausted and not snapshot.principal.is_owner:
+            await self.turns.finish(trace_id, handle.fencing_token if handle else None)
+            limit = float(snapshot.budget_limit or 0.0)
+            return Reply(
+                text=(
+                    f"Личный лимит на день (${limit:.2f}) исчерпан — умные ответы "
+                    "на паузе до завтра. Чтение, заметки и команды работают."
+                ),
+                trace_id=trace_id,
+                degraded=True,
+            )
+        flags = await self._flag_snapshot(msg.actor)
+        overrides = await self._runtime_overrides()
         level = await self._degradation_level()
-        route = self._route(msg, level=level)
+        route = self._route(msg, level=level, overrides=overrides)
         # level передаётся явно: route() и системный промпт должны видеть один и тот же бюджет
         log.info("supervisor.route", role=route.role, thinking=route.thinking, reason=route.reason)
-        system = await self._system_message(level=level)
+        system = await self._system_message(level=level, overrides=overrides)
         messages: list[dict[str, Any]] = [
             system,
             *await self._history(msg.owner_id),
@@ -200,12 +304,18 @@ class Supervisor:
                 "sources": [],
             },
         )
-        self.repro.begin_turn(
+        await self.repro.begin_turn(
             trace_id,
             owner_id=msg.owner_id,
             prompt_ids=prompt_ids,
             tools_schema_sha=self.registry.schema_sha(),
         )
+        # номер шага и «чем вооружён ход» теперь на строке заявки; токен — в extras: ему
+        # сверяются advance/finish (fencing: украденная аренда не двигает чужой счётчик)
+        ctx.extras["fencing"] = handle.fencing_token if handle else None
+        ctx.extras["flags"] = flags
+        ctx.extras["principal"] = snapshot.principal
+        ctx.extras["budget_ratio"] = snapshot.ratio()
         await self._event(
             owner_id=msg.owner_id,
             event_type="conversation.turn_received",
@@ -228,15 +338,19 @@ class Supervisor:
                 await self._record_turn(ctx, messages, fast, route=route)
                 return fast
             reply = await self._guarded_loop(messages, ctx, route=route, on_delta=on_delta)
+            # F5: любой отказ в этом ходу (не только pending) даёт право на апелляцию владельцу
+            if ctx.extras.get("appealable") and not reply.needs_confirmation:
+                reply.appealable = True
             await self._verify_reply(reply, ctx, question=msg.text)
             notes = _notes_of(ctx)
             _append_notices(reply, ctx)
             await self._save_history(msg.owner_id, messages, final_text=reply.text)
             reply.trace_id = trace_id
             await self._record_turn(ctx, messages, reply, route=route, notes=notes)
+            self._observe_turn(ctx, reply)
             return reply
         finally:
-            self.repro.end_turn(trace_id)
+            await self._end_turn(trace_id, handle)
 
     async def resume(self, pending_id: str, approved: bool, owner_id: int) -> Reply:
         """Продолжение прерванного хода после решения владельца (ADR-006)."""
@@ -269,8 +383,14 @@ class Supervisor:
             },
         )
         # ход продолжает уже начатую трассу: без этого «до» и «после подтверждения» выглядели бы
-        # как два несвязанных ответа, а это ровно тот случай, где владельца интересует причина
-        self.repro.begin_turn(trace_id, owner_id=owner_id, tools_schema_sha=None)
+        # как два несвязанных ответа, а это ровно тот случай, где владельца интересует причина.
+        # F1: та же trace_id переоткрывает заявку (status finished→active) с НОВЫМ токеном:
+        # старый процесс, если он чудом жив, больше не сможет закрыть этот ход «своим» токеном
+        handle = await self.repro.begin_turn(trace_id, owner_id=owner_id, tools_schema_sha=None)
+        ctx.extras["fencing"] = handle.fencing_token if handle else None
+        # журнал продолжения помнит, ЧЕЙ запрос исполняется (actor — не всегда владелец: гость
+        # попросил, владелец подтвердил; у replay/бюджета это разные строки)
+        ctx.extras["actor_id"] = snapshot.get("actor_id", owner_id)
 
         for action in actions:
             tool = str(action["tool"])
@@ -304,9 +424,10 @@ class Supervisor:
             await self._save_history(owner_id, messages, final_text=reply.text)
             reply.trace_id = trace_id
             await self._record_turn(ctx, messages, reply, route=route, notes=notes)
+            self._observe_turn(ctx, reply)
             return reply
         finally:
-            self.repro.end_turn(trace_id)
+            await self._end_turn(trace_id, handle)
 
     async def reset(self, owner_id: int) -> None:
         await self._kv("history.delete", self.kv.delete(history_key(owner_id)), 0)
@@ -352,7 +473,28 @@ class Supervisor:
             # расписание: «3 запланировано, 1 просрочено» — это диагноз тика. Без него «напоминание
             # не пришло» означает «иди читай таблицу»
             "reminders": await _reminders_status(self.services.reminders, self.cfg),
+            # F1/F7: «два процесса дерутся за владельца» и «мы прямо сейчас деградированы» —
+            # то, без чего инцидент начинается с чтения логов
+            "turns": await self._turns_status(),
+            "degradation": await self._degradation_status(),
+            "workflow_mode": str(getattr(self.cfg, "workflow_mode", "off")),
         }
+
+    async def _turns_status(self) -> dict[str, Any]:
+        try:
+            data = await self.turns.status()
+        except Exception as exc:  # noqa: BLE001 - статус не имеет права падать
+            return {"error": f"{type(exc).__name__}: {exc}"[:160]}
+        return {"durable": bool(self.turns.durable), **data}
+
+    async def _degradation_status(self) -> dict[str, Any]:
+        if self.overrides is None:
+            return {"enabled": False}
+        try:
+            active = await self.overrides.list_active()
+        except Exception as exc:  # noqa: BLE001
+            return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"[:160]}
+        return {"enabled": True, "active": list(active)}
 
     # ------------------------------------------------ роутинг
 
@@ -360,8 +502,15 @@ class Supervisor:
         """Публичная точка маршрутизации — её же дёргают evals и (позже) Temporal-activity."""
         return self._route(msg, level=await self._degradation_level())
 
-    def _route(self, msg: Inbound, *, level: int) -> Route:
+    def _route(
+        self, msg: Inbound, *, level: int, overrides: Mapping[str, Any] | None = None
+    ) -> Route:
         text = (msg.text or "").strip()
+        # F7: «только дешёвый путь» — решение БЕЗ LLM-классификатора (принцип 5: деградация
+        # не должна сама стоить вызова модели). Классификатор остаётся фолбэком, если строка
+        # всё же короткая: fast и так fast
+        if overrides and overrides.get("route.force_fast"):
+            return Route("fast", bool(msg.attachments), False, "degraded:fast_only")
         if msg.attachments:
             return Route("brain", True, level < 1, "есть вложение: нужен analyze_image + brain")
         if SMALLTALK.match(text):
@@ -448,6 +597,9 @@ class Supervisor:
             tools_schema_sha=self.registry.schema_sha() if route.tools else None,
             route=f"{route.role}:{route.reason}",
             notes=notes,
+            flags=dict(ctx.extras.get("flags") or {}),
+            actor_id=ctx.extras.get("actor_id"),
+            degraded=reply.degraded or bool(ctx.extras.get("degraded")),
         )
 
     async def _degradation_level(self) -> int:
@@ -517,9 +669,10 @@ class Supervisor:
         iterations = 0
         for _ in range(self.cfg.max_iterations):
             iterations += 1
-            # номер шага ведёт рекордер: локальный счётчик расходится с журналом, если ход начался
-            # без begin_turn (resume, деградация) — тогда step=0 и мы откатываемся на итерацию
-            step = self.repro.turn_step(ctx.trace_id) or iterations
+            # номер шага ведёт ledger: локальный счётчик расходится с журналом, если ход начался
+            # без begin_turn (resume, деградация) — тогда step=0 и мы откатываемся на итерацию.
+            # fencing-токен обязателен: украденная (просроченная) аренда не двигает чужой шаг
+            step = await self.repro.turn_step(ctx.trace_id, ctx.extras.get("fencing")) or iterations
             ctx.extras["turn_no"] = step
             call_kwargs: dict[str, Any] = {
                 "tools": self.registry.schemas() if route.tools else None,
@@ -527,8 +680,10 @@ class Supervisor:
                 "trace_id": ctx.trace_id,
             }
             # стриминг включён, только если интерфейс реально куда-то текст досылает: иначе это был
-            # бы «стрим ради стрима» — та же задержка до ответа и лишний риск на оборванный поток
-            sink = on_delta if self.cfg.stream_replies else None
+            # бы «стрим ради стрима» — та же задержка до ответа и лишний риск на оборванный поток.
+            # F6/F7: право голоса теперь не только у env — флаг telegram.stream_replies (каталог)
+            # и runtime-override деградации SLO могут выключить стрим на живую, без рестарта
+            sink = on_delta if await self._stream_allowed(ctx) else None
             if sink is None:
                 res: ChatResult = await self.services.gateway.chat(
                     route.role, messages, **call_kwargs
@@ -558,20 +713,22 @@ class Supervisor:
                 except (UnknownTool, ValueError) as exc:
                     messages.append(_tool_message(call.id, f"ERROR: инструмент недоступен: {exc}"))
                     continue
-                decision, reason = self.policy.decide(
-                    ActionContext(
-                        tool=spec.name,
-                        risk=spec.risk,
-                        writes=spec.writes,
-                        source_trust=ctx.source_trust,
-                        args=args,
-                        kill_switch=kill_active,
-                    )
+                decision, reason, rule_tag = self._decide(
+                    ctx,
+                    spec,
+                    args,
+                    kill_active=kill_active,
+                    snapshot=ctx.extras.get("principal_snapshot"),
                 )
                 await self._event(
                     owner_id=ctx.owner_id,
                     event_type="policy.decision",
-                    payload={"tool": spec.name, "decision": str(decision), "reason": reason},
+                    payload={
+                        "tool": spec.name,
+                        "decision": str(decision),
+                        "reason": reason,
+                        "rule": rule_tag,
+                    },
                 )
                 await self.repro.policy(
                     trace_id=ctx.trace_id,
@@ -581,10 +738,18 @@ class Supervisor:
                     decision=str(decision),
                     reason=reason,
                     risk=str(spec.risk),
+                    rule=rule_tag,
+                    actor_id=ctx.extras.get("actor_id"),
                 )
                 if decision is Decision.DENY:
                     messages.append(_tool_message(call.id, f"DENIED: {reason}"))
                     await self._audit_tool(ctx, spec.name, args, "deny", reason, ok=True)
+                    # F5: отказ — не приговор без права голоса. Гость/член семьи может
+                    # обжаловать владельцу (inline-кнопка → on_confirm владельца уже построен)
+                    ctx.extras["appealable"] = bool(
+                        ctx.extras.get("actor_id") is not None
+                        and int(ctx.extras.get("actor_id") or 0) != int(ctx.owner_id)
+                    )
                     continue
                 if decision is Decision.CONFIRM:
                     # placeholder обязателен: у каждого tool_call должен быть свой tool-ответ
@@ -595,6 +760,7 @@ class Supervisor:
                             call_id=call.id,
                             reason=reason,
                             risk=str(spec.risk),
+                            rule=rule_tag,
                         )
                     )
                     messages.append(_tool_message(call.id, CONFIRM_PLACEHOLDER))
@@ -605,7 +771,10 @@ class Supervisor:
                 messages.append(_tool_message(call.id, _tool_text(call.name, out)))
 
             if pending:
-                return await self._request_confirmation(messages, ctx, pending)
+                reply = await self._request_confirmation(messages, ctx, pending)
+                if ctx.extras.get("appealable") and reply.pending:
+                    reply.appealable = True
+                return reply
         return Reply(
             text=(
                 f"Не уложился в {self.cfg.max_iterations} шагов: задача больше, чем один проход. "
@@ -628,9 +797,18 @@ class Supervisor:
         payload = {
             "pid": pending_id,
             "owner_id": ctx.owner_id,
+            # F2: чей запрос ждёт подтверждения — резолвер (кнопка) принадлежит владельцу,
+            # но «кто попросил» не должно стираться кнопкой
+            "actor_id": ctx.extras.get("actor_id"),
             "trace_id": ctx.trace_id,
             "actions": [
-                {"tool": p.tool, "args": p.args, "call_id": p.call_id, "reason": p.reason}
+                {
+                    "tool": p.tool,
+                    "args": p.args,
+                    "call_id": p.call_id,
+                    "reason": p.reason,
+                    "rule": p.rule,
+                }
                 for p in pending
             ],
             # снимок пройдёт через orjson: только JSON-совместимые значения
@@ -677,9 +855,26 @@ class Supervisor:
         и «насколько этому можно верить» — разные вещи, и вторая без первой бесполезна.
         """
         spec = self.registry.get(tool)
+        # F7: «web tools → не найдено» — объявленная деградация исполняется ЗДЕСЬ, до handler:
+        # выключенный инструмент не должен ниNetworking, ни платить за транспорт; ответ —
+        # честная строка для модели, а не исключение (модель продолжит без веба)
+        overrides = ctx.extras.get("overrides") or await self._runtime_overrides()
+        if overrides.get("tools.web.enabled") is False and _is_web_tool(spec):
+            self._note_degraded("tools.web.enabled", ctx)
+            return ToolResult(
+                content=(
+                    "Веб-инструменты деградированы (расход SLO-бюджета): ничего не найдено. "
+                    "Это не ошибка запроса — попробуй заметки/память или ответь без веба."
+                ),
+                trust="system",
+            )
         started = time.perf_counter()
+
+        async def _run() -> ToolResult:
+            return ToolResult.coerce(await spec.handler(spec.args.model_validate(args), ctx))
+
         try:
-            out = ToolResult.coerce(await spec.handler(spec.args.model_validate(args), ctx))
+            out = await self._run_once(ctx, spec, args, _run)
         except Exception as exc:  # noqa: BLE001 - ошибка инструмента уходит модели как данные, не как 500
             log.exception("tool.failed", tool=tool)
             await self._audit_tool(ctx, tool, args, decision, repr(exc), ok=False)
@@ -713,6 +908,7 @@ class Supervisor:
             decision=decision,
             ok=True,
             latency_ms=int((time.perf_counter() - started) * 1000),
+            actor_id=ctx.extras.get("actor_id"),
         )
         if out.is_untrusted:
             # Верификатору нужно СЫРЬЁ, а не остаток после разметки: сверяем ответ с тем, что вернул
@@ -720,6 +916,221 @@ class Supervisor:
             ctx.extras.setdefault("sources", []).append(out.content)
             out = await self._quarantine(tool, out, ctx)
         return out
+
+    # ---------------- ----------- параллельность / права / флаги / деградация / идемпотентность
+
+    async def _principal_snapshot(self, msg: Inbound) -> PrincipalSnapshot:
+        """Кто спросил, что ему можно и сколько он уже потратил. Одна сборка на ход.
+
+        Офлайн (без principals-магазина) — синтетический владелец: resolve_principal без БД
+        строит Principal из конфига-росера, а snapshot_for без governance даёт только fallback-
+        лимит. Смысл: путь через права проходит ВСЕГДА, «тесты без БД» не должны исполнять
+        другой код (иначе RLS-логика проверялась бы только на проде).
+        """
+        roster: dict[int, Any] = {}
+        raw_roster = str(getattr(self.cfg, "principal_roster", "") or "")
+        if raw_roster:
+            try:
+                roster = parse_roster(raw_roster)
+            except Exception as exc:  # noqa: BLE001 - кривой конфиг не должен валить ход
+                log.warning("principals.roster_invalid", err=repr(exc)[:160])
+        principal = await resolve_principal(
+            self.principals, msg.actor, owner_id=msg.owner_id, roster=roster
+        )
+        snapshot = await snapshot_for(
+            self.governance,
+            principal,
+            fallback_limit=float(getattr(self.cfg, "principal_daily_budget_usd", 0.0) or 0.0)
+            or None,
+        )
+        return snapshot
+
+    async def _flag_snapshot(self, actor_id: int) -> dict[str, Any]:
+        """Снимок флагов хода (F6). Пустой — если источник не подключён: «не проверяли», не
+        «выключено»."""
+        if self.flags is None:
+            return {}
+        try:
+            snap = await self.flags.snapshot(actor_id)
+        except Exception as exc:  # noqa: BLE001 - флаг не имеет права валить ход; но видно в логе
+            log.warning("flags.snapshot_failed", err=repr(exc)[:200])
+            return {}
+        return {key: dec.journal_value() for key, dec in snap.items()}
+
+    async def _runtime_overrides(self) -> dict[str, Any]:
+        """Деградационные переопределения (F7) с TTL-кэшем на 5 секунд.
+
+        Кэш — не лень, а порядок цены: overrides читаются на каждый tool_call и каждый
+        candidate-фильтр; 40 маленьких SELECT на ход превратили бы деградацию в новый источник
+        лаг-метрики. 5 секунд — компромисс «включили деградацию → через 5 секунд вся ферма».
+        """
+        if self.overrides is None:
+            return {}
+        now = time.monotonic()
+        if now - self._overrides_at < 5.0 and self._overrides_at > 0:
+            return self._overrides_cache
+        try:
+            loaded = dict(await self.overrides.load())
+        except Exception as exc:  # noqa: BLE001 — override-читалка не может уронить ответ
+            log.warning("overrides.load_failed", err=repr(exc)[:200])
+            return self._overrides_cache or {}
+        self._overrides_cache = loaded
+        self._overrides_at = now
+        return loaded
+
+    async def _stream_allowed(self, ctx: ToolContext) -> bool:
+        """Стримить или нет: env-настройка → флаг каталога → override деградации (в таком
+        приоритете).
+
+        Флаг может и ВКЛЮЧИТЬ стрим там, где env его не просил (конверсия по перцентилю), и
+        выключить живьём. Override — только выключает: «SLO горит» не может быть перебит флагом.
+        """
+        if not self.cfg.stream_replies:
+            return False
+        flags = ctx.extras.get("flags") or {}
+        decision = flags.get("telegram.stream_replies")
+        if isinstance(decision, Mapping) and decision.get("src") == "db":
+            if not decision.get("on", True):
+                return False
+        overrides = ctx.extras.get("overrides")
+        if overrides is None:
+            overrides = await self._runtime_overrides()
+            ctx.extras["overrides"] = overrides
+        if overrides.get("telegram.stream_replies") is False:
+            return False
+        return True
+
+    async def allow_streaming(self, owner_id: int, actor_id: int | None = None) -> bool:
+        """Вопрос «открывать ли стрим-ответ» ДО входа в ход — его задаёт бот."""
+        flags = await self._flag_snapshot(int(actor_id if actor_id is not None else owner_id))
+        decision = flags.get("telegram.stream_replies")
+        if (
+            isinstance(decision, Mapping)
+            and decision.get("src") == "db"
+            and not decision.get("on", True)
+        ):
+            return False
+        overrides = await self._runtime_overrides()
+        return (
+            bool(self.cfg.stream_replies) and overrides.get("telegram.stream_replies") is not False
+        )
+
+    def _decide(
+        self,
+        ctx: ToolContext,
+        spec: Any,
+        args: dict[str, Any],
+        *,
+        kill_active: bool,
+        snapshot: PrincipalSnapshot | None,
+    ) -> tuple[Decision, str, str]:
+        """Policy-решение с RBAC-входом (F2+F5). Возвращает (решение, причина, тег правила)."""
+        principal = snapshot.principal if snapshot is not None else None
+        required = permission_for_tool(spec.name, writes=bool(spec.writes))
+        missing = bool(principal is not None and required and not principal.can(required))
+        outcome = self.policy.decide_full(
+            ActionContext(
+                tool=spec.name,
+                risk=spec.risk,
+                writes=bool(spec.writes),
+                source_trust=ctx.source_trust,
+                args=args,
+                kill_switch=bool(kill_active) or bool(snapshot and snapshot.kill_active),
+                required_action=required,
+                permission_missing=missing,
+                non_owner=principal is not None and not principal.is_owner,
+                budget_ratio=float(ctx.extras.get("budget_ratio") or 0.0),
+            )
+        )
+        return outcome.decision, outcome.reason, outcome.rule
+
+    async def _run_once(
+        self, ctx: ToolContext, spec: Any, args: dict[str, Any], fn: Any
+    ) -> ToolResult:
+        """Идемпотентность побочного эффекта (F8): activity_id = trace+шаг+инструмент.
+
+        Реестр говорит «это уже исполнено с результатом R» — handler НЕ зовётся повторно:
+        платёж не уйдёт дважды после краха на середине хода. Реестра нет (Null/durable=False) —
+        просто исполняем; идемпотентность не может быть условием работы, только гарантией.
+        """
+        ledger = self.activity_ledger
+        mode = str(getattr(self.cfg, "workflow_mode", "off"))
+        if ledger is None or mode == "off":
+            return await fn()
+        from aegis.workflows.ledger import run_once  # noqa: PLC0415
+
+        step_no = int(ctx.extras.get("turn_no", 0))
+        activity_id = f"{ctx.trace_id}:{step_no}:tool:{spec.name}"
+
+        async def _boxed() -> dict[str, Any]:
+            return _result_json(await fn())
+
+        outcome = await run_once(
+            ledger,
+            activity_id,
+            _boxed,
+            trace_id=ctx.trace_id,
+            fencing_token=int(ctx.extras.get("fencing") or 0),
+        )
+        if outcome.state == "running":
+            return ToolResult(
+                content=(
+                    "Этот шаг уже исполняется другим воркером; повторный эффект не запущен "
+                    "(дедупликация по activity id — как задумано в durable-режиме)."
+                ),
+                trust="system",
+            )
+        return _result_from_json(outcome.result)
+
+    def _note_degraded(self, switch: str, ctx: ToolContext) -> None:
+        """Одно упоминание деградации на ход — в notices и в extras['degraded'] (в журнал)."""
+        ctx.extras["degraded"] = True
+        if switch in self._degrade_notes:
+            return
+        self._degrade_notes.add(switch)
+        ctx.extras.setdefault("notices", []).append(f"деградация по SLO: {switch}")
+
+    async def _end_turn(self, trace_id: str, handle: TurnHandle | None) -> None:
+        """Финал хода: закрыть заявку (токеном) — очередь разбирает бот, не этот процесс."""
+        try:
+            await self.repro.end_turn(trace_id, handle.fencing_token if handle else None)
+        except Exception as exc:  # noqa: BLE001 - финал не имеет права затмить ответ
+            log.warning("turn.finish_failed", err=repr(exc)[:200])
+
+    async def drain_next(self, owner_id: int) -> Inbound | None:
+        """Очередь «один ход на владельца»: следующий сообщивший (F1). Пусто — None, без лжи."""
+        item = await self.turns.pop_next(owner_id)
+        if item is None:
+            return None
+        await self.turns.close_item(item.queue_id)
+        payload = dict(item.payload or {})
+        return Inbound(
+            text=str(payload.get("text") or ""),
+            owner_id=owner_id,
+            source_trust=str(payload.get("source_trust") or "owner"),  # type: ignore[arg-type]
+            actor_id=int(payload["actor_id"]) if payload.get("actor_id") is not None else None,
+        )
+
+    def _observe_turn(self, ctx: ToolContext, reply: Reply) -> None:
+        """Метрики хода (F7): длительность + счётчик. Без реестра — no-op, не исключение."""
+        if self.metrics is None:
+            return
+        try:
+            started = float(ctx.extras.get("started_at") or 0.0)
+            if started:
+                self.metrics.histogram(
+                    "aegis.turn.seconds",
+                    help="время хода от входа до ответа",
+                ).observe(max(time.perf_counter() - started, 0.0))
+            self.metrics.counter("aegis.turn.total").inc(
+                1.0,
+                **{
+                    "queued": str(bool(reply.queued)).lower(),
+                    "degraded": str(bool(reply.degraded)).lower(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - метрика не роняет ответ
+            log.warning("metrics.observe_failed", err=repr(exc)[:160])
 
     # ------------------------------------------------ промпт и память
 
@@ -732,6 +1143,11 @@ class Supervisor:
         """
         sources = [str(item) for item in (ctx.extras.get("sources") or []) if str(item).strip()]
         if ctx.extras.get("degraded") or reply.degraded or not sources or not reply.text:
+            return
+        # F7: «verify» — из объявленных переключателей деградации: сверка стоит отдельный
+        # LLM-вызов, и сжигающий бюджет сервис вправе его отключить (не «украсить», а отключить)
+        if (ctx.extras.get("overrides") or {}).get("answer.verify.enabled") is False:
+            self._note_degraded("answer.verify.enabled", ctx)
             return
         if not self.verifier.should_verify(answer=reply.text, sources=sources):
             return
@@ -810,7 +1226,9 @@ class Supervisor:
             ref_id=out.ref_id,
         )
 
-    async def _system_message(self, *, level: int) -> dict[str, str]:
+    async def _system_message(
+        self, *, level: int, overrides: Mapping[str, Any] | None = None
+    ) -> dict[str, str]:
         notes: list[str] = []
         facts: list[str] = []
         try:
@@ -821,6 +1239,11 @@ class Supervisor:
             notes.append("kill switch активен: записи запрещены, работай только на чтение")
         if level >= 1:
             notes.append("бюджет близок к лимиту: отвечай короче, инструментов — минимум")
+        if overrides and overrides.get("tools.web.enabled") is False:
+            notes.append(
+                "веб-инструменты деградированы (SLO-бюджет): они вернут «не найдено»; "
+                "не обещай актуальных данных из веба, помечай неуверенность явно"
+            )
         tools = [(t.name, t.description) for t in self.registry.all() if t.enabled]
         return {
             "role": "system",
@@ -965,6 +1388,39 @@ class Supervisor:
 
 
 # --------------------------------------------------------------- helpers
+
+
+def _result_json(out: ToolResult) -> dict[str, Any]:
+    """ToolResult → то, что переживёт рестарт процесса (jsonb в реестре активностей)."""
+    return {"content": out.content, "trust": out.trust, "source": out.source}
+
+
+def _result_from_json(data: Mapping[str, Any]) -> ToolResult:
+    return ToolResult(
+        content=str(data.get("content") or ""),
+        trust=str(data.get("trust") or "system"),  # type: ignore[arg-type]
+        source=str(data.get("source") or ""),
+    )
+
+
+_WEB_TOOL_PREFIXES = ("web", "search", "fetch", "news", "rates")
+
+
+def _is_web_tool(spec: Any) -> bool:
+    """«Веб-инструмент» для выключателя деградации — по имени и флагу untrusted-источника.
+
+    Список не магический: внешний источник = сеть; локальные инструменты (notes, memory,
+    reminders) при «веб лежит» обязаны работать — в этом весь смысл graceful degradation.
+    """
+    name = str(getattr(spec, "name", "")).lower()
+    if any(part in name for part in _WEB_TOOL_PREFIXES):
+        return True
+    return bool(getattr(spec, "is_external", False))
+
+
+def _memory_turns() -> TurnLedger:
+    """Офлайн-режим: очередь и заявки живут в процессе. durable=False видно в /status."""
+    return NullTurnLedger()
 
 
 def _notes_of(ctx: ToolContext) -> list[str]:

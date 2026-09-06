@@ -12,6 +12,11 @@
 3. **Воспроизводимость.** По записи собирается тот же запрос и прогоняется с замороженными
    результатами инструментов (:mod:`aegis.governance.replay`).
 
+Параллельность (F1): «открытый ход» — строка ``governance.turn_claims`` с fencing token, а не
+словарь процесса: два экземпляра бота на одной базе видят один и тот же счётчик шагов, а рестарт
+не обнуляет ход. Всё, что в памяти, — только кеш чтения (``failures``); провозглашается
+волатильным и видно в ``/status``.
+
 Два правила, от которых зависит, будет это доказательством или косметикой:
 
 * журнал append-only на уровне БД (миграция ``0002``), и цепочку мы не «чиним» задним числом: обрыв
@@ -27,13 +32,13 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from time import monotonic
 from typing import Any, Literal, Protocol
 
 import orjson
 import structlog
 from sqlalchemy import text
 
+from aegis.governance.turns import NullTurnLedger, SqlTurnLedger, TurnHandle, TurnLedger
 from aegis.platform.canonical import canonical_bytes, sha256_bytes
 from aegis.platform.config import Settings, settings
 from aegis.platform.db import SessionFactory, session
@@ -43,6 +48,7 @@ __all__ = [
     "AnchorReport",
     "BlobRef",
     "BlobStore",
+    "purgeable_blob_ids",
     "ChainReport",
     "DecisionRecorder",
     "NullDecisionRecorder",
@@ -81,7 +87,9 @@ _HASHED_FIELDS: tuple[str, ...] = (
     "prev_hash",
 )
 
-RecordKind = Literal["llm_call", "tool_run", "policy", "turn_summary", "verdict"]
+RecordKind = Literal[
+    "llm_call", "tool_run", "policy", "turn_summary", "verdict", "system", "tombstone"
+]
 
 #: Сколько незакрытых ходов держим в памяти для корреляции «вызов модели ↔ шаг хода». Личный бот
 #: столько не открывает одновременно, но утечка из-за одного неудачного `finally` была бы хуже.
@@ -225,18 +233,18 @@ class DecisionRecorder(Protocol):
     @property
     def enabled(self) -> bool: ...
 
-    def begin_turn(
+    async def begin_turn(
         self,
         trace_id: str,
         *,
         owner_id: int,
         prompt_ids: Sequence[Mapping[str, Any]] = (),
         tools_schema_sha: bytes | None = None,
-    ) -> None: ...
+    ) -> TurnHandle | None: ...
 
-    def end_turn(self, trace_id: str) -> None: ...
+    async def end_turn(self, trace_id: str, fencing_token: int | None = None) -> None: ...
 
-    def turn_step(self, trace_id: str) -> int: ...
+    async def turn_step(self, trace_id: str, fencing_token: int | None = None) -> int: ...
 
     async def on_llm_call(
         self,
@@ -261,6 +269,7 @@ class DecisionRecorder(Protocol):
         decision: str,
         ok: bool,
         latency_ms: int = 0,
+        actor_id: int | None = None,
     ) -> None: ...
 
     async def policy(
@@ -273,6 +282,17 @@ class DecisionRecorder(Protocol):
         decision: str,
         reason: str,
         risk: str = "",
+        rule: str = "",
+        actor_id: int | None = None,
+    ) -> None: ...
+
+    async def system_event(
+        self,
+        *,
+        owner_id: int,
+        note: str,
+        params: Mapping[str, Any] | None = None,
+        kind: RecordKind = "system",
     ) -> None: ...
 
     async def verdict(
@@ -308,6 +328,9 @@ class DecisionRecorder(Protocol):
         tools_schema_sha: bytes | None = None,
         route: str = "",
         notes: Sequence[str] = (),
+        flags: Mapping[str, Any] | None = None,
+        actor_id: int | None = None,
+        degraded: bool = False,
     ) -> None: ...
 
     async def verify(
@@ -328,23 +351,33 @@ class DecisionRecorder(Protocol):
 
 
 class NullDecisionRecorder:
-    """Без БД воспроизводимость физически невозможна — и это надо сказать, а не сделать вид."""
+    """Без БД воспроизводимость физически невозможна — и это надо сказать, а не сделать вид.
 
-    def __init__(self) -> None:
+    Шаги хода всё равно считаются (NullTurnLedger в памяти): без номеров шагов журнал
+    превращался бы в кашу и в «демо без базы». Честность здесь — в ``enabled=False`` и
+    ``durable=False``: и то, и другое видно владельцу, а не только программисту.
+    """
+
+    def __init__(self, turns: TurnLedger | None = None) -> None:
         self.failures = 0
+        self._turns: TurnLedger = turns or NullTurnLedger()
 
     @property
     def enabled(self) -> bool:
         return False
 
-    def begin_turn(self, *args: Any, **kwargs: Any) -> None:
-        return None
+    @property
+    def durable(self) -> bool:
+        return False
 
-    def end_turn(self, *args: Any, **kwargs: Any) -> None:
-        return None
+    async def begin_turn(self, *args: Any, **kwargs: Any) -> TurnHandle | None:
+        return await self._turns.begin(*args, **kwargs)
 
-    def turn_step(self, trace_id: str) -> int:
-        return 0
+    async def end_turn(self, trace_id: str, fencing_token: int | None = None) -> None:
+        await self._turns.finish(trace_id, fencing_token)
+
+    async def turn_step(self, trace_id: str, fencing_token: int | None = None) -> int:
+        return await self._turns.advance(trace_id, fencing_token)
 
     async def on_llm_call(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -390,6 +423,9 @@ class SqlDecisionRecorder:
 
     Репозиторий, а не сервис: никаких знаний о том, что такое «ход агента». Supervisor вызывает его
     точечно и не может сломать ответ владельца — ошибки записью в ``failures`` и всё.
+
+    Открытый ход и счётчик шагов живут в :mod:`aegis.governance.turns` (Postgres, fencing token),
+    а не в словаре процесса: второй экземпляр видит тот же счётчик, а рестарт не обнуляет ход.
     """
 
     def __init__(
@@ -398,69 +434,73 @@ class SqlDecisionRecorder:
         *,
         session_factory: SessionFactory | None = None,
         blobs: BlobStore | None = None,
+        turns: TurnLedger | None = None,
     ) -> None:
         self.cfg = cfg or settings()
         self._sm = session_factory
-        self.blobs = blobs or BlobStore(session_factory, max_bytes=self.cfg.repro_max_blob_bytes)
+        self.blobs = blobs or BlobStore(
+            session_factory,
+            max_bytes=self.cfg.repro_max_blob_bytes,
+            cipher=_cipher_from(cfg or self.cfg),
+        )
         self.failures = 0
-        #: открытые ходы: trace_id → {owner_id, prompt_ids, tools_schema_sha, step, opened_at}.
-        #  Шлюз зовёт on_llm_call и не знает ни владельца, ни версии промпта: эти вещи живут здесь,
-        #  иначе корреляция «шаг хода ↔ вызов модели» свелась бы к угадыванию по времени.
-        self._turns: dict[str, dict[str, Any]] = {}
+        self._turns: TurnLedger = turns or SqlTurnLedger(
+            session_factory=session_factory, lease_minutes=self.cfg.turn_lease_minutes
+        )
 
     @property
     def enabled(self) -> bool:
         return True
 
+    @property
+    def durable(self) -> bool:
+        return self._turns.durable
+
+    @property
+    def turns(self) -> TurnLedger:
+        """Наружу — чтобы supervisor ставил в очередь через тот же ledger, что и открывает ход."""
+        return self._turns
+
     # ------------------------------------------------ ход (корреляция вызовов модели)
 
-    def begin_turn(
+    async def begin_turn(
         self,
         trace_id: str,
         *,
         owner_id: int,
         prompt_ids: Sequence[Mapping[str, Any]] = (),
         tools_schema_sha: bytes | None = None,
-    ) -> None:
+    ) -> TurnHandle | None:
+        """Открыть ход; ``TurnBusy`` уходит наружу — у владельца уже есть активный ход.
+
+        Шлюз зовёт ``on_llm_call`` и не знает ни владельца, ни версии промпта: эти вещи лежат на
+        строке заявки (``governance.turn_claims``), иначе корреляция «шаг хода ↔ вызов модели»
+        свелась бы к угадыванию по времени — и между двумя процессами в частности.
+        """
         if not _is_uuid(trace_id):
-            return
-        self._sweep_turns()
-        self._turns[trace_id] = {
-            "owner_id": int(owner_id),
-            "prompt_ids": [dict(item) for item in prompt_ids],
-            "tools_schema_sha": tools_schema_sha,
-            "step": 0,
-            "opened_at": monotonic(),
-        }
+            return None
+        return await self._turns.begin(
+            trace_id,
+            owner_id=int(owner_id),
+            prompt_ids=prompt_ids,
+            tools_schema_sha=tools_schema_sha,
+        )
 
-    def end_turn(self, trace_id: str) -> None:
-        self._turns.pop(trace_id, None)
+    async def end_turn(self, trace_id: str, fencing_token: int | None = None) -> None:
+        await self._turns.finish(trace_id, fencing_token)
 
-    def turn_step(self, trace_id: str) -> int:
+    async def turn_step(self, trace_id: str, fencing_token: int | None = None) -> int:
         """Начать новый шаг хода и вернуть его номер: 1, 2, 3 …
 
         Нужен, чтобы ``llm_call``, ``policy`` и ``tool_run`` одного хода читались как
         последовательность, а не как три кучи с общим trace_id. Нумерация с единицы: ``0`` в журнале
-        означает «шаг не размечен» (ход без begin_turn), и смешивать это с первым шагом нельзя.
+        означает «шаг не размечен» (ход без begin_turn или украденная аренда), и смешивать это с
+        первым шагом нельзя.
         """
-        turn = self._turns.get(trace_id)
-        if turn is None:
-            return 0
-        step = int(turn["step"]) + 1
-        turn["step"] = step
-        return step
-
-    def _sweep_turns(self) -> None:
-        now = monotonic()
-        stale = [
-            key
-            for key, turn in self._turns.items()
-            if now - float(turn.get("opened_at", now)) > _TURN_STALE_S
-        ]
-        for key in stale:
-            self._turns.pop(key, None)
-        while len(self._turns) > _MAX_OPEN_TURNS:
-            self._turns.pop(next(iter(self._turns)))
+        if fencing_token is None:
+            ctx = await self._turns.peek(trace_id)
+            return int(ctx["step"]) if ctx else 0
+        return await self._turns.advance(trace_id, fencing_token)
 
     # ------------------------------------------------ запись
 
@@ -481,7 +521,7 @@ class SqlDecisionRecorder:
         trace = str(getattr(record, "trace_id", "") or "")
         if not _is_uuid(trace):
             return
-        open_turn = self._turns.get(trace) or {}
+        open_turn = await self._turns.peek(trace) or {}
         owner_id = int(open_turn.get("owner_id") or owner_id)
         if turn_no is None:
             turn_no = int(open_turn.get("step", 0) or 0)
@@ -540,6 +580,7 @@ class SqlDecisionRecorder:
         decision: str,
         ok: bool,
         latency_ms: int = 0,
+        actor_id: int | None = None,
     ) -> None:
         """Вызов инструмента: аргументы, результат и доверие к нему — всё отдельно от пересказа."""
         if not _is_uuid(trace_id):
@@ -551,6 +592,7 @@ class SqlDecisionRecorder:
             "turn_no": int(turn_no),
             "kind": "tool_run",
             "owner_id": int(owner_id),
+            "actor_id": actor_id,
             "prompt_ids": [],
             "tools_schema_sha": None,
             "model": None,
@@ -585,8 +627,15 @@ class SqlDecisionRecorder:
         decision: str,
         reason: str,
         risk: str = "",
+        rule: str = "",
+        actor_id: int | None = None,
     ) -> None:
-        """Решение политики — записью, а не строкой в логе: «кто решил» должно читаться годами."""
+        """Решение политики — записью, а не строкой в логе: «кто решил» должно читаться годами.
+
+        ``rule`` — ``rule_id@version`` из декларативного набора (F5): по нему и пересобирается
+        «что изменилось бы», если бы правило было другим. ``actor_id`` — кто спросил, отдельно от
+        ``owner_id`` (чьи данные): после появления членов семьи эти числа начинают различаться.
+        """
         if not _is_uuid(trace_id):
             return
         await self._append(
@@ -596,15 +645,50 @@ class SqlDecisionRecorder:
                 "turn_no": int(turn_no),
                 "kind": "policy",
                 "owner_id": int(owner_id),
+                "actor_id": actor_id,
                 "prompt_ids": [],
                 "tools_schema_sha": None,
                 "model": None,
                 "params": {"tool": tool, "risk": risk},
-                "policy": {"decision": decision, "reason": reason[:600]},
+                "policy": {"decision": decision, "reason": reason[:600], "rule": rule or None},
                 "cost_usd": "0.000000",
                 "latency_ms": 0,
                 "truncated": False,
                 "note": None,
+            }
+        )
+
+    async def system_event(
+        self,
+        *,
+        owner_id: int,
+        note: str,
+        params: Mapping[str, Any] | None = None,
+        kind: RecordKind = "system",
+    ) -> None:
+        """Событие приложения в том же журнале, что и ходы: деградация, ротация ключей, purge.
+
+        «Факт деградации попадает в журнал, а не только в метрику» (F7) — иначе через месяц
+        никто не отличит «стриминг был выключён SLO» от «кто-то выставил флаг руками».
+        trace_id фиктивный-детерминированный: запись принадлежит не ходу, а системе, и
+        притворяться чужим трассировочным id она не обязана.
+        """
+        await self._append(
+            {
+                "id": str(uuid.uuid4()),
+                "trace_id": uuid.uuid5(uuid.NAMESPACE_DNS, f"aegis:system:{kind}").hex,
+                "turn_no": 0,
+                "kind": kind,
+                "owner_id": int(owner_id),
+                "prompt_ids": [],
+                "tools_schema_sha": None,
+                "model": None,
+                "params": dict(params or {}),
+                "policy": None,
+                "cost_usd": "0.000000",
+                "latency_ms": 0,
+                "truncated": False,
+                "note": note[:600],
             }
         )
 
@@ -676,20 +760,34 @@ class SqlDecisionRecorder:
         tools_schema_sha: bytes | None = None,
         route: str = "",
         notes: Sequence[str] = (),
+        flags: Mapping[str, Any] | None = None,
+        actor_id: int | None = None,
+        degraded: bool = False,
     ) -> None:
-        """Итог хода: собранный вход целиком и то, что ответили. Это и есть «воспроизведи меня»."""
+        """Итог хода: собранный вход целиком и то, что ответили. Это и есть «воспроизведи меня».
+
+        ``flags`` — оценка флага/флага на момент хода (F6): без неё «в каком режиме отвечал этот
+        ход» из журнала не восстановить, а A/B и «почему стало хуже» отвечаются именно пересчётом
+        журнала. Popadaet в ``params``, то есть под хэш: режим ответа — часть доказательства.
+        """
         if not _is_uuid(trace_id):
             return
+        record_params: dict[str, Any] = {"iterations": int(iterations), "route": route}
+        if degraded:
+            record_params["degraded"] = True
+        if flags:
+            record_params["flags"] = {str(k): _flag_state(v) for k, v in dict(flags).items()}
         payload: dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "trace_id": trace_id,
             "turn_no": int(turn_no),
             "kind": "turn_summary",
             "owner_id": int(owner_id),
+            "actor_id": actor_id,
             "prompt_ids": [dict(item) for item in prompt_ids],
             "tools_schema_sha": _sha_bytes(tools_schema_sha),
             "model": model,
-            "params": {"iterations": int(iterations), "route": route},
+            "params": record_params,
             "policy": None,
             "cost_usd": _money(cost_usd),
             "latency_ms": int(latency_ms),
@@ -929,6 +1027,74 @@ class SqlDecisionRecorder:
         log.warning("repro.failed", where=where, err=repr(exc)[:300], trace_id=trace)
 
 
+def _flag_state(value: Any) -> Any:
+    """Оценка флага в журнал — компактно и без objects-repr.
+
+    :class:`~aegis.platform.flags.FlagDecision` знает свою форму сама; dict проходит как есть;
+    прочее — bool/int, «как оно в конфиге», в журнал не пишется: читать его придётся через год.
+    """
+    dump = getattr(value, "journal_value", None)
+    if callable(dump):
+        result: dict[str, Any] = dump()
+        return result
+    if isinstance(value, dict):
+        return {str(k): _flag_state(v) for k, v in value.items()}
+    if isinstance(value, bool | int | str | float):
+        return value
+    return str(value)[:120]
+
+
+def _cipher_from(cfg: Settings) -> Any:
+    """Ключарка для блобов; ``crypto_mode=off`` (dev/тесты) — None, шифрование выключено вовсе."""
+    mode = getattr(cfg, "crypto_mode", "auto")
+    if mode == "off":
+        return None
+    from aegis.platform.crypto import BlobCipher, load_keks  # noqa: PLC0415 — опциональный путь
+
+    keks = load_keks(cfg)
+    if not keks:
+        if mode == "enforce":
+            raise RuntimeError("CRYPTO_MODE=enforce, но AEGIS_KEK не задан")
+        return None
+    return BlobCipher(keks, active_version=cfg.crypto_key_version)
+
+
+async def purgeable_blob_ids(
+    owner_id: int,
+    *,
+    session_factory: SessionFactory | None = None,
+    limit: int = 500,
+) -> list[bytes]:
+    """Блобы, на которые ссылается ТОЛЬКО этот владелец: кандидаты на крипто-стирание (F3).
+
+    Блоб контент-адресный и может переиспользоваться записями другого владельца — уничтожать его
+    «за компанию» нельзя: право на забвение одного не превращается в порчу журнала другого.
+    Поэтому «purgeable» = «нет ни одной чужой ссылки». Ответ возвращается параноидально точным
+    запросом, а не «вычтем из множества владельца множество остальных»: при NULL owner в
+    чужих строках разность бы враала.
+    """
+    sql = """
+    SELECT b.sha256
+      FROM platform.blobs b
+     WHERE EXISTS (
+        SELECT 1 FROM governance.decision_records dr
+         WHERE dr.owner_id = :owner
+           AND (dr.input_sha = b.sha256 OR dr.output_sha = b.sha256)
+     )
+       AND NOT EXISTS (
+        SELECT 1 FROM governance.decision_records dr
+         WHERE dr.owner_id <> :owner
+           AND (dr.input_sha = b.sha256 OR dr.output_sha = b.sha256)
+     )
+     ORDER BY b.created_at
+     LIMIT :limit
+    """
+    sm = session_factory or session
+    async with sm() as s:
+        rows = (await s.execute(text(sql).bindparams(owner=int(owner_id), limit=int(limit)))).all()
+    return [bytes(row[0]) for row in rows]
+
+
 class BlobStore:
     """Контент-адрес: содержимое по его же хэшу, один раз на всех.
 
@@ -939,10 +1105,17 @@ class BlobStore:
     """
 
     def __init__(
-        self, session_factory: SessionFactory | None = None, *, max_bytes: int = 1_048_576
+        self,
+        session_factory: SessionFactory | None = None,
+        *,
+        max_bytes: int = 1_048_576,
+        cipher: Any = None,
     ) -> None:
         self._sm = session_factory
         self.max_bytes = max(1024, int(max_bytes))
+        #: :class:`aegis.platform.crypto.BlobCipher` или None. None = открытый текст (dev),
+        #  иначе — AES-GCM по DEK на запись, обёрнутому в KEK из env (F3)
+        self.cipher = cipher
 
     async def put(self, value: Any, *, media_type: str = _JSON) -> BlobRef:
         data = _encode(value)
@@ -957,16 +1130,34 @@ class BlobStore:
         truncated = size > self.max_bytes
         stored = data[: self.max_bytes] if truncated else data
         sha = sha256_bytes(stored)
+        # sha считается по открытому тексту ДО шифрования: хэш-цепочка и блоки ссылок обязаны
+        # оставаться содержательно стабильными при включённом и выключенном шифровании.
+        # Иначе «включили KEK» = «все прошлые хэши рассинхронизировались» — это не доказательство.
+        wrapped: bytes | None = None
+        key_version: int | None = None
+        payload = stored
+        if self.cipher is not None:
+            payload, wrapped, key_version = self.cipher.encrypt(stored)
         sm = self._sm or session
         async with sm() as s:
             await s.execute(
                 text(
                     """
-                    INSERT INTO platform.blobs (sha256, size_bytes, media_type, content)
-                    VALUES (:sha, :size, :media, :content)
+                    INSERT INTO platform.blobs
+                        (sha256, size_bytes, media_type, content, wrapped_dek, key_version,
+                         content_cipher)
+                    VALUES (:sha, :size, :media, :content, :dek, :kver, :cipher)
                     ON CONFLICT (sha256) DO NOTHING
                     """
-                ).bindparams(sha=sha, size=size, media=media_type, content=stored),
+                ).bindparams(
+                    sha=sha,
+                    size=size,
+                    media=media_type,
+                    content=payload,
+                    dek=wrapped,
+                    kver=key_version,
+                    cipher="aes-256-gcm" if wrapped is not None else "none",
+                ),
             )
             await s.commit()
         return BlobRef(sha256=sha, size=size, truncated=truncated)
@@ -977,10 +1168,37 @@ class BlobStore:
             return None
         sm = self._sm or session
         async with sm() as s:
-            found = await s.scalar(
-                text("SELECT content FROM platform.blobs WHERE sha256 = :sha").bindparams(sha=raw),
+            row = (
+                (
+                    await s.execute(
+                        text(
+                            "SELECT content, content_cipher, wrapped_dek, key_version "
+                            "FROM platform.blobs WHERE sha256 = :sha"
+                        ).bindparams(sha=raw)
+                    )
+                )
+                .mappings()
+                .first()
             )
-        return bytes(found) if found is not None else None
+        if row is None:
+            return None
+        cipher = str(row["content_cipher"] or "none")
+        if cipher == "none":
+            return bytes(row["content"])
+        # шифровано, а ключа нет: либо ключ стёрт (crypto-shredding), либо KEK-версия недоступна
+        # в env. Итог один для читателя — содержимое не восстановить — и он обязан быть честным:
+        # None здесь = «утрачено», то же самое, что скажет verify по missing_blobs.
+        if row["wrapped_dek"] is None or self.cipher is None:
+            return None
+        try:
+            return self.cipher.decrypt(
+                bytes(row["content"]),
+                bytes(row["wrapped_dek"]),
+                key_version=int(row["key_version"] or 0) or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — подмена/обрыв ciphertext читается как утрата
+            log.warning("blob.decrypt_failed", err=repr(exc)[:200])
+            return None
 
     async def text(self, sha: Any) -> str | None:
         data = await self.get(sha)
@@ -1040,9 +1258,9 @@ def check_chain(records: Sequence[Mapping[str, Any]]) -> ChainReport:
 
 _INSERT_RECORD = """
 INSERT INTO governance.decision_records
-    (id, trace_id, turn_no, kind, owner_id, prompt_ids, tools_schema_sha, model, params,
+    (id, trace_id, turn_no, kind, owner_id, actor_id, prompt_ids, tools_schema_sha, model, params,
      input_sha, output_sha, policy, cost_usd, latency_ms, truncated, note, prev_hash, hash)
-VALUES (CAST(:id AS uuid), CAST(:trace_id AS uuid), :turn_no, :kind, :owner_id,
+VALUES (CAST(:id AS uuid), CAST(:trace_id AS uuid), :turn_no, :kind, :owner_id, :actor_id,
         CAST(:prompt_ids AS jsonb), :tools_schema_sha, :model, CAST(:params AS jsonb),
         :input_sha, :output_sha, CAST(:policy AS jsonb), CAST(:cost_usd AS numeric), :latency_ms,
         :truncated, :note, :prev_hash, :hash)
@@ -1062,13 +1280,15 @@ VALUES (CAST(:id AS uuid), CAST(:trace_id AS uuid), :turn_no, :kind, :owner_id,
 _SELECT_WINDOW = """
 SELECT
     dr.id::text AS id, dr.trace_id::text AS trace_id, dr.turn_no, dr.seq, dr.kind,
-    dr.owner_id, dr.prompt_ids, dr.tools_schema_sha, dr.model, dr.params, dr.input_sha,
+    dr.owner_id, dr.actor_id, dr.prompt_ids, dr.tools_schema_sha, dr.model, dr.params, dr.input_sha,
     dr.output_sha, dr.policy, dr.cost_usd, dr.latency_ms, dr.truncated, dr.note,
     dr.prev_hash, dr.hash, dr.created_at,
     (dr.input_sha IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM platform.blobs b WHERE b.sha256 = dr.input_sha)) AS input_gone,
+            SELECT 1 FROM platform.blobs b WHERE b.sha256 = dr.input_sha
+              AND NOT (b.content_cipher <> 'none' AND b.wrapped_dek IS NULL))) AS input_gone,
        (dr.output_sha IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM platform.blobs b WHERE b.sha256 = dr.output_sha)) AS output_gone
+            SELECT 1 FROM platform.blobs b WHERE b.sha256 = dr.output_sha
+              AND NOT (b.content_cipher <> 'none' AND b.wrapped_dek IS NULL))) AS output_gone
 FROM governance.decision_records dr
 WHERE (CAST(:since AS timestamptz) IS NULL
        OR dr.created_at >= CAST(:since AS timestamptz))
@@ -1081,7 +1301,7 @@ LIMIT :limit
 _SELECT_TRACE = """
 SELECT
     dr.id::text AS id, dr.trace_id::text AS trace_id, dr.turn_no, dr.seq, dr.kind,
-    dr.owner_id, dr.prompt_ids, dr.tools_schema_sha, dr.model, dr.params, dr.input_sha,
+    dr.owner_id, dr.actor_id, dr.prompt_ids, dr.tools_schema_sha, dr.model, dr.params, dr.input_sha,
     dr.output_sha, dr.policy, dr.cost_usd, dr.latency_ms, dr.truncated, dr.note,
     dr.prev_hash, dr.hash, dr.created_at
 FROM governance.decision_records dr
@@ -1098,6 +1318,7 @@ def _insert_params(payload: Mapping[str, Any], digest: bytes) -> dict[str, Any]:
         "turn_no": int(payload["turn_no"]),
         "kind": payload["kind"],
         "owner_id": int(payload["owner_id"]),
+        "actor_id": payload.get("actor_id"),
         "prompt_ids": orjson.dumps(list(payload.get("prompt_ids") or [])).decode(),
         "tools_schema_sha": _sha_bytes(payload.get("tools_schema_sha")),
         "model": payload.get("model"),

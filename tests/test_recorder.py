@@ -149,8 +149,10 @@ async def test_null_recorder_is_disabled_but_answerable() -> None:
     """Выключенный журнал обязан отвечать, а не молчать: пустой ответ модель заполнит догадками."""
     recorder = NullDecisionRecorder()
     assert recorder.enabled is False
-    recorder.begin_turn("trace", owner_id=1)  # begin/end — синхронные: hot path не ждёт БД
-    recorder.end_turn("trace")
+    # begin/end — теперь через ledger (F1): заявка хода живёт в БД, и «шаги переживают рестарт»
+    # важнее асинхронности; Null-вариант остаётся безawait-исключений — контракт одинаков для всех
+    await recorder.begin_turn("trace", owner_id=1)
+    await recorder.end_turn("trace")
     await recorder.on_llm_call(object())
     await recorder.tool_run(trace_id="t")
     await recorder.turn_summary(trace_id="t")

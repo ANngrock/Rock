@@ -81,19 +81,24 @@ class JournalSpy:
         self.failures = 0
         self._step = 0
 
-    def turn_step(self, trace_id: str) -> int:
-        """Нумерация шагов как у настоящего рекордера: supervisor читает её каждый проход."""
+    async def turn_step(self, trace_id: str, fencing_token: int | None = None) -> int:
+        """Нумерация шагов как у настоящего рекордера: supervisor читает её каждый проход.
+
+        Асинхронный, как протокол: шаг теперь может потребовать записи в заявку хода (lease
+        touch), и «синхронный hot path» больше не инвариант — инвариант «данные в БД».
+        """
+        del fencing_token
         self._step += 1
         return self._step
 
     def _add(self, kind: str, **fields: Any) -> None:
         self.calls.append((kind, fields))
 
-    def begin_turn(self, trace_id: str, **kwargs: Any) -> None:
+    async def begin_turn(self, trace_id: str, **kwargs: Any) -> None:
         self._add("begin", trace_id=trace_id, **kwargs)
 
-    def end_turn(self, trace_id: str) -> None:
-        self._add("end", trace_id=trace_id)
+    async def end_turn(self, trace_id: str, fencing_token: int | None = None) -> None:
+        self._add("end", trace_id=trace_id, fencing=fencing_token)
 
     async def policy(self, **kwargs: Any) -> None:
         self._add("policy", **kwargs)
