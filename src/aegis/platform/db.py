@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -54,8 +55,38 @@ def get_engine() -> AsyncEngine:
             future=True,
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+        _attach_rls_hook(_engine)
     assert _engine is not None  # narrowing для mypy
     return _engine
+
+
+_rls_hooked = False
+
+
+def _attach_rls_hook(engine: AsyncEngine) -> None:
+    """Начало транзакции = установка RLS-GUC этого контекста (F2).
+
+    `Session.after_begin`, а не `before_execute`: GUC обязаны жить ровно одну транзакцию
+    (``set_config`` с ``is_local=true``), а не «до конца соединения» — иначе переиспользованный
+    пул утащит принципала прошлого запроса в чужую транзакцию. Вешается на класс Session (один
+    раз на процесс): AsyncSession внутри исполняет ровно этот sync-Session, так что хук ловит
+    и raw `session()`, и репозитории с собственной фабрикой. Ошибка хука роняет транзакцию:
+    «не удалось связать контекст» не должно тихо означать «связали с дефолтом».
+    """
+    global _rls_hooked
+    if _rls_hooked:
+        return
+    _rls_hooked = True
+    del engine
+    from sqlalchemy.orm import Session as SyncSession  # noqa: PLC0415
+
+    @event.listens_for(SyncSession, "after_begin")
+    def _set_rls_gucs(session: object, transaction: object, connection: object) -> None:
+        from aegis.platform.rls import effective_scope, guc_statements  # noqa: PLC0415
+
+        del session, transaction
+        for stmt in guc_statements(effective_scope()):
+            connection.exec_driver_sql(stmt)
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:

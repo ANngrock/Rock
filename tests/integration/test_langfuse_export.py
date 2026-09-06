@@ -68,7 +68,7 @@ async def _one_turn(
     """Ход журнала из четырёх записей — ровно тот набор, который должен стать пятью спанами."""
     trace = str(uuid.uuid4())
     prompts = [{"id": "supervisor/system", "version": "0.3", "sha256": "a" * 64}]
-    recorder.begin_turn(trace, owner_id=owner_id, prompt_ids=prompts)
+    await recorder.begin_turn(trace, owner_id=owner_id, prompt_ids=prompts)
     await recorder.on_llm_call(
         LLMCallRecord(
             call_id=str(uuid.uuid4()),
@@ -119,7 +119,7 @@ async def _one_turn(
         latency_ms=900,
         iterations=1,
     )
-    recorder.end_turn(trace)
+    await recorder.end_turn(trace)
     return trace
 
 

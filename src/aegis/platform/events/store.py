@@ -291,19 +291,16 @@ class EventStore:
         row = await self._s.execute(
             text(
                 """
-                SELECT count(*) FILTER (WHERE published_at IS NULL AND abandoned_at IS NULL)::int AS
-                pending,
-                       count(*) FILTER (
-                           WHERE published_at IS NULL AND abandoned_at IS NULL AND attempts >=
-                           t.threshold
-                       )::int AS stuck,
+                -- «stuck» после F4 — это abandoned: вычерпанная из ротации строка требует
+                -- реакции человека и больше попыток не жжёт. pending считает только живых
+                SELECT count(*)
+                           FILTER (WHERE published_at IS NULL AND abandoned_at IS NULL)::int
+                           AS pending,
+                       count(*) FILTER (WHERE abandoned_at IS NOT NULL)::int AS stuck,
                        count(*) FILTER (WHERE abandoned_at IS NOT NULL)::int AS abandoned
                 FROM platform.outbox
-                CROSS JOIN (
-                    SELECT COALESCE(CAST(:max_attempts AS int), 2147483647) AS threshold
-                ) t
                 """
-            ).bindparams(max_attempts=max_attempts)
+            )
         )
         r = row.one()
         return {"pending": int(r[0]), "stuck": int(r[1]), "abandoned": int(r[2] or 0)}

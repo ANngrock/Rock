@@ -101,6 +101,28 @@ EVENT_REGISTRY: dict[str, dict[str, Any]] = {
         },
     ),
     "conversation.reset": _event(1, {"type": "object", "properties": {}}),
+    "conversation.turn_answered": _event(
+        1,
+        {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+                "text": {"type": "string", "maxLength": 8000},
+                "trace_id": {"type": ["string", "null"]},
+            },
+        },
+    ),
+    "note.added": _event(
+        1,
+        {
+            "type": "object",
+            "required": ["note"],
+            "properties": {
+                "note": {"type": ["string", "integer", "object"]},
+                "title": {"type": ["string", "null"]},
+            },
+        },
+    ),
     "intent.answered": _event(
         1,
         {

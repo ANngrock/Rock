@@ -1146,7 +1146,8 @@ class BlobStore:
                     INSERT INTO platform.blobs
                         (sha256, size_bytes, media_type, content, wrapped_dek, key_version,
                          content_cipher)
-                    VALUES (:sha, :size, :media, :content, :dek, :kver, :cipher)
+                    VALUES (:sha, :size, :media, :content, :dek, coalesce(:kver, 1),
+                           coalesce(:cipher, 'none'))
                     ON CONFLICT (sha256) DO NOTHING
                     """
                 ).bindparams(
@@ -1260,7 +1261,10 @@ _INSERT_RECORD = """
 INSERT INTO governance.decision_records
     (id, trace_id, turn_no, kind, owner_id, actor_id, prompt_ids, tools_schema_sha, model, params,
      input_sha, output_sha, policy, cost_usd, latency_ms, truncated, note, prev_hash, hash)
-VALUES (CAST(:id AS uuid), CAST(:trace_id AS uuid), :turn_no, :kind, :owner_id, :actor_id,
+-- actor отсутствует = «спросил владелец» (эпоха до F2 и прямые системные записи):
+-- coalesce на вставке, а не в семи вызывающих местах — единственное место, где смысл не расходится
+VALUES (CAST(:id AS uuid), CAST(:trace_id AS uuid), :turn_no, :kind, :owner_id,
+        coalesce(CAST(:actor_id AS bigint), CAST(:owner_id AS bigint)),
         CAST(:prompt_ids AS jsonb), :tools_schema_sha, :model, CAST(:params AS jsonb),
         :input_sha, :output_sha, CAST(:policy AS jsonb), CAST(:cost_usd AS numeric), :latency_ms,
         :truncated, :note, :prev_hash, :hash)

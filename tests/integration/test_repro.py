@@ -58,8 +58,14 @@ def _cfg(**over: Any) -> Settings:
 async def _one_turn(recorder: SqlDecisionRecorder, owner_id: int = 777) -> str:
     trace = str(uuid.uuid4())
     prompts = [{"id": "core/system", "version": "sys-v0.3.0", "sha256": "a" * 64}]
-    recorder.begin_turn(trace, owner_id=owner_id, prompt_ids=prompts, tools_schema_sha=b"\x01" * 32)
-    assert recorder.turn_step(trace) == 1, "шаги с единицы: 0 значит «ход не размечен»"
+    handle = await recorder.begin_turn(
+        trace, owner_id=owner_id, prompt_ids=prompts, tools_schema_sha=b"\x01" * 32
+    )
+    # turn_step требует fencing: «свой» шаг считает только владелец аренды — ровно то,
+    # ради чего токен и introduцирован (чужой процесс после сна не сдвинет счётчик)
+    assert await recorder.turn_step(trace, handle.fencing_token if handle else None) == 1, (
+        "шаги с единицы: 0 значит «ход не размечен»"
+    )
     await recorder.on_llm_call(
         LLMCallRecord(
             call_id=str(uuid.uuid4()),
@@ -115,7 +121,7 @@ async def _one_turn(recorder: SqlDecisionRecorder, owner_id: int = 777) -> str:
         route="brain:tools",
         notes=["SearXNG не ответил"],
     )
-    recorder.end_turn(trace)
+    await recorder.end_turn(trace)
     return trace
 
 
@@ -344,7 +350,7 @@ async def test_verdict_record_is_accepted_by_the_journal() -> None:
     """
     recorder = SqlDecisionRecorder(_cfg())
     trace = str(uuid.uuid4())
-    recorder.begin_turn(trace, owner_id=4242, prompt_ids=[], tools_schema_sha=None)
+    await recorder.begin_turn(trace, owner_id=4242, prompt_ids=[], tools_schema_sha=None)
     await recorder.verdict(
         trace_id=trace,
         turn_no=1,
@@ -358,7 +364,7 @@ async def test_verdict_record_is_accepted_by_the_journal() -> None:
         prompt_ids=[{"id": "verify/judge", "version": "1.0", "sha256": "b" * 64}],
         payload={"answer": "Курс 99", "sources": ["NBU: 43,18"]},
     )
-    recorder.end_turn(trace)
+    await recorder.end_turn(trace)
 
     rows = await recorder.records_for_trace(trace)
     kinds = [row["kind"] for row in rows]

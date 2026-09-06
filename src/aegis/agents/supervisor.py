@@ -64,6 +64,7 @@ from aegis.platform.gateway.models import ChatRole
 from aegis.platform.gateway.streaming import TextSink
 from aegis.platform.kv import KV, history_key, pending_key
 from aegis.platform.logging import bind_contextvars
+from aegis.platform.rls import PrincipalScope, principal_scope, reset_scope, set_scope
 from aegis.web.search import wrap_untrusted
 
 __all__ = ["Inbound", "PendingAction", "Reply", "Route", "Supervisor"]
@@ -217,6 +218,14 @@ class Supervisor:
     # ------------------------------------------------ public
 
     async def handle(self, msg: Inbound, *, on_delta: TextSink | None = None) -> Reply:
+        # F2/RLS: связываем контекст до первой транзакции хода — «кто спросил» (actor), «чьё
+        # это» (house=owner) и роль. Дальше хук БД сам ставит GUC в каждой транзакции; у
+        # репозиториев нет шанса «забыть». kind уточнится после snapshot — до этого считаем гостя
+        # гостем: fail-closed на чтение, запись журнала это не блокирует
+        with principal_scope(msg.actor, "guest", msg.owner_id):
+            return await self._handle_bound(msg, on_delta=on_delta)
+
+    async def _handle_bound(self, msg: Inbound, *, on_delta: TextSink | None) -> Reply:
         trace_id = str(uuid.uuid4())
         bind_contextvars(trace_id=trace_id, owner_id=msg.owner_id, actor_id=msg.actor)
         # F1: «один ход на владельца» — заявка в БД, а не «мы же один процесс». Пока активен
@@ -270,6 +279,8 @@ class Supervisor:
                 trace_id=trace_id,
                 degraded=True,
             )
+        # роль известна — пересвязываем контекст (member получает household-чтение, guest — нет)
+        _scope_token = _scope_for(msg, snapshot)
         flags = await self._flag_snapshot(msg.actor)
         overrides = await self._runtime_overrides()
         level = await self._degradation_level()
@@ -350,6 +361,8 @@ class Supervisor:
             self._observe_turn(ctx, reply)
             return reply
         finally:
+            if _scope_token is not None:
+                reset_scope(_scope_token)
             await self._end_turn(trace_id, handle)
 
     async def resume(self, pending_id: str, approved: bool, owner_id: int) -> Reply:
@@ -1388,6 +1401,15 @@ class Supervisor:
 
 
 # --------------------------------------------------------------- helpers
+
+
+def _scope_for(msg: Inbound, snapshot: PrincipalSnapshot) -> object:
+    """Пересвязка contextvar на реальный kind принципала. Возвращает токен для finally.
+
+    Функция, а не метод: состояние хода живёт в asyncio-контексте задачи, а не на Supervisor
+    (один объект на N параллельных ходов — атрибут-токен бы затирался между задачами).
+    """
+    return set_scope(PrincipalScope(msg.actor, snapshot.principal.kind, msg.owner_id))
 
 
 def _result_json(out: ToolResult) -> dict[str, Any]:

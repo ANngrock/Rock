@@ -91,7 +91,7 @@ RETURNING fencing_token
 _INSERT_CLAIM = """
 INSERT INTO governance.turn_claims
     (trace_id, owner_id, fencing_token, prompt_ids, tools_schema_sha, lease_until)
-VALUES (:trace, :owner_id, nextval('governance.fencing_seq'),
+VALUES (CAST(:trace AS uuid), :owner_id, nextval('governance.fencing_seq'),
         CAST(:prompt_ids AS jsonb), :tools_schema_sha,
         now() + make_interval(secs => :lease_secs))
 RETURNING fencing_token
@@ -383,7 +383,11 @@ class SqlTurnLedger:
             async with self._session() as s:
                 await s.execute(text(_LOCK_SQL), {"trace": trace_id})
                 await s.execute(text(_EXPIRE_CLAIM).bindparams(owner_id=int(owner_id)))
-                busy = await s.scalar(text(_BUSY_CHECK).bindparams(**params))
+                # явно два параметра: у проверки занятости нет ни prompt_ids, ни lease —
+                # «bindparams всем словарём» упало бы «параметр не определён» вместо ответа
+                busy = await s.scalar(
+                    text(_BUSY_CHECK).bindparams(owner_id=int(owner_id), trace=trace_id)
+                )
                 if busy:
                     raise TurnBusy(int(owner_id), str(busy))
                 existing = (
