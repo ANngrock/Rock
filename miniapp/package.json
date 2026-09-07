@@ -1,0 +1,34 @@
+{
+  "name": "aegis-vision-miniapp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vision-мини-апп Aegis: камера в Telegram, анализ в реальном времени, следы — в vision-схеме",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "node --watch server/index.ts",
+    "dev:ui": "vite ui",
+    "build": "vite build ui",
+    "start": "node server/index.ts",
+    "test": "node --test server/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.16.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.11.11",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.6",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}

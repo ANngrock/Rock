@@ -129,6 +129,26 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # --- vision-мини-апп: `docker compose --profile miniapp up -d vision` (шаг 9) ---
+  # Telegram откроет Mini App только по внешнему https — за фронтом (caddy/nginx) ждём
+  # TELEGRAM_MINIAPP_URL из .env; сам контейнер слушает localhost, наружу не торчит.
+  vision:
+    build:
+      context: ../miniapp
+      dockerfile: Dockerfile
+    image: aegis-vision:latest
+    profiles: ["miniapp"]
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql://aegis:aegis@postgres:5432/aegis
+      PORT: "8790"
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:8790:8790"
+    restart: unless-stopped
+    logging: *logging
+
 volumes:
   pgdata: {}
   redisdata: {}
