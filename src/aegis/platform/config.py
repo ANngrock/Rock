@@ -212,6 +212,23 @@ class Settings(BaseSettings):
     #: сколько строк расписания уносит один тик: после простоя (или --persistent) очередь может
     #: быть длинной, и выплюнуть её всю за раз — значит засыпать владельца сообщениями
     reminders_batch: int = Field(default=20, ge=1, le=200)
+    #: как часто ход расписания делает сам процесс бота: 0 = только systemd-таймер (±5 минут),
+    #  >0 = тик в процессе — звонку нужно «ровно в 15:00», а не «когда таймер спохватится»
+    reminders_inprocess_seconds: int = Field(default=60, ge=0, le=3600)
+
+    # --- звонок как канал доставки напоминаний ---
+    #: none|twilio|webhook. Twilio — TTS через REST и без публичного URL (TwiML передаётся телом
+    #  запроса); webhook — POST {"to","text"} на свой шлюз (Asterisk/FreePBX/софтфон-мост)
+    call_provider: str = "none"
+    #: телефон владельца в E.164. Берётся из конфига, а не из фразы чата: номер, продиктованный
+    #  сообщением, — открытая дверь «позвони куда скажут» для prompt-инъекции из веб-страницы
+    notify_phone: str = ""
+    twilio_account_sid: str = ""
+    twilio_auth_token: SecretStr | None = None
+    twilio_from_number: str = ""
+    call_webhook_url: str = ""
+    #: таймаут = «дождаться принятия звонка провайдером», а не длительность разговора
+    call_timeout_seconds: int = Field(default=12, ge=3, le=120)
 
     repro_verify_limit: int = Field(default=5000, ge=100, le=200_000)
 
@@ -385,6 +402,25 @@ class Settings(BaseSettings):
                 + self.kv_backend
                 + ": состояние сессий и дневной бюджет обязаны переживать рестарт процесса"
             )
+        provider = (self.call_provider or "none").strip().lower()
+        if provider not in {"none", "twilio", "webhook"}:
+            raise ConfigError(
+                f"CALL_PROVIDER={self.call_provider!r}: знаю только none|twilio|webhook"
+            )
+        if provider != "none" and not self.notify_phone.strip():
+            raise ConfigError(
+                f"CALL_PROVIDER={provider} требует NOTIFY_PHONE: звонить некому — "
+                "лучше none, чем «напоминание сорвётся на середине»"
+            )
+        if provider == "twilio" and not (
+            self.twilio_account_sid and self.twilio_auth_token and self.twilio_from_number
+        ):
+            raise ConfigError(
+                "CALL_PROVIDER=twilio требует TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN и "
+                "TWILIO_FROM_NUMBER (номер с голосовой поддержкой)"
+            )
+        if provider == "webhook" and not self.call_webhook_url.startswith("http"):
+            raise ConfigError("CALL_PROVIDER=webhook требует CALL_WEBHOOK_URL (http/https)")
         if self.crypto_mode == "enforce" and self.crypto_kek is None:
             raise ConfigError(
                 "CRYPTO_MODE=enforce требует AEGIS_KEK (base64, 32 байта). Иначе «зашифровано» "

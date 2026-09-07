@@ -94,6 +94,7 @@ aegis migrate status                                  # head vs БД, висяч
 aegis backfill status|run --rounds N|pause NAME       # бэкфиллы с лизингом, прогрессом и паузой
 aegis slo status|alerts --write F|tick [--dry-run]    # burn-rate: состояние, артефакт алертов, тик
 aegis turns status|release TRACE|drain OWNER [--execute]  # аренда ходов и залипшая очередь (F1)
+aegis remind add --channel call … | remind test           # напоминание звонком; без провайдера — честный деград (шаг 2.9, RUNBOOK §21)
 ```
 
 ## Качество

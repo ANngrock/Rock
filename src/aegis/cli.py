@@ -70,7 +70,17 @@ def _build_parser() -> argparse.ArgumentParser:
     add.add_argument("text", nargs="+", help="что напомнить")
     add.add_argument("--when", required=True, help="словами: «через 20 минут», «завтра в 9»")
     add.add_argument("--at", default=None, help="точное время ISO с поясом (обход разборщика)")
+    add.add_argument(
+        "--channel",
+        choices=("message", "call", "both"),
+        default="message",
+        help="как доставлять: сообщением, звонком или обоими (звонки требуют CALL_PROVIDER)",
+    )
     add.add_argument("--owner-id", type=int, default=1)
+    remind_actions.add_parser(
+        "test",
+        help="проверка доставки: тестовое сообщение и, если настроено, тестовый звонок",
+    )
     show = remind_actions.add_parser("list", help="запланированные напоминания")
     show.add_argument("--limit", type=int, default=10)
     show.add_argument("--owner-id", type=int, default=1)
@@ -331,6 +341,35 @@ async def _turns_report() -> dict[str, Any]:
     return out
 
 
+def _call_channels_note(cfg: Any) -> str:
+    """Строка doctor про канал звонка: конфигурация, а не «жив ли» — провайдер звонков снаружи."""
+    provider = (cfg.call_provider or "none").strip().lower()
+    phone_digits = "".join(ch for ch in str(cfg.notify_phone or "") if ch.isdigit())
+    if provider == "none":
+        return " · звонки не настроены: каналы call/both деградируют до сообщений"
+    if len(phone_digits) < 8:
+        return f" · ! CALL_PROVIDER={provider}, а NOTIFY_PHONE не похож на номер"
+    tail = f"…{phone_digits[-4:]}"
+    if provider == "twilio":
+        missing = [
+            label
+            for label, val in (
+                ("TWILIO_ACCOUNT_SID", cfg.twilio_account_sid),
+                ("TWILIO_AUTH_TOKEN", cfg.twilio_auth_token),
+                ("TWILIO_FROM_NUMBER", cfg.twilio_from_number),
+            )
+            if not val
+        ]
+        if missing:
+            return f" · ! twilio: не хватает {', '.join(missing)}"
+        return f" · звонки: twilio на {tail}"
+    if provider == "webhook":
+        if not cfg.call_webhook_url:
+            return " · ! webhook: CALL_WEBHOOK_URL пуст"
+        return f" · звонки: webhook → {str(cfg.call_webhook_url)[:40]}"
+    return f" · ! неизвестный CALL_PROVIDER={provider}"
+
+
 async def _reminders_report(cfg: Any) -> dict[str, Any]:
     """Расписание напоминаний: таблица, настроен ли инструмент, догоняет ли тик.
 
@@ -367,7 +406,7 @@ async def _reminders_report(cfg: Any) -> dict[str, Any]:
     out["overdue"] = int(overdue or 0)
     out["note"] = (
         f"в расписании {out['live']}, просрочено {out['overdue']}"
-        f" · тик ≤ {cfg.reminders_batch} за проход"
+        f" · тик ≤ {cfg.reminders_batch} за проход" + _call_channels_note(cfg)
     )
     if out["overdue"]:
         out["hint"] = "ждут тика: systemctl status aegis-reminders.timer"
@@ -811,6 +850,11 @@ def _plural(count: int, one: str, few: str, many: str) -> str:
     return f"{count} {many}"
 
 
+def _tail_phone(raw: str) -> str:
+    digits = "".join(c for c in str(raw) if c.isdigit())
+    return f"+…{digits[-4:]}" if len(digits) > 4 else "…"
+
+
 async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
     """Напоминания из консоли — без модели: момент считает парсер, а не угадывает LLM.
 
@@ -847,12 +891,25 @@ async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
         if due < datetime.now(UTC):
             print("! в прошлом напоминания не ставлю", file=sys.stderr)
             return 2
-        reminder_id = await store.add(owner_id=args.owner_id, body=body, due_at=due.astimezone(UTC))
+        reminder_id = await store.add(
+            owner_id=args.owner_id,
+            body=body,
+            due_at=due.astimezone(UTC),
+            channel=getattr(args, "channel", "message"),
+        )
         # та же форма, что у инструмента: абсолютный момент + «через сколько», — чтобы «через 4 мин»
         # не выглядело расхождением с «поставленными через 5»
         local = due.astimezone(cfg.tz)
         moment = humanize(due, now=datetime.now(cfg.tz), timezone=cfg.timezone)
         print(f"Поставлено на {local:%d.%m %H:%M} ({moment}) — {body}. id={reminder_id[:8]}")
+        ch = getattr(args, "channel", "message")
+        if ch != "message":
+            ready = (cfg.call_provider or "none").strip().lower() != "none" and bool(
+                (cfg.notify_phone or "").strip()
+            )
+            print(
+                f"  канал: {ch}" + ("" if ready else " ! не настроены звонки — доставлю сообщением")
+            )
         print(f"  разбор: {matched!r}")
         if note:
             print(f"  ! {note}", file=sys.stderr)
@@ -895,19 +952,21 @@ async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
             for item in pending:
                 print(f"  - {item.label(cfg.timezone)}")
             return 0
-        from aegis.interaction.telegram.notify import TelegramNotifier
+        from aegis.interaction.notify import ReminderDispatcher
 
         try:
-            notifier = TelegramNotifier.from_settings(cfg)
+            dispatcher = ReminderDispatcher.from_settings(cfg)
         except RuntimeError as exc:
             print(f"! {exc}", file=sys.stderr)
             return 2
         try:
-            await notifier.start()
-            report = await deliver(store, send=notifier.send, limit=limit)
+            await dispatcher.start()
+            report = await deliver(store, send=dispatcher.send, limit=limit)
         finally:
-            await notifier.aclose()
+            await dispatcher.aclose()
         print(report.summary())
+        for note in dispatcher.last_notes:
+            print(f"  ! {note}", file=sys.stderr)
         for short in report.sent:
             print(f"  ok {short}")
         for short in report.failed:
@@ -916,6 +975,44 @@ async def _cmd_remind(action: str, args: argparse.Namespace) -> int:
             print(f"  !! {short}: попытки кончились", file=sys.stderr)
         # ненулевой выход нужен, чтобы systemd видел failed у юнита, а не «тихо и чисто»
         return 1 if report.failed else 0
+
+    if action == "test":
+        from aegis.interaction.calls import CallError, call_provider_from_settings
+        from aegis.interaction.notify import ReminderDispatcher, spoken_text
+        from aegis.planning.reminders import Reminder
+
+        try:
+            dispatcher = ReminderDispatcher.from_settings(cfg)
+        except RuntimeError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        probe = Reminder(
+            id="test0000-0000-0000-0000-000000000000",
+            text="проверка канала доставки (aegis remind test)",
+            due_at=datetime.now(UTC),
+        )
+        rc = 0
+        try:
+            await dispatcher.start()
+            try:
+                await dispatcher.telegram.send(probe)
+                print("сообщение: доставлено")
+            except Exception as exc:  # noqa: BLE001 — тест обязан показать отказ, не traceback
+                print(f"! сообщение: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+                rc = 1
+            provider = call_provider_from_settings(cfg)
+            if provider is None:
+                print("звонок: не настроен (CALL_PROVIDER=none) — канал сообщений это не отменяет")
+            else:
+                try:
+                    await provider.call(cfg.notify_phone, spoken_text(probe, cfg.timezone))
+                    print(f"звонок на {_tail_phone(cfg.notify_phone)}: провайдер принял вызов")
+                except CallError as exc:
+                    print(f"! звонок: {str(exc)[:200]}", file=sys.stderr)
+                    rc = 1
+        finally:
+            await dispatcher.aclose()
+        return rc
 
     return 2
 

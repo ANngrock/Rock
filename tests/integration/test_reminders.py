@@ -320,3 +320,101 @@ async def test_counts_report_the_schedule_state(owner: int) -> None:
 
 def _other_owner() -> int:
     return int(uuid.uuid4().int % 2_000_000_000) + 10_000
+
+
+# --------------------------------------------------------------- каналы --
+
+
+@pytest.mark.usefixtures("db")
+async def test_channel_round_trip_and_database_check(owner: int) -> None:
+    """Канал переживает запись и выдачу, а CHECK держит мусор даже на прямом UPDATE.
+
+    Констрейнт проверяем именно здесь: в офлайн-тестах он есть только как строка в миграции,
+    а «копья не пущены, потому что их в БД не проверяют» — классический способ разъехаться
+    коду и схеме.
+    """
+    store = SqlReminderStore()
+    due = datetime.now(UTC) + timedelta(hours=1)
+    call_id = await store.add(owner_id=owner, body="позвонить маме", due_at=due, channel="call")
+    plain_id = await store.add(owner_id=owner, body="обычное", due_at=due)
+
+    items = {item.id[:8]: item for item in await store.list_scheduled(owner_id=owner)}
+    assert items[call_id[:8]].channel == "call"
+    assert items[plain_id[:8]].channel == "message", (
+        "DEFAULT 'message' — старые строки не осиротели"
+    )
+
+    async with session() as s:
+        with pytest.raises(DBAPIError, match="reminders_channel_chk"):
+            await s.execute(
+                text("UPDATE planning.reminders SET channel = 'sms' WHERE id = :i"),
+                {"i": call_id},
+            )
+        await s.rollback()
+
+
+@pytest.mark.usefixtures("db")
+async def test_channel_column_has_honest_default() -> None:
+    """DEFAULT 'message' живёт в схеме, а не только в коде."""
+    async with session() as s:
+        default = (
+            await s.execute(
+                text(
+                    "SELECT column_default FROM information_schema.columns"
+                    " WHERE table_schema = 'planning' AND table_name = 'reminders'"
+                    " AND column_name = 'channel'"
+                )
+            )
+        ).scalar()
+    assert default is not None and "message" in str(default), (
+        "миграция 0009 не накатана — `aegis migrate`/`make migrate`"
+    )
+
+
+@pytest.mark.usefixtures("db")
+async def test_failed_call_still_delivers_and_closes_the_row(owner: int) -> None:
+    """Звонок упал — напоминание доставлено текстом и строка ушла в sent, а не в бесконечный retry.
+
+    Это сценарий «немого обещания» наоборот: провайдер живёт своей жизнью (абонент недоступен,
+    лимиты, сеть), и единственный недопустимый исход — когда владелец не узнал НИ-ЧТО.
+    """
+    from aegis.interaction.calls import CallError
+    from aegis.interaction.notify import ReminderDispatcher
+
+    store = SqlReminderStore()
+    due_id = await store.add(
+        owner_id=owner,
+        body="записать ребёнка к врачу",
+        due_at=datetime.now(UTC) - timedelta(minutes=5),
+        channel="call",
+    )
+
+    class _FakeTelegram:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str | None]] = []
+
+        async def send(self, reminder: Reminder, prefix: str | None = None) -> None:
+            self.sent.append((str(reminder.text), prefix))
+
+        async def start(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    class _BusyProvider:
+        async def call(self, to: str, text: str) -> None:
+            raise CallError("all lines busy")
+
+    telegram = _FakeTelegram()
+    dispatcher = ReminderDispatcher(
+        telegram=telegram, calls=_BusyProvider(), phone="+70000000000", timezone="UTC"
+    )
+    report = await deliver(store, send=dispatcher.send)
+
+    assert due_id[:8] in report.sent, "fallback-доставка = успешная доставка"
+    row = await _row(owner, due_id)
+    assert row["status"] == "sent" and row["last_error"] is None
+    confession = [item for item in telegram.sent if item[1] and "Не дозвонился" in item[1]]
+    assert confession, "об отказе дозвониться владелец узнаёт из того же сообщения"
+    assert any("звонок не удался" in note for note in dispatcher.last_notes)

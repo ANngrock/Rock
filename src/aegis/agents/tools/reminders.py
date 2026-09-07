@@ -18,9 +18,11 @@ from pydantic import BaseModel, Field
 
 from aegis.agents.tools.registry import ToolContext, registry
 from aegis.governance.policy import Risk
-from aegis.planning.reminders import Reminder
+from aegis.planning.reminders import REMINDER_CHANNELS, Reminder
 from aegis.planning.schedule import When, WhenNotParsed, humanize, parse_when
 from aegis.platform.config import settings
+
+_CHANNELS = REMINDER_CHANNELS
 
 __all__ = ["cancel_reminder", "list_reminders", "set_reminder"]
 
@@ -40,7 +42,16 @@ class SetReminderArgs(BaseModel):
         max_length=120,
         description=(
             "дословная фраза владельца про время: «через 20 минут», «завтра в 9», "
-            "«в пятницу утром», «12.09 в 14:00». Не переводить в ISO и не додумывать"
+            "«в пятницу утром», «12.09 в 14:00», «за 15 минут до завтра в 15:00». "
+            "Не переводить в ISO и не додумывать"
+        ),
+    )
+    channel: str = Field(
+        default="message",
+        description=(
+            "как доставить: message — сообщением в чат (по умолчанию), call — звонком, "
+            "both — звонком и сообщением. «Позвони мне», «напомни звонком» = call; "
+            "если канал не указан, всегда message"
         ),
     )
 
@@ -77,9 +88,27 @@ async def set_reminder(args: SetReminderArgs, ctx: ToolContext) -> str:
         return f"Не ставлю: {exc}"
     except ValueError as exc:
         return f"Не ставлю: {exc}"
+    channel = (args.channel or "message").strip().lower()
+    if channel not in _CHANNELS:
+        return f"Не ставлю: канал доставки должен быть одним из {list(_CHANNELS)}"
+    call_ready = (cfg.call_provider or "none").strip().lower() != "none" and bool(
+        (cfg.notify_phone or "").strip()
+    )
+    channel_note = ""
+    if channel in ("call", "both") and not call_ready:
+        # строку храним как заказанную: включатся ключи — и старые напоминания зазвонят сами;
+        # предупреждение здесь — чтобы владелец знал про это СЕЙЧАС, а не узнавал в семь утра
+        channel_note = (
+            "\n⚠️ звонки не настроены (CALL_PROVIDER/NOTIFY_PHONE) — доставлю сообщением, "
+            "заказ звонка сохранён."
+        )
     try:
         reminder_id = await store.add(
-            owner_id=ctx.owner_id, body=args.text, due_at=when.at, trace_id=ctx.trace_id
+            owner_id=ctx.owner_id,
+            body=args.text,
+            due_at=when.at,
+            trace_id=ctx.trace_id,
+            channel=channel,
         )
     except Exception as exc:  # noqa: BLE001 - враньё «поставил» опаснее сообщения об ошибке
         return f"Не сохранилось: {type(exc).__name__}: {str(exc)[:200]}"
@@ -88,8 +117,10 @@ async def set_reminder(args: SetReminderArgs, ctx: ToolContext) -> str:
     local = when.at.astimezone(cfg.tz)
     moment = humanize(when.at, now=datetime.now(cfg.tz), timezone=cfg.timezone)
     note = f"\n{when.note}" if when.note else ""
+    how = {"message": "сообщением", "call": "звонком", "both": "звонком и сообщением"}[channel]
     return (
-        f"Поставлено на {local:%d.%m %H:%M} ({moment}) — {args.text}. id={reminder_id[:8]}.{note}\n"
+        f"Поставлено на {local:%d.%m %H:%M} ({moment}) — {args.text}. "
+        f"Доставка: {how}. id={reminder_id[:8]}.{note}{channel_note}\n"
         f"Отмена — инструмент cancel_reminder с ref={reminder_id[:8]}."
     )
 

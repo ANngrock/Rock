@@ -51,7 +51,13 @@ class Store:
         self.cancelled: list[str] = []
 
     async def add(
-        self, *, owner_id: int, body: str, due_at: datetime, trace_id: str | None = None
+        self,
+        *,
+        owner_id: int,
+        body: str,
+        due_at: datetime,
+        trace_id: str | None = None,
+        channel: str = "message",
     ) -> str:
         if self.fail_add is not None:
             raise self.fail_add

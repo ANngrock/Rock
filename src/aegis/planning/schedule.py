@@ -142,6 +142,18 @@ _YEAR_ISO_RE = re.compile(
 )
 _WEEKDAY_RE = re.compile(r"(?:в|по|на)\s+(?P<w>" + "|".join(_WEEKDAYS) + r")", re.I)
 _PAST_HINT = re.compile(r"(вчера|прошл|раньш|уже был|утра было)", re.I)
+#: «за 15 минут до завтра в 15:00» — lead-фраза. Отдельное правило, а не «пусть модель сама
+#  отнимет минуты»: вычитание из уже распознанного момента здесь делает тот же детерминированный
+#  код, что и во всём парсере, — и «заранее» перестаёт зависеть от арифметики языковой модели
+#: единичное «за час до» без числа — норма разговорного языка, не ошибка; число по умолчанию 1
+_LEAD_RE = re.compile(
+    rf"за\s+(?P<d>(?:{_NUM}\s*)?(?:мин\w*|час\w*|сут\w*|дн\w*|ден\w*|нед\w*)|пол\s?часа?)"
+    r"\s*(?:до|перед(?:\s+тем\s+как)?)\s+(?P<base>\S.*)$",
+    re.I,
+)
+#: «за … до/перед …» на слух есть, а разобрать нечем — молча потерять «заранее» опаснее, чем
+#: отказаться: владелец поставит напоминание «на 15:00» вместо «за 10 минут до встречи» и не узнает
+_LEAD_ATTEMPT_RE = re.compile(r"\bза\s+\S[^.?!]*?\s(?:до|перед)\s+\S", re.I)
 
 #: «завтра» без времени = утро рабочего дня. Единственный случай, когда время думается за
 #: владельца, — и он обязан узнать об этом из note, а не из сообщения в шесть утра.
@@ -176,6 +188,28 @@ def parse_when(text: str, *, now: datetime, timezone: str = "UTC") -> When:
 
     zone = _zone(timezone)
     local = now.astimezone(zone)
+
+    # 0) «за N до <база>»: считаем базу обычными правилами, вычитаем — и только потом сверяем с
+    #    «не в прошлом ли»: «за 5 минут до» через 4 минуты — не «сейчас», а честный отказ
+    lead = _LEAD_RE.search(raw)
+    if lead is None and _LEAD_ATTEMPT_RE.search(raw):
+        raise WhenNotParsed(
+            "слышу «за … до», но не могу посчитать: «за 10 минут до», «за час до», «за 2 дня до»"
+        )
+    if lead:
+        if _LEAD_RE.search(lead.group("base")):
+            raise WhenNotParsed("цепочку «за X до за Y до» не разбираю: назовите итоговый момент")
+        lead_at = _lead_minutes(lead.group("d"))
+        anchor = parse_when(lead.group("base"), now=now, timezone=timezone)
+        at = anchor.at - timedelta(minutes=lead_at)
+        if at <= local:
+            raise WhenNotParsed(
+                f"«{lead.group(0).strip()}» приходится на прошедшее: базовый момент слишком близок"
+            )
+        note = f"считаю заранее: {anchor.matched} минус {lead_at} мин"
+        if anchor.note:
+            note += f"; {anchor.note}"
+        return When(at=at, matched=lead.group(0).strip(), note=note)
 
     # 1) явная дата: ISO или «дд.мм.гггг» / «дд.мм» / «15 сентября»
     iso = _YEAR_ISO_RE.search(raw)
@@ -313,6 +347,24 @@ def _zone(name: str) -> ZoneInfo:
         return ZoneInfo(name)
     except Exception:  # noqa: BLE001 - битый TZ в .env не имеет права валить бота
         return ZoneInfo("UTC")
+
+
+def _lead_minutes(phrase: str) -> int:
+    """«15 минут» / «час» / «полчаса» из lead-части — те же единицы, что у «через N»."""
+    p = phrase.strip().lower()
+    m = re.match(rf"^(?:{_NUM}\s*)?(?P<u>мин\w*|час\w*|сут\w*|дн\w*|ден\w*|нед\w*)$", p)
+    if m:
+        number = m.group("n") or "1"
+        minutes = int(_num(number) * _unit_minutes(m.group("u")))
+    elif p.replace(" ", "") == "полчаса":
+        # «полчаса» без числа — устойчивая форма, а не число с единицей; проверять её ДО
+        # словесных числительных нельзя: «полтора» тоже начинается на «пол»
+        minutes = 30
+    else:
+        raise WhenNotParsed(f"не понимаю «{phrase.strip()}» как длительность: минуты, часы, дни")
+    if minutes <= 0:
+        raise WhenNotParsed("нулевое «заранее» — это «в момент»; назовите минуты")
+    return minutes
 
 
 def _num(raw: str) -> float:

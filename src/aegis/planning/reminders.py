@@ -53,6 +53,10 @@ MIN_REF = 6
 
 DELIVER_PREFIX = "⏰ Напоминание:"
 
+#: канал доставки: сообщение, звонок или оба. Расширяется вместе с CHECK в миграции 0009 —
+# и нигде больше (ни диспетчер, ни инструмент не держат своих вариантов)
+REMINDER_CHANNELS = ("message", "call", "both")
+
 _CLAIM_SQL = """
 WITH picked AS (
     SELECT id
@@ -71,18 +75,19 @@ UPDATE planning.reminders AS r
    SET status = 'sending', attempts = r.attempts + 1, updated_at = now()
   FROM picked
  WHERE r.id = picked.id
-RETURNING r.id::text AS id, r.text, r.due_at, r.attempts, r.owner_id,
+RETURNING r.id::text AS id, r.text, r.due_at, r.attempts, r.owner_id, r.channel,
           coalesce(r.last_error, '') AS last_error
 """
 
 _INSERT_SQL = """
-INSERT INTO planning.reminders (owner_id, text, due_at, status, trace_id)
-VALUES (:owner_id, :body, :due_at, 'scheduled', :trace_id)
+INSERT INTO planning.reminders (owner_id, text, due_at, status, trace_id, channel)
+VALUES (:owner_id, :body, :due_at, 'scheduled', :trace_id, :channel)
 RETURNING id::text AS id
 """
 
 _LIST_SQL = """
-SELECT id::text AS id, text, due_at, attempts, status, coalesce(last_error, '') AS last_error
+SELECT id::text AS id, text, due_at, attempts, status, channel,
+       coalesce(last_error, '') AS last_error
   FROM planning.reminders
  WHERE owner_id = :owner_id AND status IN ('scheduled', 'sending')
  ORDER BY due_at
@@ -105,7 +110,8 @@ RETURNING id::text AS id, text, due_at, owner_id
 
 #: «что ушло бы» для ``--dry-run``: тот же отбор, что и у claim, но без блокировки и без попыток
 _PEEK_SQL = """
-SELECT id::text AS id, text, due_at, attempts, status, coalesce(last_error, '') AS last_error
+SELECT id::text AS id, text, due_at, attempts, status, channel,
+       coalesce(last_error, '') AS last_error
   FROM planning.reminders
  WHERE due_at <= now()
    AND attempts < :max_attempts
@@ -154,6 +160,9 @@ class Reminder:
     attempts: int = 0
     last_error: str = ""
     status: str = "scheduled"
+    #: заказанный канал (REMINDER_CHANNELS). Хранится как заказ, а не как факт: провайдер
+    #  может появиться позже, и «заказанное звонком» тогда зазвонит без перестановки
+    channel: str = "message"
 
     @property
     def short_id(self) -> str:
@@ -167,10 +176,11 @@ class Reminder:
         """
         zone = ZoneInfo(timezone) if timezone else UTC
         when = self.due_at.astimezone(zone).strftime("%d.%m %H:%M")
+        tag = " 📞" if self.channel in ("call", "both") else ""
         tail = f" (попытка {self.attempts})" if self.attempts else ""
         error = f" — {self.last_error[:80]}" if self.last_error else ""
         zone_tag = timezone or "UTC"
-        return f"{self.short_id} · {when} {zone_tag}{tail} · {self.text[:120]}{error}"
+        return f"{self.short_id} · {when} {zone_tag}{tail}{tag} · {self.text[:120]}{error}"
 
 
 @dataclass(slots=True)
@@ -209,6 +219,7 @@ class ReminderStore(Protocol):
         body: str,
         due_at: datetime,
         trace_id: str | None = None,
+        channel: str = "message",
     ) -> str: ...
 
     async def list_scheduled(self, *, owner_id: int, limit: int = 10) -> list[Reminder]: ...
@@ -274,7 +285,12 @@ class SqlReminderStore:
         body: str,
         due_at: datetime,
         trace_id: str | None = None,
+        channel: str = "message",
     ) -> str:
+        if channel not in REMINDER_CHANNELS:
+            # CHECK в таблице поймал бы и позже, но сюда приходят слова модели: «не понял канал»
+            # должен звучать здесь, а не IntegrityError'ом из недр тика
+            raise ValueError(f"канал доставки должен быть одним из {REMINDER_CHANNELS}")
         if due_at.tzinfo is None:
             # Наивное время в timestamptz — это «сработает не тогда», а не «не сработает вовсе»
             raise ValueError("due_at обязан быть tz-aware: момент считается в таймере владельца")
@@ -287,6 +303,7 @@ class SqlReminderStore:
                         "body": " ".join(body.split())[:2000],
                         "due_at": due_at,
                         "trace_id": trace_id,
+                        "channel": channel,
                     },
                 )
             ).mappings()
@@ -448,6 +465,7 @@ def _reminder(row: Any) -> Reminder:
         attempts=int(row.get("attempts") or 0),
         last_error=str(row.get("last_error") or ""),
         status=str(row.get("status") or "scheduled"),
+        channel=str(row.get("channel") or "message"),
     )
 
 

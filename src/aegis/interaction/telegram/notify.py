@@ -57,10 +57,10 @@ class TelegramNotifier:
             await self._bot.session.close()
             self._bot = None
 
-    async def send(self, reminder: Reminder) -> None:
+    async def send(self, reminder: Reminder, prefix: str | None = None) -> None:
         await self.start()
         body = " ".join(reminder.text.split())[:_MAX_LEN]
-        text = f"{DELIVER_PREFIX} {body}"
+        text = f"{prefix or DELIVER_PREFIX} {body}"
         try:
             await self._bot.send_message(self.chat_id, text, link_preview_options=None)
         except Exception as exc:  # noqa: BLE001 - отдаём наверх: попытку считает магазин
