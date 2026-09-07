@@ -21,6 +21,7 @@ import re
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import replace as _dc_replace
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
@@ -250,12 +251,15 @@ def _feeds_store() -> Any:
 
 
 def _menu_deps(app: App) -> Any:
+    from aegis.automation.store import SqlAutomationStore
     from aegis.cognition.inbox import SqlInboxStore
     from aegis.cognition.lexicon import SqlLexicon
     from aegis.cognition.stickers import SqlStickers
     from aegis.integrations.store import SqlConnectorStore
+    from aegis.planning.jobs import SqlJobStore
     from aegis.planning.nodes import SqlNodeStore
     from aegis.planning.reminders import SqlReminderStore
+    from aegis.planning.tasks import SqlTaskStore
 
     return menu_mod.MenuDeps(
         cfg=app.cfg,
@@ -267,6 +271,9 @@ def _menu_deps(app: App) -> Any:
         inbox=SqlInboxStore() if app.db_ready else None,
         cost=app.cost,
         feeds=_feeds_store() if app.db_ready else None,
+        tasks=SqlTaskStore() if app.db_ready else None,
+        jobs=SqlJobStore() if app.db_ready else None,
+        automation=SqlAutomationStore() if app.db_ready else None,
     )
 
 
@@ -1109,6 +1116,115 @@ async def _feeds_tick_loop(app: App) -> None:
             backoff = min(900.0, max(30.0, backoff * 2))
 
 
+async def _automation_tick_loop(app: App) -> None:
+    """Тик авто-цикла: крон-прогоны агента + напоминания о созревших дедлайнах задач.
+
+    Заимствованный у наблюдателей порядок делает повтор безопасным: ``claim_due`` переводит
+    next_run вперёд одним коммитом с выборкой — выполнение после коммита (at-most-once:
+    упади процесс посреди тика, очередь не начнёт крутить одно и то же вечно). Прогон —
+    полноценный ход :meth:`supervisor.handle` с промптом владельца: все права, флаги и
+    журнал как у обычного сообщения. Ошибка прогона — fail_count; пять подряд — пауза,
+    а не вечный стук в мёртвую дверь.
+    """
+    interval = max(10, int(app.cfg.automation_tick_seconds))
+    running: set[asyncio.Task[None]] = set()
+    while True:
+        await asyncio.sleep(interval)
+        if not app.db_ready:
+            continue
+        try:
+            from aegis.planning.jobs import SqlJobStore
+            from aegis.planning.reminders import SqlReminderStore
+            from aegis.planning.tasks import SqlTaskStore
+
+            now = datetime.now(UTC)
+            store = SqlJobStore()
+            for job in await store.claim_due(limit=3, now=now, tz=app.cfg.tz):
+                task = asyncio.create_task(_run_job_turn(app, store, job), name=f"job:{job.id[:8]}")
+                running.add(task)
+                task.add_done_callback(running.discard)
+            ripe = await SqlTaskStore().claim_due_reminders(now=now, limit=20)
+            if ripe:
+                reminders = SqlReminderStore()
+                for t in ripe:
+                    await reminders.add(
+                        owner_id=t.owner_id,
+                        body=f"⏰ Срок задачи истёк: «{t.title}»",
+                        due_at=now,
+                        channel="message",
+                    )
+                log.info("tasks.reminders_armed", count=len(ripe))
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 — сбой тика не роняет бота
+            log.warning("automation.tick_failed", err=repr(exc)[:200])
+
+
+async def _run_job_turn(app: App, store: Any, job: Any) -> None:
+    try:
+        reply = await app.supervisor.handle(
+            Inbound(text=job.prompt, owner_id=int(job.owner_id), source_trust="owner")
+        )
+        body = (reply.text or "").strip()
+        if job.channel == "message" and body and body != "—":
+            from aegis.interaction.telegram.notify import TelegramNotifier
+
+            await TelegramNotifier.from_settings(app.cfg).send_text(f"🛠 {job.title}: {body}")
+        await store.finish_run(job, ok=True, error="")
+    except asyncio.CancelledError:
+        await store.finish_run(job, ok=False, error="остановлен (рестарт процесса)")
+        raise
+    except Exception as exc:  # noqa: BLE001 — прогон не должен унести петлю
+        log.warning("job.run_failed", job=job.title[:40], err=repr(exc)[:200])
+        await store.finish_run(job, ok=False, error=repr(exc)[:200])
+
+
+async def _hooks_serve_loop(app: App) -> None:
+    """Приёмник входящих вебхуков: stdlib-сервер на hooks_bind:hooks_port, политика ряда.
+
+    notify — текст прилетает владельцу сообщением; turn — инициирует агентный ход, куда
+    payload идёт ТОЛЬКО через :func:`wrap_untrusted` и с source_trust=untrusted: чужая CI
+    не получает прав владельца, даже владея секретом (секрет — про доступ, не про доверие).
+    """
+    from aegis.automation.hooks_http import serve_hooks
+    from aegis.automation.store import SqlAutomationStore
+
+    cfg = app.cfg
+    store = SqlAutomationStore()
+
+    async def on_fire(hook: Any, payload: str) -> None:
+        from aegis.interaction.telegram.notify import TelegramNotifier
+
+        notifier = TelegramNotifier.from_settings(cfg)
+        if hook.policy != "turn":
+            await notifier.send_text(f"📥 Вебхук «{hook.name}»:\n{payload[:1200] or '— пусто —'}")
+            return
+        from aegis.web.search import wrap_untrusted
+
+        text = wrap_untrusted(f"webhook:{hook.name}", payload[:4000] or "— пусто —")
+        try:
+            reply = await app.supervisor.handle(
+                Inbound(text=text, owner_id=int(hook.owner_id), source_trust="untrusted")
+            )
+        except Exception as exc:  # noqa: BLE001 — ход не удался: владельцу честно, 500 не шлём
+            await notifier.send_text(
+                f"↩︎ Вебхук «{hook.name}»: ход не удался ({type(exc).__name__})"
+            )
+            return
+        body = (reply.text or "").strip()
+        if body and body != "—":
+            await notifier.send_text(f"↩︎ {hook.name}: {body}")
+
+    log.info("hooks.serving_start", bind=cfg.hooks_bind, port=cfg.hooks_port)
+    await serve_hooks(
+        store=store,
+        host=cfg.hooks_bind,
+        port=cfg.hooks_port,
+        max_body=int(cfg.hooks_max_body_kb) * 1024,
+        on_fire=on_fire,
+    )
+
+
 async def _vault_rotate_loop(app: App) -> None:
     """Повороты динамической цепи: каждые crypto_rotate_sec (по умолчанию — 2 минуты).
 
@@ -1313,6 +1429,12 @@ async def main() -> None:
     vault_task: asyncio.Task[None] | None = None
     if app.db_ready:
         vault_task = asyncio.create_task(_vault_rotate_loop(app))
+    automation_task: asyncio.Task[None] | None = None
+    if app.db_ready and getattr(app.cfg, "automation_enabled", True):
+        automation_task = asyncio.create_task(_automation_tick_loop(app))
+    hooks_task: asyncio.Task[None] | None = None
+    if app.db_ready and getattr(app.cfg, "hooks_enabled", False):
+        hooks_task = asyncio.create_task(_hooks_serve_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -1346,6 +1468,12 @@ async def main() -> None:
         if vault_task is not None:
             vault_task.cancel()
             await asyncio.gather(vault_task, return_exceptions=True)
+        if automation_task is not None:
+            automation_task.cancel()
+            await asyncio.gather(automation_task, return_exceptions=True)
+        if hooks_task is not None:
+            hooks_task.cancel()
+            await asyncio.gather(hooks_task, return_exceptions=True)
         await app.aclose()
 
 

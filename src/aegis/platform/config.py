@@ -335,6 +335,20 @@ class Settings(BaseSettings):
     #: слать ли новые предметы владельцу в личку ботом (иначе — только в базу и /menu)
     parser_push: bool = True
 
+    # --- автоматизация (миграция 0016): задачи, крон-прогоны, исходящие действия, вебхуки ---
+    automation_enabled: bool = True
+    #: тик авто-цикла: крон-прогоны + напоминания по дедлайнам задач
+    automation_tick_seconds: int = Field(default=60, ge=10, le=900)
+    action_timeout_s: float = Field(default=15.0, ge=0.5, le=120.0)
+    action_max_body_kb: int = Field(default=256, ge=4, le=4096)
+    #: приёмник входящих вебхуков: выключен по умолчанию — открыть порт должен только владелец
+    hooks_enabled: bool = False
+    hooks_bind: str = "127.0.0.1"
+    hooks_port: int = Field(default=8791, ge=1, le=65535)
+    #: внешний адрес для подсказок (за реверс-прокси); пусто — bind:port
+    hooks_public_url: str = ""
+    hooks_max_body_kb: int = Field(default=64, ge=1, le=512)
+
     # --- политика как код (F5) ---
     #: декларативные правила; пусто/нет файла — встроенный набор (поведение до F5 не меняется)
     policy_rules_path: str = "deploy/policy/rules.yml"

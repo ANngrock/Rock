@@ -21,12 +21,17 @@ def load_builtin_tools() -> None:
     if _loaded:
         return
     from aegis.agents.tools import (  # noqa: F401
+        assistant,
+        automation,
         builtin,
         cognition,
+        devbox,
+        jobs,
         nodes,
         parsing,
         reminders,
         repro,
+        tasks,
         watchers,
     )
 

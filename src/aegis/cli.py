@@ -173,6 +173,107 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fbackfill.add_argument("--owner-id", type=int, default=1)
 
+    task = sub.add_parser(
+        "task",
+        help="todo владельца: задачи со сроком и напоминанием (та же база, что у бота)",
+    )
+    task_actions = task.add_subparsers(dest="task_action", required=True)
+    tadd = task_actions.add_parser("add", help="записать задачу")
+    tadd.add_argument("title")
+    tadd.add_argument("--notes", default="")
+    tadd.add_argument("--tags", default="")
+    tadd.add_argument("--prio", type=int, default=0, help="-2…2 (2 — горим)")
+    tadd.add_argument("--due", default="", help="срок словами: «в пятницу вечером», «07.09 18:00»")
+    tadd.add_argument("--no-remind", action="store_true", help="о сроке не напоминать")
+    tadd.add_argument("--owner-id", type=int, default=1)
+    tlist = task_actions.add_parser("list", help="список задач")
+    tlist.add_argument("--status", default="active", help="open|doing|done|archived|all|active")
+    tlist.add_argument("--limit", type=int, default=20)
+    tlist.add_argument("--owner-id", type=int, default=1)
+    for tverb in ("done", "drop"):
+        tv = task_actions.add_parser(tverb, help=f"{tverb}: по началу id или слову из заголовка")
+        tv.add_argument("ref")
+        tv.add_argument("--owner-id", type=int, default=1)
+    tsnooze = task_actions.add_parser("snooze", help="отодвинуть срок (остальное не трогать)")
+    tsnooze.add_argument("ref")
+    tsnooze.add_argument("until", help="новый срок словами")
+    tsnooze.add_argument("--owner-id", type=int, default=1)
+
+    job = sub.add_parser("job", help="крон-прогоны агента: «каждое утро в 8 — сделай X»")
+    job_actions = job.add_subparsers(dest="job_action", required=True)
+    jadd = job_actions.add_parser("add", help="завести прогон")
+    jadd.add_argument("title")
+    jadd.add_argument("prompt", help="что делать при каждом запуске (слова владельца)")
+    jadd.add_argument(
+        "--repeat", default="daily", help="once|every_min|hourly|daily|weekdays|weekly"
+    )
+    jadd.add_argument(
+        "--at", default="08:00", help="для daily/weekdays/weekly — ЧЧ:ММ; для once — фраза"
+    )
+    jadd.add_argument("--every-min", type=int, default=30)
+    jadd.add_argument("--dow", type=int, default=1, help="для weekly: 1=пн…7=вс")
+    jadd.add_argument("--channel", default="message", help="message|silent")
+    jadd.add_argument("--owner-id", type=int, default=1)
+    jlist = job_actions.add_parser("list", help="прогоны: расписание, статус, ошибки")
+    jlist.add_argument("--owner-id", type=int, default=1)
+    for jverb, jhelp in (
+        ("run", "поставить в очередь на ближайший тик"),
+        ("pause", "пауза (накопленное не теряется)"),
+        ("resume", "снять с паузы"),
+        ("rm", "удалить прогон"),
+    ):
+        jv = job_actions.add_parser(jverb, help=f"{jverb}: {jhelp}")
+        jv.add_argument("ref")
+        jv.add_argument("--owner-id", type=int, default=1)
+
+    action = sub.add_parser(
+        "action", help="исходящие HTTP-действия: именованные эндпоинты с печатными секретами"
+    )
+    action_actions = action.add_subparsers(dest="action_action", required=True)
+    aadd = action_actions.add_parser("add", help="сохранить эндпоинт (секреты — только здесь)")
+    aadd.add_argument("name")
+    aadd.add_argument("--url", required=True)
+    aadd.add_argument("--method", default="POST")
+    aadd.add_argument("--header", action="append", default=[], help="K:V, повторяемо")
+    aadd.add_argument("--body", default="", help="шаблон тела с {{плейсхолдерами}}")
+    aadd.add_argument("--timeout-ms", type=int, default=15000)
+    aadd.add_argument(
+        "--secret",
+        action="append",
+        default=[],
+        help="KEY=значение; без «=» значение читается из stdin (в историю shell не попадёт)",
+    )
+    aadd.add_argument("--owner-id", type=int, default=1)
+    alist = action_actions.add_parser("list", help="эндпоинты: метод, url, имена секретов, статус")
+    alist.add_argument("--owner-id", type=int, default=1)
+    arun = action_actions.add_parser("run", help="вызвать эндпоинт (значения переменных — --var)")
+    arun.add_argument("name")
+    arun.add_argument("--var", action="append", default=[], help="key=value, повторяемо")
+    arun.add_argument("--owner-id", type=int, default=1)
+    ahist = action_actions.add_parser("history", help="журнал последних запусков")
+    ahist.add_argument("--limit", type=int, default=12)
+    ahist.add_argument("--owner-id", type=int, default=1)
+    arm = action_actions.add_parser("rm", help="удалить эндпоинт (журнал остаётся)")
+    arm.add_argument("name")
+    arm.add_argument("--owner-id", type=int, default=1)
+
+    hook = sub.add_parser("hook", help="входящие вебхуки: пусть внешний мир пинает бота")
+    hook_actions = hook.add_subparsers(dest="hook_action", required=True)
+    hadd = hook_actions.add_parser("add", help="создать вход (секрет покажет `hook url`, один раз)")
+    hadd.add_argument("name")
+    hadd.add_argument("--policy", default="notify", help="notify|turn")
+    hadd.add_argument("--rate", type=int, default=6, help="срабатываний в минуту (0 — без лимита)")
+    hadd.add_argument("--owner-id", type=int, default=1)
+    hlist = hook_actions.add_parser("list", help="входы с политикой и счётчиками")
+    hlist.add_argument("--owner-id", type=int, default=1)
+    hurl = hook_actions.add_parser("url", help="адрес с ключом (одноразово, в чат не пересылать)")
+    hurl.add_argument("name")
+    hurl.add_argument("--owner-id", type=int, default=1)
+    for hverb, hflag in (("on", True), ("off", False)):
+        hv = hook_actions.add_parser(hverb, help=f"{'включить' if hflag else 'выключить'} вход")
+        hv.add_argument("name")
+        hv.add_argument("--owner-id", type=int, default=1)
+
     parse = sub.add_parser(
         "parse", help="прочитать URL один раз: страница/лента/публичный t.me-канал → текст (JSON)"
     )
@@ -1233,6 +1334,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["cognition"] = await _cognition_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
         report["checks"]["feeds"] = await _feeds_report(cfg)
+        report["checks"]["automation"] = await _automation_report(cfg)
         report["checks"]["vault"] = await _vault_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
         report["checks"]["turns"] = await _turns_report()
@@ -3647,6 +3749,452 @@ async def _cmd_turns(action: str, args: argparse.Namespace) -> int:
     return await _db_guard(go)
 
 
+async def _cmd_task(action: str, args: argparse.Namespace) -> int:
+    """Задачи todo из консоли — тот же SqlTaskStore, что у бота и меню."""
+    from aegis.planning.tasks import SqlTaskStore
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlTaskStore()
+
+    def _when(phrase: str) -> Any:
+        from datetime import UTC
+        from datetime import datetime as _dt
+
+        from aegis.planning.schedule import parse_when
+
+        return parse_when(phrase, now=_dt.now(UTC).astimezone(cfg.tz), timezone=cfg.timezone).at
+
+    if action == "add":
+        due_at: Any = None
+        if getattr(args, "due", ""):
+            try:
+                due_at = _when(args.due)
+            except ValueError as exc:
+                print(f"! срок не разобрался: {exc}", file=sys.stderr)
+                return 2
+        try:
+            row = await store.add(
+                owner_id=args.owner_id,
+                title=args.title,
+                notes=args.notes,
+                tags=args.tags,
+                priority=args.prio,
+                due_at=due_at,
+                remind_on_due=bool(due_at) and not args.no_remind,
+            )
+        except Exception as exc:  # noqa: BLE001 - без БД задачи нет: честный 1
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        tail = ""
+        if due_at is not None:
+            tail = f" · до {due_at.astimezone(cfg.tz):%d.%m %H:%M}" + (
+                " (напомню)" if not args.no_remind else ""
+            )
+        print(f"Задача «{row.title}» — {row.id[:8]}{tail}")
+        return 0
+    if action == "list":
+        try:
+            rows = await store.list_tasks(
+                owner_id=args.owner_id,
+                status=None if args.status == "all" else args.status,
+                limit=args.limit,
+            )
+            stat = await store.stats(owner_id=args.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        for t in rows:
+            mark = {"open": "☐", "doing": "▶", "done": "☑", "archived": "·"}[t.status]
+            due = f" · до {t.due_at.astimezone(cfg.tz):%d.%m %H:%M}" if t.due_at else ""
+            print(f"{mark} {t.id[:8]} {t.title}{due}" + (f" · !{t.priority}" if t.priority else ""))
+        if not rows:
+            print("пусто")
+        print(
+            f"— открыто {stat.get('open', 0)}, в работе {stat.get('doing', 0)}, "
+            f"просрочено {stat.get('overdue', 0)}, закрыто за неделю {stat.get('done_week', 0)}"
+        )
+        return 0
+    if action in ("done", "drop"):
+        status = "done" if action == "done" else "archived"
+        try:
+            touched = await store.update(owner_id=args.owner_id, ref=args.ref, status=status)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if touched is None:
+            print("! не нашёл задачу")
+            return 1
+        verb = "Готово: ✅" if action == "done" else "В архиве:"
+        print(f"{verb} «{touched.title}»")
+        return 0
+    if action == "snooze":
+        try:
+            moment = _when(args.until)
+            moved = await store.update(
+                owner_id=args.owner_id, ref=args.ref, due_at=moment, remind_on_due=True
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if moved is None or moved.due_at is None:
+            print("! не нашёл задачу")
+            return 1
+        print(f"Срок сдвинут: «{moved.title}» → {moved.due_at.astimezone(cfg.tz):%d.%m %H:%M}")
+        return 0
+    return 2
+
+
+async def _cmd_job(action: str, args: argparse.Namespace) -> int:
+    """Крон-прогоны из консоли: тот же SqlJobStore, что тикает внутри бота."""
+    from aegis.planning.jobs import SqlJobStore
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlJobStore()
+
+    if action == "add":
+        first_run = None
+        at_time = args.at
+        if args.repeat == "once":
+            from datetime import UTC
+            from datetime import datetime as _dt
+
+            from aegis.planning.schedule import parse_when
+
+            try:
+                first_run = parse_when(
+                    args.at, now=_dt.now(UTC).astimezone(cfg.tz), timezone=cfg.timezone
+                ).at
+            except ValueError as exc:
+                print(f"! момент не разобрался: {exc}", file=sys.stderr)
+                return 2
+            at_time = ""
+        try:
+            job_id = await store.add(
+                owner_id=args.owner_id,
+                title=args.title,
+                prompt=args.prompt,
+                repeat=args.repeat,
+                at_time=at_time,
+                every_min=args.every_min,
+                dow=args.dow,
+                channel=args.channel,
+                first_run=first_run,
+                tz=cfg.tz,
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        when = (
+            f"в {first_run.astimezone(cfg.tz):%d.%m %H:%M} один раз"
+            if first_run is not None
+            else f"{args.repeat}, в {at_time}"
+            if args.repeat in ("daily", "weekdays", "weekly")
+            else f"{args.repeat}, каждые {args.every_min} мин"
+        )
+        print(f"Прогон «{args.title}» ({job_id[:8]}) — {when}")
+        if not getattr(cfg, "automation_enabled", True):
+            print("! внимание: AUTOMATION_ENABLED=false — тикер бота его не поведёт")
+        return 0
+    if action == "list":
+        try:
+            jobs = await store.list_jobs(owner_id=args.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        for j in jobs:
+            state = {"active": "▶", "paused": "⏸", "done": "✔"}[j.status]
+            nxt = f" · далее {j.next_run.astimezone(cfg.tz):%d.%m %H:%M}" if j.next_run else ""
+            err = f" · ошибок подряд {j.fail_count}" if j.fail_count else ""
+            sched = j.repeat + (f" {j.at_time}" if j.at_time else "")
+            print(f"{state} {j.id[:8]} {j.title} [{sched}]{nxt}{err}")
+        if not jobs:
+            print("прогонов нет")
+        return 0
+    if action in ("run", "pause", "resume", "rm"):
+        try:
+            if action == "run":
+                note = await store.trigger_now(owner_id=args.owner_id, ref=args.ref)
+            elif action == "rm":
+                note = "удалено" if await store.drop(owner_id=args.owner_id, ref=args.ref) else None
+            else:
+                note = await store.set_status(
+                    owner_id=args.owner_id,
+                    ref=args.ref,
+                    status="paused" if action == "pause" else "active",
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(note if note else "! не нашёл (или уже в этом состоянии)")
+        return 0 if note else 1
+    return 2
+
+
+async def _cmd_action(action: str, args: argparse.Namespace) -> int:
+    """Исходящие действия: эндпоинты с запечатанными секретами и журналом."""
+    from aegis.automation.store import SqlAutomationStore
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlAutomationStore()
+
+    if action == "add":
+        headers: dict[str, str] = {}
+        for raw in args.header:
+            key, sep, value = raw.partition(":")
+            if not sep:
+                print(f"! заголовок «{raw}» — ждём K:V", file=sys.stderr)
+                return 2
+            headers[key.strip()] = value.strip()
+        secrets_map: dict[str, str] = {}
+        for raw in args.secret:
+            key, sep, value = raw.partition("=")
+            key = key.strip().upper()
+            if not sep:
+                print(f"  значение секрета {key} (однострочно; в историю не попадёт):", flush=True)
+                value = sys.stdin.readline().rstrip("\n")
+            if not value:
+                print(f"! пустое значение секрета {key}", file=sys.stderr)
+                return 2
+            secrets_map[key] = value
+        try:
+            row = await store.upsert_endpoint(
+                owner_id=args.owner_id,
+                name=args.name,
+                url=args.url,
+                method=args.method,
+                headers=headers,
+                body_template=args.body,
+                secrets_map=secrets_map or None,
+                timeout_ms=args.timeout_ms,
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        sec = (
+            f" · секреты: {', '.join(row.secret_names)}" if row.secret_names else " · секретов нет"
+        )
+        print(f"Эндпоинт «{row.name}» — {row.method} {row.url}{sec}")
+        if "{{secret:" in args.body or any("{{secret:" in v for v in headers.values()):
+            print("  плейсхолдеры {{secret:KEY}} подставятся при вызове из зачатенных значений")
+        return 0
+    if action == "list":
+        try:
+            rows = await store.list_endpoints(owner_id=args.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        for e in rows:
+            sec = f" 🔐×{len(e.secret_names)}" if e.secret_names else ""
+            flag = "" if e.enabled else " [выключен]"
+            last = f" · {e.last_status}" if e.last_status else ""
+            print(f"• {e.name} — {e.method} {e.url}{sec}{last}{flag}")
+        if not rows:
+            print("эндпоинтов нет")
+        return 0
+    if action == "run":
+        variables: dict[str, str] = {}
+        for raw in args.var:
+            key, sep, value = raw.partition("=")
+            if not sep:
+                print(f"! переменная «{raw}» — ждём key=value", file=sys.stderr)
+                return 2
+            variables[key.strip()] = value
+        from aegis.automation.execute import ActionError, run_endpoint
+
+        try:
+            row, secrets = await store.endpoint_for_run(owner_id=args.owner_id, ref=args.name)
+        except KeyError:
+            print(f"! эндпоинт «{args.name}» не найден", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        try:
+            res = await run_endpoint(
+                row, secrets, variables=variables, max_body_kb=cfg.action_max_body_kb
+            )
+        except ActionError as exc:
+            await store.record_run(
+                endpoint_id=row.id,
+                owner_id=args.owner_id,
+                ok=False,
+                status=0,
+                ms=0,
+                digest=str(exc),
+                triggered_by="cli",
+            )
+            print(f"! {exc}", file=sys.stderr)
+            return 1
+        await store.record_run(
+            endpoint_id=row.id,
+            owner_id=args.owner_id,
+            ok=res.ok,
+            status=res.status,
+            ms=res.ms,
+            digest=res.digest,
+            triggered_by="cli",
+        )
+        print(res.digest)
+        return 0 if res.ok else 1
+    if action == "history":
+        try:
+            runs = await store.recent_runs(owner_id=args.owner_id, limit=args.limit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        for r in runs:
+            mark = "✅" if r["ok"] else "❌"
+            line = f"{mark} {r['name']}: {r['status']} · {r['ms']} мс · {r['triggered_by']}"
+            print(line + f" · {str(r['digest'])[:100]}")
+        if not runs:
+            print("журнал пуст")
+        return 0
+    if action == "rm":
+        try:
+            ok = await store.drop_endpoint(owner_id=args.owner_id, ref=args.name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print("удалено (журнал остался)" if ok else "! не нашёл")
+        return 0 if ok else 1
+    return 2
+
+
+async def _cmd_hook(action: str, args: argparse.Namespace) -> int:
+    """Входящие вебхуки из консоли."""
+    from aegis.automation.store import SqlAutomationStore
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlAutomationStore()
+    base = cfg.hooks_public_url or f"http://{cfg.hooks_bind}:{cfg.hooks_port}"
+
+    if action == "add":
+        try:
+            hook, _secret = await store.add_hook(
+                owner_id=args.owner_id, name=args.name, policy=args.policy, rate_per_min=args.rate
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(f"Вебхук «{hook.name}» создан ({hook.policy}, лимит {hook.rate_per_min}/мин).")
+        print(f"  адрес с ключом одноразово: aegis hook url {hook.name}")
+        if not getattr(cfg, "hooks_enabled", False):
+            print("  ! приёмник выключен: поставь AEGIS_HOOKS_ENABLED=true и перезапусти бота")
+        return 0
+    if action == "list":
+        try:
+            hooks = await store.list_hooks(owner_id=args.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        for h in hooks:
+            flag = "" if h.enabled else " [выключен]"
+            print(
+                f"• {h.name} — {h.policy} · лимит {h.rate_per_min}/мин"
+                f" · срабатываний {h.fires}{flag}"
+            )
+        if not hooks:
+            print("вебхуков нет")
+        return 0
+    if action == "url":
+        found = await store.hook_by_name(args.name)
+        if found is None:
+            print("! не найден (или имя чужое)", file=sys.stderr)
+            return 1
+        hook, secret = found
+        if hook.owner_id != int(args.owner_id):
+            print("! это чужой вебхук", file=sys.stderr)
+            return 1
+        if not secret:
+            print("! секрет не читается (ключарка мертва?)", file=sys.stderr)
+            return 1
+        print(f"curl -X POST --data 'текст' {base}/h/{hook.name}?key={secret}")
+        print("  или заголовок X-Aegis-Key; не пересылай эту строку в чаты")
+        return 0
+    if action in ("on", "off"):
+        try:
+            note = await store.set_hook_enabled(
+                owner_id=args.owner_id, ref=args.name, enabled=action == "on"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(note if note else "! не нашёл")
+        return 0 if note else 1
+    return 2
+
+
+async def _automation_report(cfg: Any) -> dict[str, Any]:
+    """Хаб автоматизации для doctor: схема (0016) + счётчики; без ключарки — заметка."""
+    out: dict[str, Any] = {"ok": True, "detail": "отключено (AEGIS_AUTOMATION_ENABLED=false)"}
+    if not getattr(cfg, "automation_enabled", True):
+        return out
+    try:
+        from sqlalchemy import text
+
+        from aegis.platform.db import session
+
+        async with session() as s:
+            row = await s.execute(
+                text(
+                    "SELECT to_regclass('planning.tasks') AS reg,"
+                    " (SELECT count(*) FROM planning.tasks WHERE status = 'open') AS tasks,"
+                    " (SELECT count(*) FROM planning.job WHERE status = 'active') AS jobs,"
+                    " (SELECT count(*) FROM automation.endpoint) AS eps,"
+                    " (SELECT count(*) FROM automation.hook WHERE enabled) AS hooks,"
+                    " (SELECT count(*) FROM automation.run WHERE ok = false AND id >"
+                    " coalesce((SELECT max(id) - 50 FROM automation.run), 0)) AS fails"
+                )
+            )
+            r = row.mappings().one()
+        if r["reg"] is None:
+            out.update(
+                ok=False, detail="схема не готова — нужна миграция 0016 (alembic upgrade head)"
+            )
+            return out
+        out["detail"] = (
+            f"задач {r['tasks']}, прогонов {r['jobs']}, эндпоинтов {r['eps']}, "
+            f"вебхуков {r['hooks']}, сбоев в последних 50 вызовах {r['fails']}"
+        )
+        if not getattr(cfg, "hooks_enabled", False):
+            out["note"] = "приёмник вебхуков выключен (AEGIS_HOOKS_ENABLED)"
+    except Exception as exc:  # noqa: BLE001
+        out.update(ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -3666,6 +4214,14 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_watch(args.watch_action, args))
         if args.command == "feed":
             return asyncio.run(_cmd_feed(args.feed_action, args))
+        if args.command == "task":
+            return asyncio.run(_cmd_task(args.task_action, args))
+        if args.command == "job":
+            return asyncio.run(_cmd_job(args.job_action, args))
+        if args.command == "action":
+            return asyncio.run(_cmd_action(args.action_action, args))
+        if args.command == "hook":
+            return asyncio.run(_cmd_hook(args.hook_action, args))
         if args.command == "parse":
             return asyncio.run(_cmd_parse(args))
         if args.command == "vault":

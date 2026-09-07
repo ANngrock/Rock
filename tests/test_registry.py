@@ -6,9 +6,13 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, Field
 
-from aegis.agents.tools import builtin  # noqa: F401  - регистрирует инструменты
+from aegis.agents.tools import builtin, load_builtin_tools
 from aegis.agents.tools.registry import ToolRegistry, UnknownTool
 from aegis.governance.policy import Risk
+
+# импорт builtin НЕ регистрирует чужие модули: полный реестр собирает только loader — иначе
+# тесты «проходят» исключительно при везучем порядке прогона (кто-то другой загрузил раньше)
+load_builtin_tools()
 
 
 def test_schemas_are_openai_compatible() -> None:

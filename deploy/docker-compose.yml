@@ -126,6 +126,11 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
     command: ["aegis", "bot"]
+    ports:
+      # приёмник входящих вебхуков: активен только с HOOKS_ENABLED=true, и тогда в .env
+      # нужен HOOKS_BIND=0.0.0.0 (внутри контейнера loopback снаружи не виден).
+      # TLS и публичный адрес — на реверс-прокси (RUNBOOK §30).
+      - "127.0.0.1:${HOOKS_PORT:-8791}:${HOOKS_PORT:-8791}"
     restart: unless-stopped
     logging: *logging
 

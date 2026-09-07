@@ -86,6 +86,9 @@ class MenuDeps:
     inbox: Any = None
     cost: Any = None
     feeds: Any = None
+    tasks: Any = None
+    jobs: Any = None
+    automation: Any = None
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -112,6 +115,8 @@ _SECTIONS = (
     ("inbox", "💬 Личные чаты"),
     ("connectors", "🔌 Подключения"),
     ("feeds", "📡 Парсер"),
+    ("tasks", "🗂 Задачи"),
+    ("automation", "⚡ Автоматизация"),
 )
 
 
@@ -203,6 +208,10 @@ async def perform_screen(
             return await _screen_connectors(owner_id, deps, can_control)
         if screen == "feeds":
             return await _screen_feeds(owner_id, deps, can_control)
+        if screen == "tasks":
+            return await _screen_tasks(owner_id, deps, can_control)
+        if screen == "automation":
+            return await _screen_automation(owner_id, deps, can_control)
         if screen == "vision":
             return _screen_vision(deps)
         if screen == "about":
@@ -403,6 +412,109 @@ async def _screen_feeds(owner_id: int, deps: MenuDeps, can_control: bool) -> tup
     )
 
 
+async def _screen_tasks(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
+    if deps.tasks is None:
+        return _page(
+            "🗂 Задачи", "База недоступна — список дел не читается.", controls=None, screen="tasks"
+        )
+    rows = await _gather(deps.tasks.list_tasks(owner_id=owner_id, status="active", limit=10), None)
+    stat = await _gather(deps.tasks.stats(owner_id=owner_id), {})
+    if rows is None:
+        return _page(
+            "🗂 Задачи",
+            "⚠️ Хранилище не отвечает — список не показан (это не «пусто», это «не прочиталось»).",
+            controls=None,
+            screen="tasks",
+        )
+    if not rows:
+        return _page(
+            "🗂 Задачи",
+            "Открытых нет. Скажи «запиши задачу: …» — встанет сюда; с формулировкой «к пятнице»"
+            " подцеплю срок и напомню, когда он наступит.",
+            controls=None,
+            screen="tasks",
+        )
+    lines, controls = [], []
+    for t in rows:
+        mark = "▶" if t.status == "doing" else "☐"
+        due = ""
+        if t.due_at is not None:
+            over = " ⏰" if t.due_at < deps.now else ""
+            due = f" — до {_hhmm(t.due_at)}{over}"
+        pr = " ‼️" if t.priority > 0 else ""
+        lines.append(f"{mark} <code>{t.id[:8]}</code> {_esc(t.title[:70])}{pr}{due}")
+        if can_control:
+            controls.append([_btn(f"✅ {t.title[:26]}", f"m:act:task-done:{b64enc(t.id[:8])}")])
+    head = f"🗂 Задачи · {stat.get('open', 0)} откр."
+    if stat.get("overdue"):
+        head += f", {stat['overdue']} горят"
+    return _page(head, "\n".join(lines), controls=controls or None, screen="tasks")
+
+
+async def _screen_automation(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
+    if not getattr(deps.cfg, "automation_enabled", True):
+        return _page(
+            "⚡ Автоматизация",
+            "Выключена (<code>AUTOMATION_ENABLED=false</code>).",
+            controls=None,
+            screen="automation",
+        )
+    blocks: list[str] = []
+    controls: list[list[dict[str, str]]] = []
+    jobs = await _gather(deps.jobs.list_jobs(owner_id=owner_id, limit=8) if deps.jobs else None, [])
+    if deps.jobs is None:
+        blocks.append("Прогоны: база недоступна")
+    elif not jobs:
+        blocks.append("Прогоны: нет — скажи «каждое утро в 8 сделай X»")
+    else:
+        jl = []
+        for j in jobs:
+            state = {"active": "🟢", "paused": "⏸", "done": "✔"}[j.status]
+            nxt = f" · далее {_hhmm(j.next_run)}" if j.next_run and j.status == "active" else ""
+            jl.append(f"{state} <code>{j.id[:8]}</code> {_esc(j.title[:40])}{nxt}")
+            if can_control:
+                if j.status == "active":
+                    controls.append(
+                        [_btn(f"▶️ Сейчас: {j.title[:22]}", f"m:act:job-run:{b64enc(j.id[:8])}")]
+                    )
+                verb = "pause" if j.status == "active" else "resume"
+                label = "⏸ Пауза: " if verb == "pause" else "▶ Продолжить: "
+                payload = b64enc(f"{j.id[:8]}|{verb}")
+                controls.append([_btn(label + j.title[:20], f"m:act:job-toggle:{payload}")])
+        blocks.append("<b>Прогоны</b>\n" + "\n".join(jl))
+    eps = await _gather(
+        deps.automation.list_endpoints(owner_id=owner_id) if deps.automation else None, []
+    )
+    if eps:
+        el = []
+        for e in eps:
+            sec = f" 🔐{len(e.secret_names)}" if e.secret_names else ""
+            last = e.last_status or "ни разу"
+            el.append(f"• <code>{e.id[:8]}</code> <b>{_esc(e.name)}</b> — {e.method}{sec} · {last}")
+            if can_control:
+                controls.append([_btn(f"🚀 {e.name[:26]}", f"m:act:ep-run:{b64enc(e.id[:8])}")])
+        blocks.append("<b>Действия</b>\n" + "\n".join(el))
+    else:
+        blocks.append(
+            "Действия: эндпоинтов нет — <code>aegis action add …</code> или скажи мне url"
+        )
+    hooks = await _gather(
+        deps.automation.list_hooks(owner_id=owner_id) if deps.automation else None, []
+    )
+    if hooks:
+        hl = [
+            f"• <b>{_esc(h.name)}</b> — {h.policy}, {h.fires} сраб."
+            + ("" if h.enabled else " [выкл]")
+            for h in hooks
+        ]
+        blocks.append("<b>Вебхуки</b>\n" + "\n".join(hl))
+    if not getattr(deps.cfg, "hooks_enabled", False):
+        blocks.append("<i>приёмник выключен: AEGIS_HOOKS_ENABLED=true</i>")
+    return _page(
+        "⚡ Автоматизация", "\n\n".join(blocks), controls=controls or None, screen="automation"
+    )
+
+
 async def _screen_inbox(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
     if not getattr(deps.cfg, "userbot_enabled", False):
         return _page(
@@ -472,7 +584,8 @@ async def _screen_connectors(owner_id: int, deps: MenuDeps, can_control: bool) -
 def _screen_about(deps: MenuDeps) -> tuple[str, Any]:
     env = _esc(str(getattr(deps.cfg, "env", "?")))
     body = (
-        "Aegis — приватный ассистент-система: напоминания, узлы, голос, личные чаты, подключения\n"
+        "Aegis — приватный ассистент-система: напоминания, задачи, прогоны, действия, узлы,\n"
+        "голос, личные чаты, подключения — и калькулятор, который не врёт\n"
         "· всё в твоей базе, ничего не торчит наружу, кроме ответов тебе\n"
         "· команды: <code>/help</code> покажет список, <code>/menu</code> — вернуться сюда\n"
         f"· окружение: <code>{env}</code>\n"
@@ -574,6 +687,53 @@ async def apply_action(action: str, arg: str, owner_id: int, deps: MenuDeps) -> 
     if action == "feed-readall":
         n = await _gather(deps.feeds.mark_read(owner_id=owner_id) if deps.feeds else None, 0)
         return (f"✔️ Прочитано: {n}" if n else "И так всё прочитано", "feeds")
+    if action == "task-done":
+        ref = b64dec(arg)
+        row = await _gather(deps.tasks.update(owner_id=owner_id, ref=ref, status="done"), None)
+        return ("✅ Готово" if row else "! не нашёл (обнови экран)", "tasks")
+    if action == "job-run":
+        ref = b64dec(arg)
+        note = (
+            await _gather(deps.jobs.trigger_now(owner_id=owner_id, ref=ref), None)
+            if deps.jobs
+            else None
+        )
+        return (note or "! прогон не найден", "automation")
+    if action == "job-toggle":
+        verb, _, ref = b64dec(arg).partition("|")
+        status = "paused" if verb == "pause" else "active"
+        note = (
+            await _gather(deps.jobs.set_status(owner_id=owner_id, ref=ref, status=status), None)
+            if deps.jobs
+            else None
+        )
+        return (note or "! не нашёл/уже так", "automation")
+    if action == "ep-run":
+        ref = b64dec(arg)
+        if deps.automation is None:
+            return ("! база недоступна", "automation")
+        try:
+            from aegis.automation.execute import run_endpoint
+
+            row, secrets = await deps.automation.endpoint_for_run(owner_id=owner_id, ref=ref)
+            res = await asyncio.wait_for(
+                run_endpoint(
+                    row, secrets, max_body_kb=int(getattr(deps.cfg, "action_max_body_kb", 256))
+                ),
+                timeout=float(getattr(deps.cfg, "action_timeout_s", 15.0)) + 5.0,
+            )
+            await deps.automation.record_run(
+                endpoint_id=row.id,
+                owner_id=owner_id,
+                ok=res.ok,
+                status=res.status,
+                ms=res.ms,
+                digest=res.digest,
+                triggered_by="menu",
+            )
+            return (f"{'✅' if res.ok else '❌'} {res.status} · {res.ms} мс", "automation")
+        except Exception as exc:  # noqa: BLE001 - доклад, не исключение из callback
+            return (f"! {type(exc).__name__}: {str(exc)[:80]}", "automation")
     if action == "conn-toggle":
         want, _, ref = b64dec(arg).partition("|")
         rows = await _gather(
