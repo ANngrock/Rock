@@ -229,6 +229,11 @@ class Settings(BaseSettings):
     node_cmd_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
     node_heartbeat_seconds: int = Field(default=20, ge=5, le=300)
 
+    # --- мини-апп зрения (шаг 9): Telegram WebApp, TS-сервер живёт отдельно (miniapp/) ---
+    #: HTTPS-url мини-аппа (startapp/web_app кнопки). Пусто = кнопка «Vision» показывает,
+    #  что не настроено: врать о «красивом меню с камерой» при мёртвой кнопке — не стиль этого репо
+    telegram_miniapp_url: str = ""
+
     # --- когнитивный слой: воронка, эмоция, стикеры (шаг 2.13) ---
     #: выключить воронку = «как раньше»: текст идёт в модель как есть. Вкл. по умолчанию —
     #: чистка и регистрация в <cognition>-блоке дешевле неверно понятой реплики
@@ -464,6 +469,11 @@ class Settings(BaseSettings):
             )
         if provider == "webhook" and not self.call_webhook_url.startswith("http"):
             raise ConfigError("CALL_PROVIDER=webhook требует CALL_WEBHOOK_URL (http/https)")
+        if self.telegram_miniapp_url and not self.telegram_miniapp_url.startswith("https://"):
+            raise ConfigError(
+                "TELEGRAM_MINIAPP_URL обязан быть https:// — Telegram не откроет http-мини-апп,"
+                " а «кнопка, которая жмётся и молчит», хуже кнопки, которой нет"
+            )
         if self.userbot_enabled and not str(self.nats_url or "").strip():
             raise ConfigError(
                 "USERBOT_ENABLED=true требует NATS_URL: демон с телефоном живёт отдельно от бота,"

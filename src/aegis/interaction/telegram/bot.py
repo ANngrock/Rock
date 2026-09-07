@@ -41,6 +41,7 @@ from aegis.agents.supervisor import Inbound, Reply
 from aegis.agents.tools import load_builtin_tools
 from aegis.agents.tools.images import sniff_mime
 from aegis.agents.tools.registry import Attachment
+from aegis.interaction.telegram import menu as menu_mod
 from aegis.interaction.telegram.render import render_for_telegram, strip_tags
 from aegis.interaction.telegram.stream import PLACEHOLDER, make_stream
 from aegis.platform.config import ConfigError
@@ -68,6 +69,7 @@ _HELP = (
     "• /resume — разморозить записи\n"
     "• /ub list — входящие из личных чатов (если включён юзербот)\n"
     "• /ub send <id> — отправить черновик от вашего имени; /ub drop <id> — в корзину\n"
+    "• /menu — кнопочное меню: состояние, напоминания, узлы, словари, чаты, зрение\n"
     "• /help — это сообщение"
 )
 
@@ -184,6 +186,80 @@ async def send_reply(bot: Bot, chat_id: int, reply: Reply) -> Message | None:
 @router.message(Command("start", "help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(_HELP)
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, app: App) -> None:
+    deps = _menu_deps(app)
+    text, kb = await menu_mod.perform_screen(
+        "main",
+        _house_owner(app, message),
+        deps,
+        can_control=_viewer_is_owner(app, message),
+    )
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("m:"))
+async def on_menu_cb(callback: CallbackQuery, app: App) -> None:
+    """Навигация меню: правка на месте, действие — с коротким answer. Не наше — молчим."""
+    parsed = menu_mod.parse_cb(str(callback.data or ""))
+    message = callback.message
+    if parsed is None or not isinstance(message, Message):
+        await callback.answer()
+        return
+    kind, screen, arg = parsed
+    if kind == "noop":
+        await callback.answer("Меню закрывать не нужно — просто сверните")
+        return
+    owner_id = _house_owner(app, message)
+    deps = _menu_deps(app)
+    notice = ""
+    if kind == "act":
+        if not _viewer_is_owner(app, callback):
+            await callback.answer("Управлять меню может только владелец", show_alert=True)
+            return
+        notice, screen = await menu_mod.apply_action(screen, arg, owner_id, deps)
+    try:
+        text, kb = await menu_mod.perform_screen(
+            screen, owner_id, deps, can_control=_viewer_is_owner(app, callback)
+        )
+        await message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # «сообщение не изменилось» — штатно при двойном тапе
+    await callback.answer(notice[:200] or None)
+
+
+def _house_owner(app: App, event: Any) -> int:
+    user = getattr(event, "from_user", None)
+    actor = int(getattr(user, "id", 0) or 0)
+    return int(app.cfg.telegram_owner_id or actor or 1)
+
+
+def _viewer_is_owner(app: App, event: Any) -> bool:
+    user = getattr(event, "from_user", None)
+    owner = app.cfg.telegram_owner_id
+    return owner is not None and str(getattr(user, "id", "")) == str(owner)
+
+
+def _menu_deps(app: App) -> Any:
+    from aegis.cognition.inbox import SqlInboxStore
+    from aegis.cognition.lexicon import SqlLexicon
+    from aegis.cognition.stickers import SqlStickers
+    from aegis.integrations.store import SqlConnectorStore
+    from aegis.planning.nodes import SqlNodeStore
+    from aegis.planning.reminders import SqlReminderStore
+
+    return menu_mod.MenuDeps(
+        cfg=app.cfg,
+        reminders=SqlReminderStore() if app.db_ready else None,
+        nodes=SqlNodeStore() if app.db_ready else None,
+        connectors=SqlConnectorStore() if app.db_ready else None,
+        lexicon=SqlLexicon() if app.db_ready else None,
+        stickers=SqlStickers() if app.db_ready else None,
+        inbox=SqlInboxStore() if app.db_ready else None,
+        cost=app.cost,
+    )
 
 
 @router.message(Command("new"))
@@ -423,7 +499,7 @@ async def on_unsupported(message: Message) -> None:
 #: «/restart» без этой проверки улетал бы в модель как обычный текст: трата токенов и
 #: загадочный ответ вместо «такой команды нет».
 KNOWN_COMMANDS = frozenset(
-    {"start", "help", "new", "cost", "status", "tools", "halt", "resume", "ub"}
+    {"start", "help", "menu", "new", "cost", "status", "tools", "halt", "resume", "ub"}
 )
 _COMMAND_SHAPED = re.compile(r"^/([A-Za-z][A-Za-z0-9_]{1,31})(?:@\w+)?$")
 #: команды, которые просят сделать что-то с самим процессом — это делается снаружи
