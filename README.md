@@ -97,6 +97,7 @@ aegis turns status|release TRACE|drain OWNER [--execute]  # аренда ход�
 aegis remind add --channel call … | remind test           # напоминание звонком; без провайдера — честный деград (шаг 2.9, RUNBOOK §21)
 aegis watch add "цена" --url … --needle … | watch tick    # наблюдатели: событие → напоминание (шаг 2.10)
 aegis connect add-mcp … | probe NAME                      # MCP/API-ключи/плагины: реестр подключений (шаг 2.11)
+aegis node enroll desk | serve --name … --code … # узлы: управление своим ПК командой с телефона (шаг 2.12)
 ```
 
 ## Качество

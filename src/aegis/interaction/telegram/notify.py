@@ -68,6 +68,31 @@ class TelegramNotifier:
             raise
         log.info("reminder.sent", id=reminder.short_id, chat=self.chat_id)
 
+    async def send_note(self, text: str, *, image_b64: str | None = None) -> None:
+        """Односторочный «бот пишет сам» для узлов: текст и (опционально) картинка из b64.
+
+        Картинка идёт как есть (bytes через BytesIO): скриншот — единственный медиа-путь v1;
+        кривой base64 ронять доставку не имеет права — тогда уйдёт только подпись.
+        """
+        await self.start()
+        import base64
+        from io import BytesIO
+
+        try:
+            if image_b64:
+                raw = base64.b64decode(image_b64, validate=True)
+                await self._bot.send_photo(self.chat_id, photo=BytesIO(raw), caption=text[:1000])
+                return
+            await self._bot.send_message(self.chat_id, text[:3900])
+        except Exception as exc:  # noqa: BLE001 - картинка необязательна: пробуем текстом
+            if image_b64:
+                await self._bot.send_message(
+                    self.chat_id, text[:3900] + f"\n(фото не приложено: {type(exc).__name__})"
+                )
+            else:
+                log.warning("node.note_failed", err=repr(exc)[:200])
+                raise
+
 
 async def print_reminder(reminder: Reminder) -> None:
     """Отправка «в консоль» для ``--dry-run``: показать, что ушло бы, не трогая Telegram."""

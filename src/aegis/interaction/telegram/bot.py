@@ -789,6 +789,36 @@ async def _reminders_tick_loop(app: App) -> None:
             await asyncio.sleep(interval)
 
 
+async def _node_gateway_loop(app: App) -> None:
+    """Фоновый гейтвей узлов: связка/heartbeat/результаты + рассылка созревших команд.
+
+    Без этой задачи бот — только БД: команды копились бы в очереди, а ответов никто не ждал.
+    Поднимаем, роняем и переподключаемся здесь же: NATS — чужой процесс, он имеет право лежать,
+    узлы при этом не «теряются» (факты в БД) и догоняют после восстановления.
+    """
+    backoff = 5.0
+    while True:
+        gateway = None
+        try:
+            from aegis.interaction.nodes.relay import NodeGateway
+            from aegis.planning.nodes import SqlNodeStore
+
+            gateway = NodeGateway(cfg=app.cfg, store=SqlNodeStore())
+            await gateway.start()
+            backoff = 5.0
+            await gateway.run()
+        except asyncio.CancelledError:
+            if gateway is not None:
+                await gateway.aclose()
+            return
+        except Exception as exc:  # noqa: BLE001 - транспорт лежит: узлы ждут, чат отвечает
+            log.warning("nodes.gateway_down", retry_in=backoff, err=repr(exc)[:200])
+            if gateway is not None:
+                await gateway.aclose()
+            await asyncio.sleep(backoff)
+            backoff = min(300.0, backoff * 2)
+
+
 async def main() -> None:
     from aegis.agents.tools.registry import registry
 
@@ -801,6 +831,22 @@ async def main() -> None:
         raise SystemExit(2) from None
 
     bot, dp = build_dispatcher(app)
+    if app.db_ready:
+        # внешние подключения — до первого ответа: инструменты должны быть в реестре заранее;
+        # сбой коннектора не роняет бота (принцип 5), он виден в логе и в doctor
+        try:
+            from aegis.integrations.bridge import load_connectors_into_registry
+
+            loaded = await load_connectors_into_registry(app.cfg)
+            if loaded["registered"] or loaded["notes"]:
+                log.info(
+                    "integrations.loaded",
+                    tools=loaded["registered"],
+                    connectors=loaded["connectors"],
+                    notes=loaded["notes"][:5],
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("integrations.load_failed", err=repr(exc)[:200])
     log.info("bot.start", owner_id=app.cfg.telegram_owner_id, tools=len(app.registry.names()))
     if app.db_ready:
         # Старт не блокируем: без схемы бот полезен, но оператор должен узнать сразу, а не по
@@ -818,6 +864,9 @@ async def main() -> None:
         and int(getattr(app.cfg, "reminders_inprocess_seconds", 0) or 0) > 0
     ):
         reminders_task = asyncio.create_task(_reminders_tick_loop(app))
+    nodes_task: asyncio.Task[None] | None = None
+    if app.db_ready and app.cfg.nodes_enabled:
+        nodes_task = asyncio.create_task(_node_gateway_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -839,6 +888,9 @@ async def main() -> None:
         if reminders_task is not None:
             reminders_task.cancel()
             await asyncio.gather(reminders_task, return_exceptions=True)
+        if nodes_task is not None:
+            nodes_task.cancel()
+            await asyncio.gather(nodes_task, return_exceptions=True)
         await app.aclose()
 
 

@@ -163,6 +163,50 @@ def _build_parser() -> argparse.ArgumentParser:
     cpr.add_argument("--call", default=None, help="вызвать инструмент (имя)")
     cpr.add_argument("--json", default="{}", help="аргументы вызова JSON")
     cpr.add_argument("--owner-id", type=int, default=1)
+
+    node = sub.add_parser(
+        "node", help="узлы: компьютеры владельца — связка, команды, демон, журнал"
+    )
+    node_actions = node.add_subparsers(dest="node_action", required=True)
+    ne = node_actions.add_parser("enroll", help="создать pending-узел и выдать 6-значный код")
+    ne.add_argument("name")
+    ne.add_argument("--owner-id", type=int, default=1)
+    nr = node_actions.add_parser(
+        "revoke", help="отвязать узел (демон получит отказ, команды встанным)"
+    )
+    nr.add_argument("name")
+    nr.add_argument("--owner-id", type=int, default=1)
+    nl = node_actions.add_parser("list", help="узлы, связка, онлайн-статус по heartbeat")
+    nl.add_argument("--owner-id", type=int, default=1)
+    nl_ = node_actions.add_parser("log", help="последние команды и их исходы")
+    nl_.add_argument("--limit", type=int, default=10)
+    nl_.add_argument("--owner-id", type=int, default=1)
+    nca = node_actions.add_parser("cancel", help="снять queued-команду (ещё не улетела)")
+    nca.add_argument("ref")
+    nca.add_argument("--owner-id", type=int, default=1)
+    for verb, verb_help in (
+        ("system", "собрать снапшот системы"),
+        ("notify", "показать уведомление на рабочем столе"),
+        ("screenshot", "прислать скриншот (если пролезет в брокер)"),
+        ("run", "выполнить команду — HIGH-риск, ответ вернётся в чат/журнал"),
+    ):
+        cn = node_actions.add_parser(verb, help=verb_help)
+        cn.add_argument("node")
+        if verb == "notify":
+            cn.add_argument("--text", required=True)
+        if verb == "run":
+            cn.add_argument("--command", required=True)
+            cn.add_argument("--timeout", type=int, default=60)
+        cn.add_argument(
+            "--wait", type=int, default=0, help="до N секунд ждать результат (для скриптов)"
+        )
+        cn.add_argument("--owner-id", type=int, default=1)
+    ns = node_actions.add_parser(
+        "serve", help="ЗАПУСТИТЬ ДЕМОН НА МАШИНЕ (исходящее соединение к NATS, код связки)"
+    )
+    ns.add_argument("--name", required=True)
+    ns.add_argument("--code", default=None, help="6 цифр из aegis node enroll (первый запуск)")
+    ns.add_argument("--url", default=None, help="NATS url (по умолчанию NATS_URL из конфига)")
     show = remind_actions.add_parser("list", help="запланированные напоминания")
     show.add_argument("--limit", type=int, default=10)
     show.add_argument("--owner-id", type=int, default=1)
@@ -508,6 +552,73 @@ async def _reminders_report(cfg: Any) -> dict[str, Any]:
     )
     if out["overdue"]:
         out["hint"] = "ждут тика: systemctl status aegis-reminders.timer"
+    return out
+
+
+async def _integrations_report(cfg: Any) -> dict[str, Any]:
+    """Реестр подключений: что включено и что упало на пробе. ok=True всегда: нерабочий
+    MCP-сервер не делает бота больным, он делает бота менее умным — это note/hint."""
+    out: dict[str, Any] = {"ok": True}
+    if not cfg.integrations_enabled:
+        out["state"] = "выключено"
+        out["note"] = "INTEGRATIONS_ENABLED=false"
+        return out
+    try:
+        ready = await _scalar("SELECT to_regclass('integrations.connectors') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - postgres-проверка точнее
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = "накатить миграцию 0011 (make migrate)"
+        return out
+    stats = await _scalar(
+        "SELECT concat(count(*), '|', count(*) FILTER (WHERE enabled),"
+        " count(*) FILTER (WHERE enabled AND last_error IS NOT NULL))"
+        " FROM integrations.connectors"
+    )
+    total_n, enabled_n, broken_n = (int(x) for x in str(stats).split("|"))
+    out["note"] = f"{enabled_n} из {total_n} включено"
+    if broken_n:
+        out["hint"] = f"{broken_n} коннекторов падают на пробе: aegis connect list"
+    return out
+
+
+async def _nodes_report(cfg: Any) -> dict[str, Any]:
+    """Узлы: связки и открытые команды. ok=True: узлы — управление, а не жизнь бота."""
+    out: dict[str, Any] = {"ok": True}
+    if not cfg.nodes_enabled:
+        out["state"] = "выключено"
+        out["note"] = "NODES_ENABLED=false"
+        return out
+    try:
+        ready = await _scalar("SELECT to_regclass('planning.nodes') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - postgres-проверка точнее
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = "накатить миграцию 0012 (make migrate)"
+        return out
+    stats = await _scalar(
+        "SELECT concat(count(*) FILTER (WHERE status = 'paired'), '|',"
+        " count(*) FILTER (WHERE status = 'paired'"
+        " AND last_seen > now() - interval '90 seconds'),"
+        " count(*) FILTER (WHERE status = 'pending')) FROM planning.nodes"
+    )
+    paired, online, pending = (int(x) for x in str(stats).split("|"))
+    open_cmds = int(
+        await _scalar(
+            "SELECT count(*) FROM planning.node_commands WHERE status IN ('queued', 'dispatched')"
+        )
+        or 0
+    )
+    out["note"] = (
+        f"узлов: {paired} привязано ({online} онлайн, {pending} ждут связки)"
+        f" · открытых команд: {open_cmds}"
+    )
+    if pending:
+        out["hint"] = "непривязанные узлы истекут через 15 минут — aegis node list"
     return out
 
 
@@ -884,6 +995,8 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
     try:
         report["checks"]["postgres"] = await _postgres_report()
         report["checks"]["reminders"] = await _reminders_report(cfg)
+        report["checks"]["integrations"] = await _integrations_report(cfg)
+        report["checks"]["nodes"] = await _nodes_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
         report["checks"]["turns"] = await _turns_report()
@@ -1064,6 +1177,143 @@ async def _cmd_watch(action: str, args: argparse.Namespace) -> int:
         return 1 if report.paused else 0
 
     return 2
+
+
+async def _cmd_node(action: str, args: argparse.Namespace) -> int:
+    """Узлы: управление чужой (своей!) машиной — коды возврата как контракт, вывод без секретов.
+
+    serve запускается НА машине узла (не на сервере): ему нужны только NATS_URL и код связки;
+    серверу не нужен входящий порт — ноутбук «позвонит сам» исходящим соединением.
+    """
+    import asyncio as _aio
+
+    from aegis.planning.nodes import SqlNodeStore, validate_payload
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if not cfg.nodes_enabled:
+        print("! NODES_ENABLED=false — узлы выключены (включите в .env)", file=sys.stderr)
+        return 2
+    store = SqlNodeStore()
+
+    try:
+        if action == "enroll":
+            node_id, code = await store.enroll(owner_id=args.owner_id, name=args.name)
+            print(f"Узел «{args.name}» создан: id={node_id[:8]}, статус pending (15 минут)")
+            print(
+                f"Код связки — на машине узла:  aegis node serve --name {args.name} --code {code}"
+            )
+            return 0
+
+        if action == "revoke":
+            ok = await store.revoke(owner_id=args.owner_id, name=args.name)
+            print("отвязан" if ok else "не нашёл связанный узел с таким именем")
+            return 0 if ok else 1
+
+        if action == "list":
+            from datetime import UTC as _UTC
+            from datetime import datetime as _dt
+
+            nodes = await store.list_nodes(owner_id=args.owner_id)
+            if not nodes:
+                print("узлов нет: aegis node enroll ИМЯ")
+                return 0
+            now = _dt.now(_UTC)
+            for n in nodes:
+                seen = ""
+                if n.last_seen is not None:
+                    age = (now - n.last_seen).total_seconds()
+                    seen = " · онлайн" if age < 90 else f" · молчит {int(age)} c"
+                caps = f" · {n.caps.get('os', '')}" if n.caps.get("os") else ""
+                print(f" {n.short_id} {n.status:<8} «{n.name}»{caps}{seen}")
+            return 0
+
+        if action == "log":
+            rows = await store.list_recent(owner_id=args.owner_id, limit=args.limit)
+            for r in rows:
+                err = f" ! {str(r['error'])[:80]}" if r["error"] else ""
+                prev = f" → {str(r['result_preview'])[:80]}" if r["result_preview"] else ""
+                print(f" {str(r['id'])[:8]} {r['status']:<10} {r['node']}/{r['action']}{prev}{err}")
+            return 0
+
+        if action == "cancel":
+            ok = await store.cancel(owner_id=args.owner_id, ref=args.ref)
+            print("снято" if ok else "не нашёл queued-команду по ref")
+            return 0 if ok else 1
+
+        if action == "serve":
+            from aegis.interaction.nodes.relay import NodeDaemon
+
+            url = (args.url or cfg.nats_url or "").strip()
+            if not url:
+                print("! NATS url пуст (--url или NATS_URL в .env)", file=sys.stderr)
+                return 2
+            if not args.code:
+                print(
+                    "! первый запуск требует --code из `aegis node enroll`;"
+                    " дальше демон скажет «привязка отклонена» — перевыпустите узел",
+                    file=sys.stderr,
+                )
+                return 2
+            daemon = NodeDaemon(
+                url=url,
+                name=args.name,
+                code=args.code,
+                hb_seconds=float(cfg.node_heartbeat_seconds),
+            )
+            print(f"демон «{args.name}» → {url}: Ctrl-C чтобы остановить")
+            await daemon.serve()
+            return 0
+
+        # system | notify | screenshot | run
+        node = await store.find(owner_id=args.owner_id, ref=args.node)
+        if node is None:
+            print(f"! узел «{args.node}» не найден среди своих", file=sys.stderr)
+            return 2
+        payload: dict[str, object] = {}
+        if action == "notify":
+            payload = {"text": args.text}
+        elif action == "run":
+            payload = {"command": args.command, "timeout_s": args.timeout}
+        try:
+            validate_payload(action, payload)
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        cmd_id = await store.enqueue(
+            node=node,
+            owner_id=args.owner_id,
+            action=action,
+            payload=payload,
+            ttl_seconds=cfg.node_cmd_ttl_seconds,
+        )
+        print(f"queued: {cmd_id[:8]} → «{node.name}»/{action}")
+        if args.wait > 0:
+            import asyncio as _waiter
+
+            deadline = _waiter.get_running_loop().time() + args.wait
+            while _waiter.get_running_loop().time() < deadline:
+                rows = await store.list_recent(owner_id=args.owner_id, limit=5)
+                row = next((r for r in rows if str(r["id"])[:8] == cmd_id[:8]), None)
+                if row and row["status"] in ("done", "failed", "expired"):
+                    print(f"{row['status']}:")
+                    print(str(row["result_preview"] or row["error"] or ""))
+                    return 0 if row["status"] == "done" else 1
+                await _aio.sleep(1)
+            print("! узел не ответил за ожидание — следите через aegis node log", file=sys.stderr)
+            return 1
+        print("  ответ узла придёт сообщением в чат (когда бот запущен) или в aegis node log")
+        return 0
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - диагноз кодом, не трейсбеком
+        print(f"! {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
 
 
 async def _cmd_connect(action: str, args: argparse.Namespace) -> int:
@@ -2671,6 +2921,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_watch(args.watch_action, args))
         if args.command == "connect":
             return asyncio.run(_cmd_connect(args.connect_action, args))
+        if args.command == "node":
+            return asyncio.run(_cmd_node(args.node_action, args))
         if args.command == "index":
             return asyncio.run(_cmd_index(args.index_action, args))
         if args.command == "outbox":

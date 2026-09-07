@@ -223,6 +223,12 @@ class Settings(BaseSettings):
     mcp_call_timeout_seconds: int = Field(default=30, ge=3, le=300)
     mcp_max_tools: int = Field(default=40, ge=1, le=200)
 
+    # --- узлы: компьютеры владельца, управляемые из Telegram (миграция 0012) ---
+    #: по умолчанию выключено: включение — осознанный шаг (демон на машине + исходящее соединение)
+    nodes_enabled: bool = False
+    node_cmd_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
+    node_heartbeat_seconds: int = Field(default=20, ge=5, le=300)
+
     # --- звонок как канал доставки напоминаний ---
     #: none|twilio|webhook. Twilio — TTS через REST и без публичного URL (TwiML передаётся телом
     #  запроса); webhook — POST {"to","text"} на свой шлюз (Asterisk/FreePBX/софтфон-мост)
@@ -428,6 +434,11 @@ class Settings(BaseSettings):
             )
         if provider == "webhook" and not self.call_webhook_url.startswith("http"):
             raise ConfigError("CALL_PROVIDER=webhook требует CALL_WEBHOOK_URL (http/https)")
+        if self.nodes_enabled and not str(self.nats_url or "").strip():
+            raise ConfigError(
+                "NODES_ENABLED=true требует NATS_URL: команды узлу летят через брокер, "
+                "без него очередь будет только копить нежность к мёртвому транспорту"
+            )
         if self.crypto_mode == "enforce" and self.crypto_kek is None:
             raise ConfigError(
                 "CRYPTO_MODE=enforce требует AEGIS_KEK (base64, 32 байта). Иначе «зашифровано» "

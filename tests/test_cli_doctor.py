@@ -199,6 +199,8 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_models_report", forbidden)
     monkeypatch.setattr(cli, "_postgres_report", ok)
     monkeypatch.setattr(cli, "_reminders_report", ok)
+    monkeypatch.setattr(cli, "_integrations_report", ok)
+    monkeypatch.setattr(cli, "_nodes_report", ok)
     monkeypatch.setattr(cli, "_notes_index_report", ok)
     monkeypatch.setattr(cli, "_outbox_report", ok)
     monkeypatch.setattr(cli, "_langfuse_report", ok)
@@ -208,6 +210,8 @@ async def test_quick_skips_every_live_probe(
     assert set(report["checks"]) == {
         "postgres",
         "redis",
+        "integrations",
+        "nodes",
         "reminders",
         "notes_index",
         "outbox",
