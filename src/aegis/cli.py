@@ -126,6 +126,43 @@ def _build_parser() -> argparse.ArgumentParser:
     watch_actions.add_parser(
         "tick", help="прогнать созревшие проверки (для systemd-таймера; доставка — тиком remind)"
     )
+
+    conn = sub.add_parser(
+        "connect", help="подключения: MCP-серверы, API-ключи, плагины — реестр и пробы"
+    )
+    conn_actions = conn.add_subparsers(dest="connect_action", required=True)
+    cadd = conn_actions.add_parser("add-mcp", help="зарегистрировать MCP-сервер (stdio-процесс)")
+    cadd.add_argument("name")
+    cadd.add_argument("--command", required=True, help="исполняемый файл сервера")
+    cadd.add_argument("--arg", action="append", default=[], help="аргумент запуска (повторять)")
+    cadd.add_argument("--env", action="append", default=[], help="VAR=value (повторять)")
+    cadd.add_argument("--secret-env", default="", help="имя env-переменной для хранимого секрета")
+    cadd.add_argument("--owner-id", type=int, default=1)
+    caapi = conn_actions.add_parser("add-api", help="именованный API-ключ (секрет в базе, шифром)")
+    caapi.add_argument("name")
+    caapi.add_argument("--base-url", default="")
+    caapi.add_argument("--header", default="Authorization")
+    caapi.add_argument("--owner-id", type=int, default=1)
+    capl = conn_actions.add_parser("add-plugin", help="локальный python-плагин из venv")
+    capl.add_argument("name")
+    capl.add_argument("--module", required=True, help="импортируемый путь pkg.mod")
+    capl.add_argument("--owner-id", type=int, default=1)
+    clin = conn_actions.add_parser("list", help="все подключения с состоянием проб")
+    clin.add_argument("--owner-id", type=int, default=1)
+    csec = conn_actions.add_parser("secret", help="записать секрет (значение из stdin или --value)")
+    csec.add_argument("name")
+    csec.add_argument("--kind", choices=("api", "mcp"), default="api")
+    csec.add_argument("--value", default=None, help="осторожно: попадёт в историю shell")
+    csec.add_argument("--owner-id", type=int, default=1)
+    for verb in ("enable", "disable", "rm"):
+        cx = conn_actions.add_parser(verb, help=f"{verb}: подключить/отключить/удалить")
+        cx.add_argument("name")
+        cx.add_argument("--owner-id", type=int, default=1)
+    cpr = conn_actions.add_parser("probe", help="запустить сервер и показать его инструменты")
+    cpr.add_argument("name")
+    cpr.add_argument("--call", default=None, help="вызвать инструмент (имя)")
+    cpr.add_argument("--json", default="{}", help="аргументы вызова JSON")
+    cpr.add_argument("--owner-id", type=int, default=1)
     show = remind_actions.add_parser("list", help="запланированные напоминания")
     show.add_argument("--limit", type=int, default=10)
     show.add_argument("--owner-id", type=int, default=1)
@@ -1026,6 +1063,145 @@ async def _cmd_watch(action: str, args: argparse.Namespace) -> int:
             print(f"  ! {note}", file=sys.stderr)
         return 1 if report.paused else 0
 
+    return 2
+
+
+async def _cmd_connect(action: str, args: argparse.Namespace) -> int:
+    """Реестр подключений из консоли. Секрет по stdin — чтобы не светиться в ps и в истории
+    shell; --value оставлено как явный осознанный грех (документация это и называет)."""
+    import json as _json
+
+    from aegis.integrations.store import SqlConnectorStore
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if not cfg.integrations_enabled:
+        print(
+            "! INTEGRATIONS_ENABLED=false — реестр отключён (включите, потом управляйте)",
+            file=sys.stderr,
+        )
+        return 2
+    store = SqlConnectorStore()
+
+    try:
+        if action in ("add-mcp", "add-api", "add-plugin"):
+            kind = action.split("-")[1]
+            config: dict[str, Any] = {}
+            if kind == "mcp":
+                env: dict[str, str] = {}
+                for raw in args.env:
+                    key, _, val = raw.partition("=")
+                    if not val:
+                        print(f"! --env ждёт VAR=value, получил {raw!r}", file=sys.stderr)
+                        return 2
+                    env[key.strip()] = val
+                config = {
+                    "command": args.command,
+                    "args": list(args.arg),
+                    "env": env,
+                    "secret_env": args.secret_env,
+                }
+            elif kind == "api":
+                config = {"base_url": args.base_url, "header": args.header}
+            else:
+                config = {"module": args.module}
+            conn_id = await store.add(
+                owner_id=args.owner_id, kind=kind, name=args.name, config=config
+            )
+            print(f"Сохранено: {kind}/{args.name} (id={conn_id[:8]})")
+            if kind in ("mcp", "api"):
+                print("  секрет (если нужен): aegis connect secret NAME --kind " + kind)
+            return 0
+
+        if action == "list":
+            from aegis.integrations.bridge import describe_connectors
+
+            connectors = await store.list(owner_id=args.owner_id)
+            print(describe_connectors(connectors))
+            return 0
+
+        if action == "secret":
+            raw_value = args.value
+            if raw_value is None:
+                if sys.stdin.isatty():
+                    print("введите секрет и нажмите Ctrl-D:", file=sys.stderr)
+                raw_value = sys.stdin.read()
+            await store.set_secret(
+                owner_id=args.owner_id, kind=args.kind, name=args.name, plaintext=raw_value
+            )
+            print(f"Секрет {args.kind}/{args.name} сохранён (в базе — только шифртекст)")
+            return 0
+
+        if action in ("enable", "disable"):
+            ok = await store.set_enabled(
+                owner_id=args.owner_id, name=args.name, enabled=(action == "enable")
+            )
+            print("ок" if ok else "не нашёл подключения с таким именем")
+            return 0 if ok else 1
+
+        if action == "rm":
+            ok = await store.remove(owner_id=args.owner_id, name=args.name)
+            print("удалено" if ok else "не нашёл подключения с таким именем")
+            return 0 if ok else 1
+
+        if action == "probe":
+            connectors = await store.list(owner_id=args.owner_id)
+            conn = next((x for x in connectors if x.name == args.name), None)
+            if conn is None:
+                print(f"! нет подключения {args.name!r}", file=sys.stderr)
+                return 2
+            if conn.kind != "mcp":
+                what = "секрет в базе" if conn.kind == "api" else "модуль плагина"
+                print(f"probe: для {conn.kind} пробы нет — это {what}")
+                return 0
+            from aegis.integrations.bridge import mcp_launch_params
+            from aegis.integrations.mcp import McpClient
+
+            launch = await mcp_launch_params(conn, store)
+            async with McpClient(**launch, timeout_s=float(cfg.mcp_call_timeout_seconds)) as client:
+                if args.call:
+                    try:
+                        call_args = _json.loads(args.json)
+                    except _json.JSONDecodeError as exc:
+                        print(f"! --json не разбирается: {exc}", file=sys.stderr)
+                        return 2
+                    text, is_err = await client.call_tool(args.call, dict(call_args))
+                    print("isError" if is_err else "ok")
+                    print(text[:4000])
+                    await store.record_probe(
+                        connector_id=conn.id,
+                        ok=not is_err,
+                        error=None if not is_err else text[:300],
+                    )
+                    return 0 if not is_err else 1
+                tools = await client.list_tools()
+            print(f"инструментов: {len(tools)}")
+            for tool in tools[:40]:
+                ann = tool.get("annotations") or {}
+                flags = ",".join(k[:-4] for k, v in ann.items() if v)
+                name_ = str(tool.get("name"))
+                desc = str(tool.get("description") or "")[:80]
+                print(f"  {name_}{' · ' + flags if flags else ''} — {desc}")
+            await store.record_probe(connector_id=conn.id, ok=True)
+            return 0
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - база/шифрование/сервер: код возврата + диагноз
+        from aegis.integrations.mcp import McpError as _ME
+
+        if isinstance(exc, _ME):
+            print(f"! mcp: {exc}", file=sys.stderr)
+            return 1
+        if "Operational" in type(exc).__name__ or "Connection" in type(exc).__name__:
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(f"! {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
     return 2
 
 
@@ -2493,6 +2669,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_remind(args.remind_action, args))
         if args.command == "watch":
             return asyncio.run(_cmd_watch(args.watch_action, args))
+        if args.command == "connect":
+            return asyncio.run(_cmd_connect(args.connect_action, args))
         if args.command == "index":
             return asyncio.run(_cmd_index(args.index_action, args))
         if args.command == "outbox":

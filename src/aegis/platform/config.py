@@ -216,6 +216,13 @@ class Settings(BaseSettings):
     #  >0 = тик в процессе — звонку нужно «ровно в 15:00», а не «когда таймер спохватится»
     reminders_inprocess_seconds: int = Field(default=60, ge=0, le=3600)
 
+    # --- внешние подключения (MCP / API-ключи / плагины) ---
+    #: выключено = реестр не читается и инструменты не регистрируются; данные подключений
+    #: при этом остаются на месте (отключить рубильником ≠ потерять конфиг)
+    integrations_enabled: bool = True
+    mcp_call_timeout_seconds: int = Field(default=30, ge=3, le=300)
+    mcp_max_tools: int = Field(default=40, ge=1, le=200)
+
     # --- звонок как канал доставки напоминаний ---
     #: none|twilio|webhook. Twilio — TTS через REST и без публичного URL (TwiML передаётся телом
     #  запроса); webhook — POST {"to","text"} на свой шлюз (Asterisk/FreePBX/софтфон-мост)

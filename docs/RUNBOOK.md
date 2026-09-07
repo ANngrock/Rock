@@ -1082,3 +1082,39 @@ aegis watch tick          # тот же systemd-контракт: rc=1 если 
 на …1234» или причину, по которой звонок не состоится (`! NOTIFY_PHONE не похож на номер`,
 «не хватает TWILIO_AUTH_TOKEN»…). `require_runtime` (`aegis bot`) с `CALL_PROVIDER=twilio` без
 ключей не стартует вовсе — бот, который обещает звонок и не может, опаснее нестартовавшего.
+
+---
+
+## 22. Подключения: MCP-серверы, API-ключи, плагины (миграция 0011)
+
+Внешний мир входит через реестр `integrations.connectors`, а не правкой кода: включил/выключил —
+без рестарта lose-state, состояние проб видно, всё в аудит-трейсе.
+
+```bash
+aegis connect add-mcp gh --command npx --arg -y --arg @modelcontextprotocol/server-github \
+    --secret-env GITHUB_TOKEN
+echo "ghp_xxx" | aegis connect secret gh --kind mcp      # stdin: не светится в ps/истории
+aegis connect probe gh                                     # initialize + tools/list настоящим spawn'ом
+aegis connect probe gh --call create_issue --json '{"repo":"me/x","title":"t"}'
+aegis connect add-api billing --base-url https://api.example.internal
+aegis connect add-plugin mycorp.aegis --module mycorp_tools
+aegis connect list | enable gh | disable gh | rm gh
+```
+
+Как это доходит до чата: при старте `aegis bot` включённые MCP-коннекторы опрашиваются
+(`tools/list`) и их инструменты регистрируются с именами `mcp__<connector>__<tool>`. Правила
+безопасности не «mcp-специальные»: вывод помечен `untrusted`, `readOnlyHint:false` →
+подтверждение в чате (policy medium), `destructiveHint`/`openWorldHint` → HIGH; сервер без
+аннотаций получает максимум подозрения, а не доверия. Один вызов = один spawned-процесс:
+никаких常驻-детей и «состояния прошлого разговора» в боте.
+
+Секреты: в базе только `secret_ct/secret_wrapped/key_version` (BlobCipher журнала, KEK из
+`AEGIS_KEK`). `docker inspect`, дамп БД и `connect list` значения не показывают. Piping в env
+MCP-процесса — единственный способ доставки ключа серверу.
+
+Плагины — локальные модули venv с `register(registry)`: это код владельца, граница доверия —
+сам venv (установленный пакет и так имеет право на всё); регистрация идёт без ре-импорта на
+каждый чат, сбой импорта — строка `last_error`, бот жив.
+
+Деградация без сети/сервера: бот стартует и отвечает (принцип 5); кривой коннектор виден в
+`doctor → integrations` («N коннекторов падают на пробе») и в `connect list` (`! …`).
