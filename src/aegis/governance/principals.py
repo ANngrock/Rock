@@ -113,6 +113,9 @@ _TOOL_DOMAINS = {
     "memory": ("memory:read", "memory:write"),
     "reminders": ("reminders:read", "reminders:write"),
     "reminder": ("reminders:read", "reminders:write"),  # реальные имена — set/cancel_reminder
+    # наблюдатели едут полосой напоминаний: весть — это тоже напоминание, плодить действия незачем
+    "watch": ("reminders:read", "reminders:write"),
+    "watches": ("reminders:read", "reminders:write"),
     "web": ("web:read", "web:read"),
     "image": ("web:read", "web:read"),
     "finance": ("memory:read", "tool:pay"),

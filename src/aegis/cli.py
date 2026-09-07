@@ -81,6 +81,51 @@ def _build_parser() -> argparse.ArgumentParser:
         "test",
         help="проверка доставки: тестовое сообщение и, если настроено, тестовый звонок",
     )
+
+    watch = sub.add_parser(
+        "watch", help="наблюдатели: следить за страницей/поиском, список, пауза, прогнать проверки"
+    )
+    watch_actions = watch.add_subparsers(dest="watch_action", required=True)
+    wadd = watch_actions.add_parser("add", help="начать следить до наступления условия")
+    wadd.add_argument("title", nargs="+", help="что это за наблюдение (одна строла владельцу)")
+    wtarget = wadd.add_mutually_exclusive_group(required=True)
+    wtarget.add_argument("--url", default=None, help="следить за страницей (полный http(s)-адрес)")
+    wtarget.add_argument("--query", default=None, help="следить за выдачей поиска")
+    wadd.add_argument(
+        "--mode",
+        choices=("contains", "regex", "changed"),
+        default="contains",
+        help="contains/regex — искать условие; changed — стрелять на любое изменение страницы",
+    )
+    wadd.add_argument("--needle", default=None, help="что искать (не нужен для changed)")
+    wadd.add_argument("--every", type=int, default=15, help="интервал проверки, минут (от 5)")
+    wadd.add_argument(
+        "--channel",
+        choices=("message", "call", "both"),
+        default="message",
+        help="как доставить весть (напоминанием); по умолчанию — сообщением",
+    )
+    wadd.add_argument("--until", default=None, help="словами «до завтра в 9»: горизонт наблюдения")
+    wadd.add_argument(
+        "--repeat",
+        action="store_true",
+        help="не гаснуть после первого попадания (поминать каждые --every)",
+    )
+    wadd.add_argument("--owner-id", type=int, default=1)
+    wlist = watch_actions.add_parser("list", help="активные и приостановленные наблюдения")
+    wlist.add_argument("--limit", type=int, default=20)
+    wlist.add_argument("--owner-id", type=int, default=1)
+    for verb, verb_help in (
+        ("pause", "приостановить"),
+        ("resume", "возобновить (сбрасывает счётчик ошибок)"),
+        ("cancel", "отменить совсем"),
+    ):
+        wv = watch_actions.add_parser(verb, help=f"{verb_help} по началу id или слову из названия")
+        wv.add_argument("ref")
+        wv.add_argument("--owner-id", type=int, default=1)
+    watch_actions.add_parser(
+        "tick", help="прогнать созревшие проверки (для systemd-таймера; доставка — тиком remind)"
+    )
     show = remind_actions.add_parser("list", help="запланированные напоминания")
     show.add_argument("--limit", type=int, default=10)
     show.add_argument("--owner-id", type=int, default=1)
@@ -404,9 +449,25 @@ async def _reminders_report(cfg: Any) -> dict[str, Any]:
     )
     out["live"] = int(live or 0)
     out["overdue"] = int(overdue or 0)
+    watch_note = " · наблюдений: таблица не накатана (миграция 0010)"
+    try:
+        has_watches = await _scalar("SELECT to_regclass('planning.watches') IS NOT NULL")
+        if has_watches:
+            w_active = int(
+                await _scalar("SELECT count(*) FROM planning.watches WHERE status = 'active'") or 0
+            )
+            w_paused = int(
+                await _scalar("SELECT count(*) FROM planning.watches WHERE status = 'paused'") or 0
+            )
+            out["watches"] = {"active": w_active, "paused": w_paused}
+            watch_note = f" · наблюдения: {w_active} активных" + (
+                f", {w_paused} на паузе (проверки падают — смотри last_error)" if w_paused else ""
+            )
+    except Exception:  # noqa: BLE001 - строка про наблюдения не имеет права валить doctor
+        watch_note = " · наблюдения: не проверялось"
     out["note"] = (
         f"в расписании {out['live']}, просрочено {out['overdue']}"
-        f" · тик ≤ {cfg.reminders_batch} за проход" + _call_channels_note(cfg)
+        f" · тик ≤ {cfg.reminders_batch} за проход" + _call_channels_note(cfg) + watch_note
     )
     if out["overdue"]:
         out["hint"] = "ждут тика: systemctl status aegis-reminders.timer"
@@ -848,6 +909,124 @@ def _plural(count: int, one: str, few: str, many: str) -> str:
     if last in range(2, 5):
         return f"{count} {few}"
     return f"{count} {many}"
+
+
+async def _cmd_watch(action: str, args: argparse.Namespace) -> int:
+    """Наблюдатели из консоли: та же конструкция честности, что у напоминаний.
+
+    Проверка условия детерминирована (contains/regex/changed) — ни одна строка не зависит от
+    модели; «до скольки» считает тот же parse_when, что и у remind, поэтому «в CLI работает,
+    в боте нет» невозможно по конструкции.
+    """
+    from datetime import datetime
+
+    from aegis.planning.schedule import WhenNotParsed, parse_when
+    from aegis.planning.watchers import SqlWatchStore, WatchReport, run_watches
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlWatchStore()
+
+    if action == "add":
+        title = " ".join(args.title)
+        kind = "page" if args.url else "search"
+        target = (args.url or args.query or "").strip()
+        expires_at = None
+        if args.until:
+            try:
+                w = parse_when(args.until, now=datetime.now(cfg.tz), timezone=cfg.timezone)
+                expires_at = w.at
+            except WhenNotParsed as exc:
+                print(f"! «до» не разобрал: {exc}", file=sys.stderr)
+                return 2
+        try:
+            watch_id = await store.add(
+                owner_id=args.owner_id,
+                title=title,
+                kind=kind,
+                target=target,
+                mode=args.mode,
+                needle=args.needle,
+                interval_minutes=args.every,
+                channel=args.channel,
+                repeat=args.repeat,
+                expires_at=expires_at,
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - без БД наблюдение невозможно: честный 1
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(f"Наблюдаю: {title} ({'страница' if kind == 'page' else 'поиск'}) id={watch_id[:8]}")
+        print(
+            f"  каждые {args.every} мин, условие: {args.mode}"
+            + (f" «{args.needle}»" if args.needle and args.mode != "changed" else "")
+            + (f", до {expires_at:%d.%m %H:%M}" if expires_at else "")
+            + (" · повторяемое" if args.repeat else " · однократное")
+        )
+        print("  первая проверка — через минуту (засеивает эталон для changed)")
+        if args.channel != "message":
+            ready = (cfg.call_provider or "none").strip().lower() != "none" and bool(
+                (cfg.notify_phone or "").strip()
+            )
+            print(
+                f"  канал вести: {args.channel}"
+                + ("" if ready else " ! звонки не настроены — деградирует до сообщения")
+            )
+        return 0
+
+    if action == "list":
+        try:
+            rows = await store.list_active(owner_id=args.owner_id, limit=args.limit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if not rows:
+            print("наблюдений нет")
+            return 0
+        tz = cfg.tz
+        for row in rows:
+            mark = {"active": "►", "paused": "⏸"}.get(str(row["status"]), "·")
+            due = row["fire_at"].astimezone(tz) if row["fire_at"].tzinfo else row["fire_at"]
+            cond = f"{row['mode']}" + (f" «{row['needle']}»" if row["needle"] else "")
+            err = f" ! {str(row['last_error'])[:80]}" if row.get("last_error") else ""
+            print(
+                f" {mark} {str(row['id'])[:8]} {row['title']} — {row['kind']}: {cond}"
+                f" · каждые {row['interval_minutes']} мин, след. {due:%d.%m %H:%M}{err}"
+            )
+        return 0
+
+    if action in ("pause", "resume", "cancel"):
+        try:
+            outcome = await store.set_status(owner_id=args.owner_id, ref=args.ref, status=action)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if outcome is None:
+            print(f"не нашёл наблюдение по «{args.ref}» (слова — только в своих)", file=sys.stderr)
+            return 1
+        print(outcome)
+        return 0
+
+    if action == "tick":
+        from aegis.agents.watch_checks import default_checkers
+
+        try:
+            report: WatchReport = await run_watches(store, **default_checkers())
+        except Exception as exc:  # noqa: BLE001 - таймер обязан видеть сбой кодом возврата, не трейсбеком
+            print(f"! тик упал: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(report.summary())
+        for note in report.notes:
+            print(f"  ! {note}", file=sys.stderr)
+        return 1 if report.paused else 0
+
+    return 2
 
 
 def _tail_phone(raw: str) -> str:
@@ -2312,6 +2491,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_repro(args.repro_action, args))
         if args.command == "remind":
             return asyncio.run(_cmd_remind(args.remind_action, args))
+        if args.command == "watch":
+            return asyncio.run(_cmd_watch(args.watch_action, args))
         if args.command == "index":
             return asyncio.run(_cmd_index(args.index_action, args))
         if args.command == "outbox":

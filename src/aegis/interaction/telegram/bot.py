@@ -746,6 +746,49 @@ async def _metrics_flush_loop(app: App) -> None:
             log.warning("metrics.flush_failed", err=repr(exc)[:200])
 
 
+async def _reminders_tick_loop(app: App) -> None:
+    """Тик напоминаний и наблюдателей внутри процесса: systemd-таймер точен до минуты, реакция
+    «за 15 минут до встречи» — нет. Оба мотора зовут один deliver с SKIP LOCKED, поэтому дублей
+    при наложении нет; цикл здесь стоит дешевле просроченного напоминания — и это единственный
+    мотор для compose-установки без таймера.
+
+    Ошибки глотаются с логом (принцип 5, как у метрик): сбой доставки не имеет права унести
+    ответы в чат. Пауза после падения — удвоение интервала один раз, чтобы разорванный Telegram
+    не превращал каждый тик в трейсбек.
+    """
+    interval = max(15, int(app.cfg.reminders_inprocess_seconds))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            from aegis.agents.watch_checks import default_checkers
+            from aegis.interaction.notify import ReminderDispatcher
+            from aegis.planning.reminders import SqlReminderStore, deliver
+            from aegis.planning.watchers import SqlWatchStore, run_watches
+
+            watch_report = await run_watches(SqlWatchStore(), **default_checkers())
+            dispatcher = ReminderDispatcher.from_settings(app.cfg)
+            await dispatcher.start()
+            try:
+                report = await deliver(SqlReminderStore(), send=dispatcher.send)
+            finally:
+                await dispatcher.aclose()
+            for note in list(watch_report.notes) + list(dispatcher.last_notes):
+                log.warning("reminders.degraded", note=note)
+            if report.sent or report.failed or watch_report.checked:
+                log.info(
+                    "reminders.tick",
+                    sent=len(report.sent),
+                    failed=len(report.failed),
+                    exhausted=len(report.exhausted),
+                    **watch_report.counts(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("reminders.tick_failed", err=repr(exc)[:200])
+            await asyncio.sleep(interval)
+
+
 async def main() -> None:
     from aegis.agents.tools.registry import registry
 
@@ -768,6 +811,13 @@ async def main() -> None:
         # метрики живут в процессе; в БД попадает снапшот — «окно SLO» читается из metric_samples.
         # Задача фоновая и молчаливая: наблюдаемость не имеет права уронить ответы (принцип 5)
         flush_task = asyncio.create_task(_metrics_flush_loop(app))
+    reminders_task: asyncio.Task[None] | None = None
+    if (
+        app.db_ready
+        and app.cfg.reminders_enabled
+        and int(getattr(app.cfg, "reminders_inprocess_seconds", 0) or 0) > 0
+    ):
+        reminders_task = asyncio.create_task(_reminders_tick_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -786,6 +836,9 @@ async def main() -> None:
         if flush_task is not None:
             flush_task.cancel()
             await asyncio.gather(flush_task, return_exceptions=True)
+        if reminders_task is not None:
+            reminders_task.cancel()
+            await asyncio.gather(reminders_task, return_exceptions=True)
         await app.aclose()
 
 

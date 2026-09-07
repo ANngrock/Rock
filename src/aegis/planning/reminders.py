@@ -264,6 +264,38 @@ class NullReminderStore:
         return None
 
 
+def build_insert_params(
+    *,
+    owner_id: int,
+    body: str,
+    due_at: datetime,
+    trace_id: str | None = None,
+    channel: str = "message",
+) -> dict[str, Any]:
+    """Проверки — до первого запроса; нормализация — одна на все пути вставки."""
+    if channel not in REMINDER_CHANNELS:
+        # CHECK в таблице поймал бы и позже, но сюда приходят слова модели: «не понял канал»
+        # должен звучать здесь, а не IntegrityError'ом из недр тика
+        raise ValueError(f"канал доставки должен быть одним из {REMINDER_CHANNELS}")
+    if due_at.tzinfo is None:
+        # Наивное время в timestamptz — это «сработает не тогда», а не «не сработает вовсе»
+        raise ValueError("due_at обязан быть tz-aware: момент считается в таймере владельца")
+    return {
+        "owner_id": int(owner_id),
+        "body": " ".join(str(body).split())[:2000],
+        "due_at": due_at,
+        "trace_id": trace_id,
+        "channel": channel,
+    }
+
+
+async def insert_reminder(s: Any, params: dict[str, Any]) -> str:
+    """INSERT на чужой сессии без commit. Нужен наблюдателям: «условие сожжено + напоминание
+    создано» обязано быть одним фактом, два коммита — это окно, в котором строка теряется."""
+    row = (await s.execute(text(_INSERT_SQL), params)).mappings()
+    return str(row.one()["id"])
+
+
 class SqlReminderStore:
     """Расписание в ``planning.reminders``. Один вызов — одна транзакция: тик переживает рестарт."""
 
@@ -287,27 +319,11 @@ class SqlReminderStore:
         trace_id: str | None = None,
         channel: str = "message",
     ) -> str:
-        if channel not in REMINDER_CHANNELS:
-            # CHECK в таблице поймал бы и позже, но сюда приходят слова модели: «не понял канал»
-            # должен звучать здесь, а не IntegrityError'ом из недр тика
-            raise ValueError(f"канал доставки должен быть одним из {REMINDER_CHANNELS}")
-        if due_at.tzinfo is None:
-            # Наивное время в timestamptz — это «сработает не тогда», а не «не сработает вовсе»
-            raise ValueError("due_at обязан быть tz-aware: момент считается в таймере владельца")
+        params = build_insert_params(
+            owner_id=owner_id, body=body, due_at=due_at, trace_id=trace_id, channel=channel
+        )
         async with self._session() as s:
-            row = (
-                await s.execute(
-                    text(_INSERT_SQL),
-                    {
-                        "owner_id": int(owner_id),
-                        "body": " ".join(body.split())[:2000],
-                        "due_at": due_at,
-                        "trace_id": trace_id,
-                        "channel": channel,
-                    },
-                )
-            ).mappings()
-            reminder_id = str(row.one()["id"])
+            reminder_id = await insert_reminder(s, params)
             await s.commit()
         return reminder_id
 

@@ -20,6 +20,6 @@ def load_builtin_tools() -> None:
     global _loaded
     if _loaded:
         return
-    from aegis.agents.tools import builtin, reminders, repro  # noqa: F401
+    from aegis.agents.tools import builtin, reminders, repro, watchers  # noqa: F401
 
     _loaded = True
