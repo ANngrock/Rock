@@ -98,6 +98,7 @@ aegis remind add --channel call … | remind test           # напоминан
 aegis watch add "цена" --url … --needle … | watch tick    # наблюдатели: событие → напоминание (шаг 2.10)
 aegis connect add-mcp … | probe NAME                      # MCP/API-ключи/плагины: реестр подключений (шаг 2.11)
 aegis node enroll desk | serve --name … --code … # узлы: управление своим ПК командой с телефона (шаг 2.12)
+aegis term|sticker|userbot …                      # когнитивная воронка, голос, мост личных чатов (шаг 2.13)
 ```
 
 ## Качество

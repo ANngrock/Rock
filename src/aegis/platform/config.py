@@ -229,6 +229,36 @@ class Settings(BaseSettings):
     node_cmd_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
     node_heartbeat_seconds: int = Field(default=20, ge=5, le=300)
 
+    # --- когнитивный слой: воронка, эмоция, стикеры (шаг 2.13) ---
+    #: выключить воронку = «как раньше»: текст идёт в модель как есть. Вкл. по умолчанию —
+    #: чистка и регистрация в <cognition>-блоке дешевле неверно понятой реплики
+    funnel_enabled: bool = True
+    affect_enabled: bool = True
+    stickers_enabled: bool = True
+
+    # --- голос: приём (STT) и ответ (TTS) ---
+    #: выкл. = голосовые честно отклоняются строкой, как до этого блока; вкл. = эндпоинт/whisper
+    voice_enabled: bool = False
+    #: пусто = glm_base_url (OpenAI-совместимые /audio/transcriptions и /audio/speech живут у
+    #  многих роутеров; у кого нет — свой URL). Модель пусто = эндпоинт не настраивался
+    voice_stt_base_url: str | None = None
+    voice_stt_model: str | None = None
+    voice_tts_base_url: str | None = None
+    voice_tts_model: str | None = None
+    voice_tts_voice: str = "alloy"
+    #: пусто = основной ключ glm_api_key: отдельный секрет только если эндпоинт чужой провайдер
+    voice_api_key: SecretStr | None = None
+    #: never: текст всегда; match: голосовое→голосом; onrequest: только по просьбе «голосом»
+    voice_reply_mode: Literal["never", "match", "onrequest"] = "match"
+    voice_max_mb: int = Field(default=20, ge=1, le=50)
+    #: имя локальной модели faster-whisper (если пакет стоит в контейнере)
+    voice_whisper_model: str = "base"
+
+    # --- мост личных чатов (юзербот: MTProto-сессия владельца, риск на владельце) ---
+    #: без true бот не слушает aegis.ub.* и не ходит в личные чаты. Отправка от имени человека
+    # возможна только при явном включении: это не флаг «покрасивее», это «руки на моём аккаунте»
+    userbot_enabled: bool = False
+
     # --- звонок как канал доставки напоминаний ---
     #: none|twilio|webhook. Twilio — TTS через REST и без публичного URL (TwiML передаётся телом
     #  запроса); webhook — POST {"to","text"} на свой шлюз (Asterisk/FreePBX/софтфон-мост)
@@ -434,6 +464,11 @@ class Settings(BaseSettings):
             )
         if provider == "webhook" and not self.call_webhook_url.startswith("http"):
             raise ConfigError("CALL_PROVIDER=webhook требует CALL_WEBHOOK_URL (http/https)")
+        if self.userbot_enabled and not str(self.nats_url or "").strip():
+            raise ConfigError(
+                "USERBOT_ENABLED=true требует NATS_URL: демон с телефоном живёт отдельно от бота,"
+                " и без брокера ему нечем дышать"
+            )
         if self.nodes_enabled and not str(self.nats_url or "").strip():
             raise ConfigError(
                 "NODES_ENABLED=true требует NATS_URL: команды узлу летят через брокер, "

@@ -20,6 +20,7 @@ import html as html_lib
 import re
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import replace as _dc_replace
 from typing import Any, cast
 
 import structlog
@@ -28,6 +29,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -64,6 +66,8 @@ _HELP = (
     "• /replay [id] — повторить ход по журналу и сравнить ответ (без id — последний)\n"
     "• /halt — заморозить записи (бот отвечает только чтением)\n"
     "• /resume — разморозить записи\n"
+    "• /ub list — входящие из личных чатов (если включён юзербот)\n"
+    "• /ub send <id> — отправить черновик от вашего имени; /ub drop <id> — в корзину\n"
     "• /help — это сообщение"
 )
 
@@ -339,22 +343,88 @@ async def on_image(message: Message, bot: Bot, app: App) -> None:
 
 
 @router.message(F.voice | F.audio)
-async def on_voice(message: Message) -> None:
-    await message.answer("Голос подключается на шаге 2 (faster-whisper). Пока — текстом или фото.")
+async def on_voice(message: Message, app: App, bot: Bot) -> None:
+    """Голосовое → распознавание → тот же ход, что и для текста, с меткой «распознано»."""
+    if message.from_user is None:
+        return
+    if not app.cfg.voice_enabled:
+        await message.answer(
+            "Приём голоса выключен (VOICE_ENABLED=false). Включите в .env — и можно говорить."
+        )
+        return
+    src = message.voice or message.audio
+    if src is None:  # pragma: no cover - фильтр гарантирует, но aiogram обновляется
+        return
+    if int(getattr(src, "file_size", 0) or 0) > app.cfg.voice_max_mb * 1_000_000:  # noqa: PLR2004
+        await message.answer(f"Голосовое больше {app.cfg.voice_max_mb} МБ — не потяну.")
+        return
+    try:
+        import io
+
+        buf = io.BytesIO()
+        await bot.download(src.file_id, destination=buf)
+        data = buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 - скачивание чужого CDN, отказ штатен
+        await message.answer(f"Голос не дошёл: {type(exc).__name__}")
+        return
+    from aegis.cognition import audio
+    from aegis.cognition.journal import log_voice
+
+    mime = (
+        "audio/ogg"
+        if message.voice
+        else str(getattr(message.audio, "mime_type", "") or "audio/mpeg")
+    )
+    owner = _inbound(app, message, text="").owner_id
+    try:
+        transcript, engine = await audio.transcribe(app.cfg, data, mime=mime)
+    except audio.VoiceError as exc:
+        await log_voice(owner, direction="in", engine="?", ok=False, error=str(exc))
+        await message.answer(f"🎤 {exc}")
+        return
+    await log_voice(
+        owner,
+        direction="in",
+        engine=engine,
+        transcription=transcript,
+        seconds=int(getattr(src, "duration", 0) or 0) or None,
+    )
+    await run(
+        message,
+        app,
+        _inbound(app, message, text=transcript),
+        bot,
+        voice=True,
+        transcript_note=f"распознано {engine}",
+    )
 
 
-@router.message(F.sticker | F.video | F.animation)
+@router.message(F.sticker)
+async def on_sticker(message: Message, app: App, bot: Bot) -> None:
+    """Стикер — реплика, а не файл: у эмодзи-стикера Telegram отдаёт символ, его и слышим."""
+    if message.from_user is None:
+        return
+    st = message.sticker
+    label = (getattr(st, "emoji", "") or "").strip()
+    set_name = (getattr(st, "set_name", "") or "").strip()
+    text = f"[стикер {label}]".strip() if label else f"[стикер из набора {set_name}]"
+    await run(message, app, _inbound(app, message, text=text), bot)
+
+
+@router.message(F.video | F.animation)
 async def on_unsupported(message: Message) -> None:
     await message.answer(
-        "Это сообщение я пока не умею разбирать (видео/стикеры — шаг 4). Если нужно сохранить — "
-        "опиши словами или пришли ссылкой."
+        "Видео и анимации я пока не разбираю. Если нужно сохранить — опиши словами или пришли "
+        "ссылкой."
     )
 
 
 #: Команды, которые знает бот. aiogram требует точного совпадения имени команды, поэтому
 #: «/restart» без этой проверки улетал бы в модель как обычный текст: трата токенов и
 #: загадочный ответ вместо «такой команды нет».
-KNOWN_COMMANDS = frozenset({"start", "help", "new", "cost", "status", "tools", "halt", "resume"})
+KNOWN_COMMANDS = frozenset(
+    {"start", "help", "new", "cost", "status", "tools", "halt", "resume", "ub"}
+)
 _COMMAND_SHAPED = re.compile(r"^/([A-Za-z][A-Za-z0-9_]{1,31})(?:@\w+)?$")
 #: команды, которые просят сделать что-то с самим процессом — это делается снаружи
 OUTSIDE_COMMANDS = frozenset({"restart", "reboot", "stop", "update", "upgrade", "logs", "pull"})
@@ -386,6 +456,59 @@ def _inbound(
     cfg = getattr(app, "cfg", None)
     house = int(getattr(cfg, "telegram_owner_id", None) or actor)
     return Inbound(text=text, owner_id=house, actor_id=actor, attachments=list(attachments or []))
+
+
+@router.message(Command("ub"))
+async def cmd_ub(message: Message, app: App, args: CommandObject) -> None:
+    """Инбокс юзербота: список, отправка черновика, отказ. Решения — в БД (cognition.inbox)."""
+    if message.from_user is None or not app.db_ready:
+        return
+    if not app.cfg.userbot_enabled:
+        await message.answer("Юзербот выключен (USERBOT_ENABLED=false) — личных чатов не видно.")
+        return
+    from aegis.cognition.inbox import SqlInboxStore
+
+    owner = int(app.cfg.telegram_owner_id or message.from_user.id)
+    parts = (args.args or "").split()
+    store = SqlInboxStore()
+    verb = parts[0].lower() if parts else "list"
+    if verb == "list":
+        rows = await store.list_recent(owner_id=owner, limit=8)
+        if not rows:
+            await message.answer("Инбокс пуст: демон ещё ничего не принёс (aegis userbot serve).")
+            return
+        lines = [
+            f"<code>{r.id[:8]}</code> · <b>{html_lib.escape(r.chat_name or r.chat_id)}</b>"
+            f" · {r.verdict}/{r.status}" + ("" if r.reply is None else " · ✍")
+            for r in rows
+        ]
+        await message.answer(
+            "<b>Входящие</b>\n" + "\n".join(lines) + "\n/ub send <id> — отправить черновик."
+        )
+    elif verb in ("send", "drop") and len(parts) >= 2:
+        row = await store.get_by_ref(owner_id=owner, ref=parts[1])
+        if row is None:
+            await message.answer("! строки с таким id нет (свежий /ub list)")
+            return
+        if verb == "drop":
+            await store.mark(owner_id=owner, row_id=row.id, status="discarded")
+            await message.answer("Убрано.")
+            return
+        if not (row.reply or "").strip():
+            await message.answer("Черновика нет — отправлять нечего; ответьте человеку сами.")
+            return
+        from aegis.interaction.userbridge.relay import dispatch_send
+
+        ok, err = await dispatch_send(
+            app.cfg, daemon=row.daemon, row_id=row.id, chat_id=row.chat_id, text=row.reply or ""
+        )
+        if ok:
+            await store.mark(owner_id=owner, row_id=row.id, status="sent")
+            await message.answer(f"Отправлено в «{row.chat_name or row.chat_id}».")
+        else:
+            await message.answer(f"! не ушло: {err}")
+    else:
+        await message.answer("Как пользоваться: /ub list · /ub send <id> · /ub drop <id>")
 
 
 @router.message(F.text)
@@ -445,7 +568,15 @@ async def on_confirm(callback: CallbackQuery, app: App, bot: Bot) -> None:
     await send_reply(bot, message.chat.id, reply)
 
 
-async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = None) -> None:
+async def run(
+    message: Message,
+    app: App,
+    inbound: Inbound,
+    bot: Bot | None = None,
+    *,
+    voice: bool = False,
+    transcript_note: str = "",
+) -> None:
     """Общий путь: индикатор → supervisor → отправка; ошибка — в чат и, если задан, в алерты.
 
     При `STREAM_REPLIES=true` «индикатор» перестаёт быть индикатором: он и есть ответ, который
@@ -463,6 +594,15 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         )
     except Exception:  # noqa: BLE001 - не готов спросить — значит старый предсказуемый путь
         stream_allowed = bool(app.cfg.stream_replies)
+    fstate = None
+    if (
+        getattr(app, "db_ready", False)
+        and getattr(app.cfg, "funnel_enabled", False)
+        and inbound.source_trust == "owner"
+    ):
+        fstate = await _funnel_inbound(app, inbound, voice=voice, transcript_note=transcript_note)
+        if fstate is not None and fstate.augmented != inbound.text:
+            inbound = _dc_replace(inbound, text=fstate.augmented)
     stream = make_stream(status, app.cfg) if stream_allowed else None
     try:
         reply = await app.supervisor.handle(inbound, on_delta=stream.push if stream else None)
@@ -478,9 +618,12 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
             degraded=True,
         )
         await notify_failure(app, bot, exc)
+    if fstate is not None and not reply.degraded:
+        reply = await _funnel_outbound(app, fstate, reply)
     if stream is not None:
         markup = _reply_markup(reply)
         if await stream.finish(reply.text, markup=markup):
+            await _funnel_garnish(app, bot, message, fstate, reply, voice=voice)
             await _drain_queue(app, bot, message.chat.id, inbound.owner_id)
             return
     try:
@@ -489,7 +632,106 @@ async def run(message: Message, app: App, inbound: Inbound, bot: Bot | None = No
         pass
     if bot is not None:
         await send_reply(bot, message.chat.id, reply)
+    await _funnel_garnish(app, bot, message, fstate, reply, voice=voice)
     await _drain_queue(app, bot, message.chat.id, inbound.owner_id)
+
+
+async def _funnel_inbound(
+    app: App,
+    inbound: Inbound,
+    *,
+    voice: bool,
+    transcript_note: str,
+) -> Any:
+    """Входная воронка: словарь, регистр, настроение. Ошибка любого шага — не ошибка хода."""
+    try:
+        from aegis.cognition import funnel as fn
+        from aegis.cognition.affect import SqlAffectStore, detect_local, emoji_for_reply
+        from aegis.cognition.lexicon import SqlLexicon
+
+        lex = await SqlLexicon().list_terms(inbound.owner_id)
+        affect_store = SqlAffectStore()
+        merged = None
+        if app.cfg.affect_enabled:
+            merged = await affect_store.signal(inbound.owner_id, detect_local(inbound.text))
+        else:
+            merged, _since = await affect_store.current(inbound.owner_id)
+        extra = [transcript_note] if transcript_note else None
+        state = fn.build_inbound(
+            inbound.text, lexicon=lex, affect=merged, voice=voice, extra_notes=extra
+        )
+        if merged is not None:
+            state.mood = merged.mood
+            state.emoji = emoji_for_reply(merged, state.register.formality)
+        return state
+    except Exception as exc:  # noqa: BLE001 - воронка украшение понимания, не его фундамент
+        log.debug("cognition.inbound_failed", err=repr(exc)[:160])
+        return None
+
+
+async def _funnel_outbound(app: App, fstate: Any, reply: Reply) -> Reply:
+    """Структура и одна нота тона поверх готового ответа; разметку чинит render, не мы."""
+    if fstate is None:
+        return reply
+    try:
+        from aegis.cognition.funnel import compose_outbound
+
+        text = compose_outbound(reply.text, fstate, mood_emoji=fstate.emoji)
+        return reply if text == reply.text else _dc_replace(reply, text=text)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("cognition.outbound_failed", err=repr(exc)[:160])
+        return reply
+
+
+async def _funnel_garnish(
+    app: App, bot: Bot | None, message: Message, fstate: Any, reply: Reply, *, voice: bool
+) -> None:
+    """Голос в ответ и стикер по настроению — после текста, потому что текст важнее косметики."""
+    if fstate is None or bot is None or reply.degraded:
+        return
+    owner = int(app.cfg.telegram_owner_id or (message.from_user.id if message.from_user else 0))
+    if getattr(app.cfg, "voice_enabled", False):
+        await _voice_reply(app, bot, message, fstate, reply, voice=voice, owner=owner)
+    if not getattr(app.cfg, "stickers_enabled", False):
+        return
+    try:
+        from aegis.cognition.funnel import sticker_gate
+        from aegis.cognition.stickers import SqlStickers, pick_sticker
+
+        pool = await SqlStickers().list_stickers(owner)
+        if pool and sticker_gate(fstate, None if fstate.mood == "neutral" else fstate):
+            chosen = pick_sticker(pool, fstate.mood, seed=str(message.message_id))
+            if chosen is not None:
+                await bot.send_sticker(message.chat.id, sticker=chosen.file_id)
+    except Exception as exc:  # noqa: BLE001 - наклейка не повод для тревоги
+        log.debug("cognition.sticker_failed", err=repr(exc)[:140])
+
+
+async def _voice_reply(
+    app: App, bot: Bot, message: Message, fstate: Any, reply: Reply, *, voice: bool, owner: int
+) -> None:
+    try:
+        from aegis.cognition.audio import decide_voice_reply, synthesize
+        from aegis.cognition.funnel import extract_request
+        from aegis.cognition.journal import log_voice
+
+        mode = str(getattr(app.cfg, "voice_reply_mode", "never"))
+        if decide_voice_reply(
+            mode, came_voice=voice, wants_voice=bool(extract_request(fstate.raw)["wants_voice"])
+        ):
+            try:
+                audio_bytes, engine = await synthesize(app.cfg, strip_tags(reply.text))
+            except Exception as exc:  # noqa: BLE001 - нет эндпоинта: молча остаётся текст
+                await log_voice(owner, direction="out", engine="?", ok=False, error=str(exc))
+                log.debug("cognition.tts_skipped", err=repr(exc)[:140])
+            else:
+                await bot.send_voice(
+                    message.chat.id,
+                    BufferedInputFile(audio_bytes, filename="answer.mp3"),
+                )
+                await log_voice(owner, direction="out", engine=engine, ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("cognition.voice_failed", err=repr(exc)[:140])
 
 
 def _reply_markup(reply: Reply) -> InlineKeyboardMarkup | None:
@@ -819,6 +1061,33 @@ async def _node_gateway_loop(app: App) -> None:
             backoff = min(300.0, backoff * 2)
 
 
+async def _userbot_gateway_loop(app: App) -> None:
+    """Шлюз личных чатов: жрёт aegis.ub.*, оценивает, уведомляет, автоотвечает по политикам.
+
+    Тот же узор, что у узлов: транспорт чужой процесс, он имеет право лежать; решения и
+    черновики живут в БД, восстановление — backoff без потери накопленного."""
+    backoff = 5.0
+    while True:
+        gateway = None
+        try:
+            from aegis.interaction.userbridge.relay import UserbotGateway
+
+            gateway = UserbotGateway(cfg=app.cfg, gateway=app.gateway)
+            await gateway.start()
+            backoff = 5.0
+            await gateway.run()
+        except asyncio.CancelledError:
+            if gateway is not None:
+                await gateway.aclose()
+            return
+        except Exception as exc:  # noqa: BLE001 - чужие чаты не валят бота
+            log.warning("userbridge.gateway_down", retry_in=backoff, err=repr(exc)[:200])
+            if gateway is not None:
+                await gateway.aclose()
+            await asyncio.sleep(backoff)
+            backoff = min(300.0, backoff * 2)
+
+
 async def main() -> None:
     from aegis.agents.tools.registry import registry
 
@@ -867,6 +1136,9 @@ async def main() -> None:
     nodes_task: asyncio.Task[None] | None = None
     if app.db_ready and app.cfg.nodes_enabled:
         nodes_task = asyncio.create_task(_node_gateway_loop(app))
+    ub_task: asyncio.Task[None] | None = None
+    if app.db_ready and app.cfg.userbot_enabled:
+        ub_task = asyncio.create_task(_userbot_gateway_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -891,6 +1163,9 @@ async def main() -> None:
         if nodes_task is not None:
             nodes_task.cancel()
             await asyncio.gather(nodes_task, return_exceptions=True)
+        if ub_task is not None:
+            ub_task.cancel()
+            await asyncio.gather(ub_task, return_exceptions=True)
         await app.aclose()
 
 

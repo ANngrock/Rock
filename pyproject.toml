@@ -38,6 +38,7 @@ dependencies = [
 # Durable-слой (NATS + Temporal). В шаге 1 поднимается инфраструктура, но код её ещё не
 # вызывает: первые подписчики outbox и AgentSession workflow появляются в шаге 2.
 durable = ["nats-py>=2.7", "temporalio>=1.7"]
+userbot = ["telethon>=1.36"]
 dev = [
   "ruff>=0.6",
   "mypy>=1.11",
@@ -96,7 +97,7 @@ warn_unreachable = true
 files = ["src", "migrations"]
 
 [[tool.mypy.overrides]]
-module = ["trafilatura.*", "nats.*", "temporalio.*", "yaml", "jsonschema"]
+module = ["trafilatura.*", "nats.*", "temporalio.*", "yaml", "jsonschema", "faster_whisper", "telethon.*"]
 ignore_missing_imports = true
 
 # Temporal-декораторы приходят Any при отсутствующем пакете (durable extra) — функция от этого
@@ -119,7 +120,14 @@ root_package = "aegis"
 [[tool.importlinter.contracts]]
 name = "domains are independent"
 type = "independence"
-modules = ["aegis.finance", "aegis.planning", "aegis.knowledge", "aegis.memory", "aegis.web"]
+modules = [
+  "aegis.finance",
+  "aegis.planning",
+  "aegis.knowledge",
+  "aegis.memory",
+  "aegis.web",
+  "aegis.cognition",
+]
 
 [[tool.importlinter.contracts]]
 name = "platform does not import domains"

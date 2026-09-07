@@ -60,6 +60,8 @@ KNOWN_ACTIONS: frozenset[str] = frozenset(
         "reminders:read",
         "nodes:read",
         "nodes:run",
+        "cognition:read",
+        "cognition:write",
         "web:read",
         "tool:pay",
         "journal:read",
@@ -121,6 +123,9 @@ _TOOL_DOMAINS = {
     # узлы — только владельцу: гостям и членам нельзя ни видеть чужую машину, ни исполнять на ней
     "node": ("nodes:read", "nodes:run"),
     "nodes": ("nodes:read", "nodes:run"),
+    # словарь и лента — приватные данные household: членам не отдаём (инбокс = чужие личные чаты)
+    "lexicon": ("cognition:read", "cognition:write"),
+    "inbox": ("cognition:read", "cognition:write"),
     "web": ("web:read", "web:read"),
     "image": ("web:read", "web:read"),
     "finance": ("memory:read", "tool:pay"),

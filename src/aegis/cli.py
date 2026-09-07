@@ -207,6 +207,64 @@ def _build_parser() -> argparse.ArgumentParser:
     ns.add_argument("--name", required=True)
     ns.add_argument("--code", default=None, help="6 цифр из aegis node enroll (первый запуск)")
     ns.add_argument("--url", default=None, help="NATS url (по умолчанию NATS_URL из конфига)")
+    term = sub.add_parser("term", help="словарь владельца: жаргон, сокращения, имена")
+    term_actions = term.add_subparsers(dest="term_action", required=True)
+    ta = term_actions.add_parser("add", help="записать значение (работает и через чат)")
+    ta.add_argument("term")
+    ta.add_argument("means")
+    ta.add_argument("--kind", choices=("term", "person", "style"), default="term")
+    ta.add_argument("--owner-id", type=int, default=1)
+    tr = term_actions.add_parser("rm", help="удалить термин")
+    tr.add_argument("term")
+    tr.add_argument("--owner-id", type=int, default=1)
+    tl = term_actions.add_parser("list", help="весь словарь")
+    tl.add_argument("--kind", choices=("term", "person", "style"), default=None)
+    tl.add_argument("--owner-id", type=int, default=1)
+    tf = term_actions.add_parser("find", help="какие термины встречаются в тексте")
+    tf.add_argument("text")
+    tf.add_argument("--owner-id", type=int, default=1)
+
+    stk = sub.add_parser("sticker", help="коллекция стикеров на настроение (file_id из Telegram)")
+    stk_actions = stk.add_subparsers(dest="sticker_action", required=True)
+    sa = stk_actions.add_parser("add", help="имя file_id (--moods joy,anxious)")
+    sa.add_argument("name")
+    sa.add_argument("file_id")
+    sa.add_argument("--moods", default="")
+    sa.add_argument("--owner-id", type=int, default=1)
+    sr = stk_actions.add_parser("rm", help="убрать стикер")
+    sr.add_argument("name")
+    sr.add_argument("--owner-id", type=int, default=1)
+    sl = stk_actions.add_parser("list", help="что подключено")
+    sl.add_argument("--owner-id", type=int, default=1)
+
+    ub = sub.add_parser("userbot", help="мост личных чатов (демон на машине владельца)")
+    ub_actions = ub.add_subparsers(dest="ub_action", required=True)
+    uw = ub_actions.add_parser("watch", help="включить чат: off|watch|draft|auto")
+    uw.add_argument("peer")
+    uw.add_argument("--mode", choices=("off", "watch", "draft", "auto"), default="draft")
+    uw.add_argument("--note", default=None)
+    uw.add_argument("--owner-id", type=int, default=1)
+    uuw = ub_actions.add_parser("unwatch", help="убрать чат из наблюдения")
+    uuw.add_argument("peer")
+    uuw.add_argument("--owner-id", type=int, default=1)
+    upl = ub_actions.add_parser("policies", help="политики чатов")
+    upl.add_argument("--owner-id", type=int, default=1)
+    ust = ub_actions.add_parser(
+        "status", help="демоны, открытый инбокс, последние вердикты (только чтение)"
+    )
+    ust.add_argument("--owner-id", type=int, default=1)
+    usc = ub_actions.add_parser("inbox", help="последние входящие (id, чат, вердикт, статус)")
+    usc.add_argument("--limit", type=int, default=10)
+    usc.add_argument("--owner-id", type=int, default=1)
+    use = ub_actions.add_parser(
+        "serve",
+        help="ЗАПУСТИТЬ ДЕМОН НА СВОЕЙ МАШИНЕ (исходящие соединения, вход в свой аккаунт)",
+    )
+    use.add_argument("--name", default=None, help="имя демона (по умолчанию hostname)")
+    use.add_argument("--url", default=None, help="NATS url (иначе NATS_URL из env)")
+    use.add_argument("--session", default="aegis-userbot.session")
+    use.add_argument("--list-chats", action="store_true", help="показать чаты и выйти")
+
     show = remind_actions.add_parser("list", help="запланированные напоминания")
     show.add_argument("--limit", type=int, default=10)
     show.add_argument("--owner-id", type=int, default=1)
@@ -622,6 +680,49 @@ async def _nodes_report(cfg: Any) -> dict[str, Any]:
     return out
 
 
+async def _cognition_report(cfg: Any) -> dict[str, Any]:
+    """Когнитивный слой: словарь, голос, инбокс. ok=True: это усиление, а не орган."""
+    out: dict[str, Any] = {"ok": True}
+    try:
+        ready = await _scalar("SELECT to_regclass('cognition.lexicon') IS NOT NULL")
+    except Exception as exc:  # noqa: BLE001 - postgres-проверка точнее
+        out["note"] = f"не проверялось ({type(exc).__name__})"
+        return out
+    if not ready:
+        out["state"] = "нет таблицы"
+        out["hint"] = "накатить миграцию 0013 (make migrate)"
+        return out
+    lex = int(await _scalar("SELECT count(*) FROM cognition.lexicon") or 0)
+    voice = str(
+        await _scalar(
+            "SELECT CASE WHEN count(*) FILTER (WHERE NOT ok) > 0 THEN concat('сбои: '"
+            " || count(*) FILTER (WHERE NOT ok), ' из ', count(*))"
+            " WHEN count(*) = 0 THEN 'тихо'"
+            " ELSE concat('ок, ', count(*)) END FROM (SELECT ok FROM cognition.voice_log"
+            " ORDER BY created_at DESC LIMIT 50) t"
+        )
+        or "?"
+    )
+    stt = "on" if cfg.voice_enabled else "off"
+    bits = [f"словарь: {lex}", f"голос: {stt} ({voice})"]
+    if cfg.userbot_enabled:
+        open_rows = int(
+            await _scalar(
+                "SELECT count(*) FROM cognition.inbox WHERE status IN ('stored','notified','draft')"
+            )
+            or 0
+        )
+        last_seen = await _scalar(
+            "SELECT concat(extract(epoch FROM now() - max(last_seen))::int) FROM cognition.userbots"
+        )
+        age = "? сек" if last_seen in (None, "") else f"{last_seen} сек"
+        bits.append(f"юзербот: {open_rows} открытых, молчание {age}")
+        if open_rows:
+            out["hint"] = "/ub list в чате — черновики ждут решения"
+    out["note"] = " · ".join(bits)
+    return out
+
+
 async def _notes_index_report(cfg: Any) -> dict[str, Any]:
     """Очередь эмбеддингов: сколько заметок ждут индексации.
 
@@ -997,6 +1098,7 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["reminders"] = await _reminders_report(cfg)
         report["checks"]["integrations"] = await _integrations_report(cfg)
         report["checks"]["nodes"] = await _nodes_report(cfg)
+        report["checks"]["cognition"] = await _cognition_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
         report["checks"]["turns"] = await _turns_report()
@@ -1176,6 +1278,201 @@ async def _cmd_watch(action: str, args: argparse.Namespace) -> int:
             print(f"  ! {note}", file=sys.stderr)
         return 1 if report.paused else 0
 
+    return 2
+
+
+async def _cmd_term(action: str, args: argparse.Namespace) -> int:
+    """Словарь из консоли — тот же SqlLexicon, что у воронки; без фич-флагов: данные есть данные."""
+    from aegis.cognition.lexicon import SqlLexicon, hits_in
+
+    store = SqlLexicon()
+    try:
+        if action == "add":
+            term = await store.upsert(args.owner_id, args.term, args.means, args.kind)
+            print(f"Записано: «{term}» ({args.kind})")
+            return 0
+        if action == "rm":
+            ok = await store.remove(args.owner_id, args.term)
+            print("Удалено." if ok else "! такого термина нет")
+            return 0 if ok else 1
+        if action == "list":
+            entries = await store.list_terms(args.owner_id, kind=args.kind)
+            if not entries:
+                print("Словарь пуст: aegis term add <термин> <значение>")
+                return 0
+            for e in entries:
+                print(f"{e.kind:<7} {e.term:<24} {e.means}")
+            return 0
+        if action == "find":
+            entries = await store.list_terms(args.owner_id)
+            hits = hits_in(entries, args.text)
+            if not hits:
+                print("Ни один термин не встретился — словарь можно пополнять")
+                return 0
+            for e in hits:
+                print(f"{e.term} = {e.means} ({e.kind})")
+            return 0
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - диагноз кодом, не трейсбеком
+        print(f"! {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
+    print("?! неизвестное действие", file=sys.stderr)
+    return 2
+
+
+async def _cmd_sticker(action: str, args: argparse.Namespace) -> int:
+    from aegis.cognition.stickers import SqlStickers
+
+    store = SqlStickers()
+    try:
+        if action == "add":
+            moods = [m for m in (args.moods or "").split(",") if m.strip()]
+            await store.add(args.owner_id, args.name, args.file_id, moods)
+            print(f"Стикер «{args.name}» сохранён")
+            return 0
+        if action == "rm":
+            ok = await store.remove(args.owner_id, args.name)
+            print("Удалено." if ok else "! такого стикера нет")
+            return 0 if ok else 1
+        if action == "list":
+            items = await store.list_stickers(args.owner_id)
+            if not items:
+                print(
+                    "Пусто. file_id возьмите у @stickersearch-подобных ботов или перешлите"
+                    " стикер в чат с ботом и добавьте сюда"
+                )
+                return 0
+            for st in items:
+                tag = ",".join(st.moods) or "любое настроение"
+                print(f"{st.name:<20} [{tag}]")
+            return 0
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"! {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
+    print("?! неизвестное действие", file=sys.stderr)
+    return 2
+
+
+async def _cmd_userbot(action: str, args: argparse.Namespace) -> int:
+    """Политики/статус — с сервера; serve — с машины владельца (там telethon и сессия)."""
+    import os as _os
+
+    if action == "serve":
+        url = (args.url or _os.environ.get("NATS_URL") or "").strip()
+        if not args.list_chats and not url:
+            print("! нужен --url nats://хост:4222 (или NATS_URL в env)", file=sys.stderr)
+            return 2
+        api_id = _os.environ.get("TELEGRAM_API_ID", "")
+        api_hash = _os.environ.get("TELEGRAM_API_HASH", "")
+        if not (api_id.isdigit() and api_hash):
+            print(
+                "! TELEGRAM_API_ID/TELEGRAM_API_HASH — создайте на my.telegram.org и"
+                " экспортируйте перед запуском",
+                file=sys.stderr,
+            )
+            return 2
+        import socket
+
+        name = args.name or socket.gethostname()[:64]
+        from aegis.interaction.userbridge.daemon import UserbotDaemon
+
+        daemon = UserbotDaemon(
+            name=name,
+            nats_url=url or "nats://127.0.0.1:4222",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            session_path=args.session,
+            phone=_os.environ.get("UB_PHONE") or None,
+        )
+        mode = "список чатов" if args.list_chats else "демон (Ctrl-C чтобы остановить)"
+        print(f"userbot «{name}» → {url or 'локальный NATS'}: {mode}")
+        try:
+            await daemon.serve(list_chats=args.list_chats)
+        except ImportError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        return 0
+
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if not cfg.userbot_enabled:
+        print("! USERBOT_ENABLED=false — включите, иначе шлюз чаты не разберёт", file=sys.stderr)
+        return 2
+    from aegis.cognition.inbox import SqlInboxStore, SqlUserbots
+
+    store = SqlInboxStore()
+    try:
+        if action == "watch":
+            await store.policy_set(args.owner_id, args.peer, args.mode, args.note)
+            hint = {
+                "off": "чат выключен (сообщения не обрабатываются вовсе)",
+                "watch": "уведомление, когда важное; ответов нет",
+                "draft": "черновик ответа вам на утверждение (/ub send)",
+                "auto": "АВТООТВЕТ при прохождении охраны — включайте осознанно",
+            }[args.mode]
+            print(f"Политика «{args.peer.lower()}» = {args.mode} — {hint}")
+            return 0
+        if action == "unwatch":
+            ok = await store.policy_remove(args.owner_id, args.peer)
+            print("Снято." if ok else "! политики не было")
+            return 0 if ok else 1
+        if action == "policies":
+            rows = await store.policy_list(args.owner_id)
+            if not rows:
+                print("Ни один чат не включён: aegis userbot watch <id> --mode draft")
+                return 0
+            for r in rows:
+                note = f" — {r['note']}" if r.get("note") else ""
+                print(f"{r['mode']:<6} {r['peer']}{note}")
+            return 0
+        if action == "status":
+            daemons = await SqlUserbots().daemons(args.owner_id)
+            recent = await store.list_recent(owner_id=args.owner_id, limit=10)
+            if not daemons:
+                print("демонов не видно (aegis userbot serve на машине владельца)")
+            for d in daemons:
+                mark = "онлайн" if d["online"] else f"молчит {int(d['age_s'])}s"
+                print(f"демон {d['daemon']}: {mark}")
+            if recent:
+                print("последние входящие:")
+                for rec in recent:
+                    draft = " ✍" if rec.reply else ""
+                    print(
+                        f"  {rec.id[:8]} {rec.chat_name or rec.chat_id}"
+                        f" [{rec.verdict}/{rec.status}]{draft}"
+                    )
+            return 0
+        if action == "inbox":
+            recent = await store.list_recent(owner_id=args.owner_id, limit=args.limit)
+            for rec in recent:
+                label = rec.chat_name or rec.chat_id
+                print(f"{rec.id[:8]} {rec.created_at:%m-%d %H:%M} {label}:")
+                print(f"   от {rec.from_name or '?'}: {rec.text[:160]}")
+                print(
+                    f"   {rec.verdict} / {rec.status}" + (f" · {rec.reason}" if rec.reason else "")
+                )
+                if rec.reply:
+                    print(f"   ✍ {rec.reply[:300]}")
+            if not recent:
+                print("пусто")
+            return 0
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"! {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
+    print("?! неизвестное действие", file=sys.stderr)
     return 2
 
 
@@ -2921,6 +3218,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_watch(args.watch_action, args))
         if args.command == "connect":
             return asyncio.run(_cmd_connect(args.connect_action, args))
+        if args.command == "term":
+            return asyncio.run(_cmd_term(args.term_action, args))
+        if args.command == "sticker":
+            return asyncio.run(_cmd_sticker(args.sticker_action, args))
+        if args.command == "userbot":
+            return asyncio.run(_cmd_userbot(args.ub_action, args))
         if args.command == "node":
             return asyncio.run(_cmd_node(args.node_action, args))
         if args.command == "index":
