@@ -24,6 +24,7 @@ def load_builtin_tools() -> None:
         builtin,
         cognition,
         nodes,
+        parsing,
         reminders,
         repro,
         watchers,

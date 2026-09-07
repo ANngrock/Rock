@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,6 +26,7 @@ from aegis.interaction.userbridge.relay import (
     subj_cmd,
     subj_res,
 )
+from aegis.platform.vault import open_payload, seal_payload
 
 __all__ = ["UserbotDaemon"]
 
@@ -143,7 +143,7 @@ class UserbotDaemon:
 
     async def _on_cmd(self, msg: Any) -> None:
         try:
-            data = json.loads(bytes(msg.data).decode("utf-8"))
+            data = open_payload(self._pc(), bytes(msg.data))
         except (ValueError, UnicodeDecodeError):
             return
         if not isinstance(data, dict) or data.get("cmd") != "send":
@@ -171,8 +171,18 @@ class UserbotDaemon:
                     {"daemon": self.name, "caps": {"dialogs": dialogs, "os": os.uname().sysname}},
                 )
 
+    def _pc(self) -> Any:
+        """Ключарка для запечатывания: только auto-режим и только когда master реально есть."""
+        from aegis.platform.config import settings
+        from aegis.platform.vault import process_cipher
+
+        cfg = settings()
+        if str(getattr(cfg, "userbot_seal", "auto")) == "off":
+            return None
+        return process_cipher(cfg)
+
     async def _publish(self, subject: str, payload: dict[str, Any]) -> None:
         if self._nc is None:
             return
         with contextlib.suppress(Exception):
-            await self._nc.publish(subject, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            await self._nc.publish(subject, seal_payload(self._pc(), payload))

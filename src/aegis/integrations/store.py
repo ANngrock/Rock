@@ -128,9 +128,15 @@ class SqlConnectorStore:
         if self._cipher is None:
             from aegis.platform.config import settings
             from aegis.platform.crypto import load_keks
+            from aegis.platform.vault import get_vault
 
             cfg = settings()
-            self._cipher = BlobCipher(load_keks(cfg), active_version=cfg.crypto_key_version)
+            vault = get_vault(cfg)
+            self._cipher = (
+                vault.cipher
+                if vault is not None and vault.cipher is not None
+                else BlobCipher(load_keks(cfg), active_version=cfg.crypto_key_version)
+            )
         return self._cipher
 
     async def add(self, *, owner_id: int, kind: str, name: str, config: dict[str, Any]) -> str:

@@ -19,6 +19,7 @@ import { verifyInitData } from "./initdata.ts";
 import { TokenBucket } from "./ratelimit.ts";
 import { encode, parseClientMessage, type ServerMessage, type SessionMode } from "./protocol.ts";
 import { analyzeFrame } from "./vision.ts";
+import { makeVault } from "./vault.ts";
 import { VisionStore } from "./store.ts";
 
 const MIME: Record<string, string> = {
@@ -70,7 +71,7 @@ export class VisionHub {
 
   constructor(cfg: MiniappConfig) {
     this.cfg = cfg;
-    this.store = new VisionStore(cfg.databaseUrl);
+    this.store = new VisionStore(cfg.databaseUrl, makeVault(cfg));
   }
 
   async init(): Promise<void> {

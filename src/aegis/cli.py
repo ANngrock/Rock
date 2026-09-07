@@ -127,6 +127,76 @@ def _build_parser() -> argparse.ArgumentParser:
         "tick", help="прогнать созревшие проверки (для systemd-таймера; доставка — тиком remind)"
     )
 
+    feed = sub.add_parser(
+        "feed",
+        help="парсер-скрейпер: следить за страницами, RSS/Atom/JSON-лентами и публичными"
+        " t.me-каналами (миграция 0015)",
+    )
+    feed_actions = feed.add_subparsers(dest="feed_action", required=True)
+    fadd = feed_actions.add_parser("add", help="начать следить за источником")
+    fadd.add_argument("target", help="URL страницы/ленты или @имя публичного t.me-канала")
+    fadd.add_argument("--label", "-l", default="", help="название источника владельцу")
+    fadd.add_argument("--every", type=int, default=15, help="интервал, минут (от 1)")
+    fadd.add_argument("--kind", choices=("auto", "web", "feed", "tg"), default="auto")
+    fadd.add_argument("--include", default=None, help="пускать только содержащее (подстрока)")
+    fadd.add_argument("--exclude", default=None, help="пропускать содержащее (подстрока)")
+    fadd.add_argument("--owner-id", type=int, default=1)
+    flist = feed_actions.add_parser("list", help="источники: цель, период, состояние, ошибки")
+    flist.add_argument("--limit", type=int, default=30)
+    flist.add_argument("--owner-id", type=int, default=1)
+    for verb, verb_help in (
+        ("pause", "приостановить"),
+        ("resume", "возобновить (сбрасывает счётчик ошибок)"),
+        ("drop", "удалить совсем (вместе с накопленным)"),
+    ):
+        fv = feed_actions.add_parser(verb, help=f"{verb_help} по началу id или подстроке цели")
+        fv.add_argument("ref")
+        fv.add_argument("--owner-id", type=int, default=1)
+    frun = feed_actions.add_parser(
+        "run", help="отсканировать созревшие источники сейчас (тот же код, что крутится в боте)"
+    )
+    frun.add_argument("--owner-id", type=int, default=1)
+    fseen = feed_actions.add_parser("seen", help="непрочитанные предметы (весть ещё не отправлена)")
+    fseen.add_argument("--owner-id", type=int, default=1)
+    fitems = feed_actions.add_parser("items", help="поиск по накопленному (заголовок/выдержка)")
+    fitems.add_argument("--query", default=None)
+    fitems.add_argument("--source", default=None, help="начало id источника")
+    fitems.add_argument("--limit", type=int, default=10)
+    fitems.add_argument("--owner-id", type=int, default=1)
+    feed_actions.add_parser("prune", help="вычистить старые тела (заголовок и адрес останутся)")
+    fbackfill = feed_actions.add_parser(
+        "backfill", help="историческая догрузка источника: scan_source с нуля и всё в статусе read"
+    )
+    fbackfill.add_argument("ref")
+    fbackfill.add_argument(
+        "--pages", type=int, default=3, help="для каналов: до скольки станиц t.me"
+    )
+    fbackfill.add_argument("--owner-id", type=int, default=1)
+
+    parse = sub.add_parser(
+        "parse", help="прочитать URL один раз: страница/лента/публичный t.me-канал → текст (JSON)"
+    )
+    parse.add_argument("url")
+    parse.add_argument("--limit", type=int, default=3, help="сколько предметов показать (ленты)")
+    parse.add_argument("--json", action="store_true", help="машинойчитаемый вывод")
+    parse.add_argument("--full", action="store_true", help="не обрезать тело")
+
+    vault = sub.add_parser(
+        "vault", help="динамическое шифрование: состояние, поворот ключа, фоновый цикл (0015)"
+    )
+    vault_actions = vault.add_subparsers(dest="vault_action", required=True)
+    vault_actions.add_parser("status", help="вершина цепи, окно ключей, охват фронтов")
+    vault_actions.add_parser(
+        "rotate", help="поворот + переупаковка: пересеалить перечисленные фронты"
+    )
+    vloop = vault_actions.add_parser(
+        "loop", help="демоновский цикл: крутить поворот каждые N секунд"
+    )
+    vloop.add_argument(
+        "--every", type=int, default=None, help="секунды (по умолчанию — из конфига)"
+    )
+    vloop.add_argument("--iterations", type=int, default=0, help="0 — бессрочно")
+
     conn = sub.add_parser(
         "connect", help="подключения: MCP-серверы, API-ключи, плагины — реестр и пробы"
     )
@@ -802,6 +872,68 @@ async def _langfuse_report(cfg: Any) -> dict[str, Any]:
     return out
 
 
+async def _feeds_report(cfg: Any) -> dict[str, Any]:
+    """Кормушки парсера: схема (0015) плюс сводка источников — «всё или ничего» в докторе."""
+    out: dict[str, Any] = {"ok": True, "detail": "отключено (AEGIS_PARSER_ENABLED=false)"}
+    if not getattr(cfg, "parser_enabled", True):
+        return out
+    try:
+        from sqlalchemy import text
+
+        from aegis.platform.db import session
+
+        async with session() as s:
+            row = await s.execute(
+                text(
+                    "SELECT to_regclass('parsing.sources') AS reg,"
+                    " (SELECT count(*) FROM parsing.sources) AS n,"
+                    " (SELECT count(*) FROM parsing.sources WHERE enabled) AS on_,"
+                    " (SELECT count(*) FROM parsing.sources WHERE last_error <> '') AS err"
+                )
+            )
+            r = row.mappings().one()
+        if r["reg"] is None:
+            out.update(
+                ok=False, detail="схема не готова — нужна миграция 0015 (alembic upgrade head)"
+            )
+            return out
+        out["detail"] = f"источников {r['n']} (активных {r['on_']}, с ошибкой {r['err']})"
+    except Exception as exc:  # noqa: BLE001
+        out.update(ok=None, detail=f"база недоступна или схема пуста ({str(exc)[:120]})")
+    return out
+
+
+async def _vault_report(cfg: Any) -> dict[str, Any]:
+    """Цепь шифрования: вершина, окно ключей, и что реально под замком."""
+    out: dict[str, Any] = {"ok": True}
+    try:
+        from aegis.platform.vault import get_vault
+
+        vault = get_vault(cfg)
+        if vault is None:
+            mode = getattr(cfg, "crypto_mode", "auto")
+            out["detail"] = (
+                "выключено (off)" if mode == "off" else f"режим {mode}: env-ключ, цепь не нужна"
+            )
+            return out
+        keys = sorted(vault.keys())
+        out["gen"] = vault.gen
+        out["rotate_sec"] = int(getattr(cfg, "crypto_rotate_sec", 120))
+        if not keys:
+            # ни master, ни env-KEK: печатать нечем — это не поломка, это «открыто по недосмотру»
+            out["ok"] = None
+            out["detail"] = (
+                f"ключей нет (цепь v{vault.gen}): записи лежат открыто — задай CRYPTO_KEK"
+            )
+            return out
+        out["window"] = f"{keys[0]}..{keys[-1]}"
+        mode_now = getattr(cfg, "crypto_mode", "auto")
+        out["detail"] = f"цепь v{vault.gen}, окно {len(keys)} ключей, режим {mode_now}"
+    except Exception as exc:  # noqa: BLE001
+        out.update(ok=False, detail=f"{type(exc).__name__}: {str(exc)[:120]}")
+    return out
+
+
 async def _outbox_report(cfg: Any) -> dict[str, Any]:
     """Очередь outbox: сколько событий ждёт публикации и сколько застряло.
 
@@ -1100,6 +1232,8 @@ async def _cmd_doctor(*, as_json: bool, quick: bool, models: bool = False) -> in
         report["checks"]["nodes"] = await _nodes_report(cfg)
         report["checks"]["cognition"] = await _cognition_report(cfg)
         report["checks"]["notes_index"] = await _notes_index_report(cfg)
+        report["checks"]["feeds"] = await _feeds_report(cfg)
+        report["checks"]["vault"] = await _vault_report(cfg)
         report["checks"]["outbox"] = await _outbox_report(cfg)
         report["checks"]["turns"] = await _turns_report()
         report["checks"]["langfuse"] = await _langfuse_report(cfg)
@@ -1277,6 +1411,320 @@ async def _cmd_watch(action: str, args: argparse.Namespace) -> int:
         for note in report.notes:
             print(f"  ! {note}", file=sys.stderr)
         return 1 if report.paused else 0
+
+    return 2
+
+
+async def _cmd_feed(action: str, args: argparse.Namespace) -> int:
+    """Кормушки парсера из консоли — тот же SqlParsingStore и тот же движок, что у бота.
+
+    Умысел простой: «в CLI работает, в боте нет» невозможно по конструкции — обе дорожки
+    зовут один run_feeds/scan_source, разница только в том, кто их тикает.
+    """
+    from aegis.parsing.store import SqlParsingStore
+    from aegis.platform.config import ConfigError, settings
+    from aegis.platform.vault import process_cipher
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    store = SqlParsingStore()
+    cipher = process_cipher(cfg)
+
+    if action == "add":
+        target = args.target.strip()
+        low = target.lower().rstrip("/")
+        kind = args.kind
+        if kind == "auto":
+            if target.startswith("@") or "t.me/" in target:
+                kind = "tg"
+            elif low.endswith((".xml", ".rss")) or low.endswith("feed"):
+                kind = "rss"
+            elif low.endswith(".atom"):
+                kind = "atom"
+            elif low.endswith(".json"):
+                kind = "jsonfeed"
+            else:
+                kind = "web"
+        try:
+            sid = await store.add_source(
+                owner_id=args.owner_id,
+                target=target,
+                kind="tg_channel" if kind == "tg" else kind,
+                label=args.label,
+                interval_sec=max(60, args.every * 60),
+                include_kw=args.include,
+                exclude_kw=args.exclude,
+            )
+        except ValueError as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - без БД кормушку не завести: честный 1
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(f"Слежу: {args.label or target} ({kind}) id={sid[:8]} · каждые {args.every} мин")
+        print("  первый прогон заберёт актуальный срез (для канала — до трёх страниц t.me/s)")
+        return 0
+
+    if action == "list":
+        try:
+            srcs = await store.list_sources(owner_id=args.owner_id, limit=args.limit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if not srcs:
+            print("кормушек нет — aegis feed add <url|@канал>")
+            return 0
+        tz = cfg.tz
+        for src in srcs:
+            mark = "►" if src.enabled else "⏸"
+            last_ok = src.last_ok.astimezone(tz) if src.last_ok else None
+            last_s = f"{last_ok:%d.%m %H:%M}" if last_ok else "ни разу"
+            err = f" ! {src.last_error[:70]}" if src.last_error else ""
+            print(
+                f" {mark} {src.id[:8]} {src.kind:10} {src.label or src.target} · каждые"
+                f" {src.interval_sec // 60}м · последний успех {last_s}{err}"
+            )
+        return 0
+
+    if action in ("pause", "resume", "drop"):
+        try:
+            if action == "drop":
+                outcome = (
+                    "удалено" if await store.drop(owner_id=args.owner_id, ref=args.ref) else None
+                )
+            else:
+                outcome = await store.set_enabled(
+                    owner_id=args.owner_id, ref=args.ref, enabled=(action == "resume")
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if outcome is None:
+            print(f"не нашёл источник по «{args.ref}»", file=sys.stderr)
+            return 1
+        print(str(outcome))
+        return 0
+
+    if action == "run":
+        from aegis.parsing.watcher import run_feeds
+
+        try:
+            report = await run_feeds(
+                store, owner_id=args.owner_id, cfg=cfg, cipher=cipher, send=None
+            )
+        except Exception as exc:  # noqa: BLE001 - тик обязан докладывать кодом, не трейсбеком
+            print(f"! тик упал: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        summ = report.summary()
+        print(
+            f"проверено {summ['checked']} · новых {summ['new_items']} · ошибок {summ['errors']}"
+            + (f" · отправлено ведей {summ['pushed']}" if summ["pushed"] else "")
+        )
+        for o in report.outcomes:
+            print(f"  {o.line()}")
+        for note in report.notes:
+            print(f"  ! {note}", file=sys.stderr)
+        return 1 if report.errors else 0
+
+    if action in ("seen", "items"):
+        limit = 30 if action == "seen" else int(args.limit)
+        try:
+            items = await store.list_items(
+                owner_id=args.owner_id,
+                source_ref=(getattr(args, "source", None) or "").strip() or None,
+                query=(getattr(args, "query", None) or "").strip() or None,
+                status="new" if action == "seen" else None,
+                limit=limit,
+                cipher=cipher,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        if not items:
+            print("пусто" if action == "items" else "непрочитанных нет")
+            return 0
+        for it in items:
+            when = it.published_at.strftime("%d.%m %H:%M") if it.published_at else ""
+            print(f" [{it.status:6}] {when} {it.url[:80]} · {it.title[:90]}")
+            if it.excerpt:
+                print(f"        {it.excerpt[:200]}".replace(chr(10), " "))
+        return 0
+
+    if action == "prune":
+        try:
+            n = await store.prune(keep_days=int(cfg.parser_keep_days))
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        print(f"обезболено тел: {n}")
+        return 0
+
+    if action == "backfill":
+        from dataclasses import asdict
+
+        import httpx
+
+        from aegis.parsing.engine import scan_source
+
+        try:
+            srcs = await store.list_sources(owner_id=args.owner_id, limit=500)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! база недоступна: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+        srow = next((r for r in srcs if r.id.startswith(args.ref.strip())), None)
+        if srow is None:
+            print(
+                f"не нашёл источник по «{args.ref}» (свежий список — aegis feed list)",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            async with httpx.AsyncClient(
+                timeout=float(getattr(cfg, "parser_timeout_s", 30.0)),
+                follow_redirects=False,
+                verify=True,
+            ) as client:
+                drafts, _cursor, notes = await scan_source(srow, cfg=cfg, client=client)
+            n = await store.add_items(source=srow, items=[asdict(d) for d in drafts], cipher=cipher)
+            read = await store.mark_read(owner_id=srow.owner_id, source_ref=srow.id[:8])
+            print(f"дочитано {len(drafts)}, новых записано {n}, помечено прочитанными {read}")
+            for note in notes:
+                print(f"  ! {note}", file=sys.stderr)
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"! не вышло: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+            return 1
+
+    return 2
+
+
+async def _cmd_parse(args: argparse.Namespace) -> int:
+    """Одноразовое чтение любого URL тем же движком, что стоит за кормушками."""
+    from aegis.parsing.telegram import channel_name
+    from aegis.parsing.watcher import parse_now
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    target = args.url.strip()
+    try:
+        if target.startswith("@") or "t.me/" in target:
+            channel_name(target)
+        drafts = await parse_now(cfg, target, limit=args.limit)
+    except ValueError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"! не прочитал: {type(exc).__name__}: {str(exc)[:180]}", file=sys.stderr)
+        return 1
+    cap = None if args.full else 2000
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "title": d.title,
+                        "url": d.url,
+                        "author": d.author,
+                        "published_at": d.published_at.isoformat() if d.published_at else None,
+                        "text": d.text if cap is None else d.text[:cap],
+                        "media": list(d.media),
+                    }
+                    for d in drafts
+                ],
+                ensure_ascii=False,
+                indent=1,
+            )
+        )
+        return 0
+    if not drafts:
+        print("! страница прочитана, но релевантного текста не найдено (SPA?)")
+        return 0
+    for d in drafts:
+        if d.title:
+            print(f"── {d.title}" + (f" · {d.published_at:%d.%m %H:%M}" if d.published_at else ""))
+        body = d.text if cap is None else d.text[:cap]
+        print(body + ("…" if cap is not None and len(d.text) > cap else ""))
+        for m in d.media[:8]:
+            print(f"  [{m[:60]}]" if len(m) > 60 else f"  {m}")
+        print()
+    return 0
+
+
+async def _cmd_vault(action: str, args: argparse.Namespace) -> int:
+    """Живой взгляд на динамическое шифрование и ручной поворот — тем же кодом, что в боте."""
+    from aegis.platform.config import ConfigError, settings
+
+    try:
+        cfg = settings()
+    except ConfigError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    if getattr(cfg, "crypto_mode", "auto") == "off":
+        print("шифрование выключено (AEGIS_CRYPTO_MODE=off): всё лежит открыто, повороты не нужны")
+        return 0
+    from aegis.platform.vault import get_vault
+
+    vault = get_vault(cfg)
+    if vault is None:
+        print(
+            "! динамическая цепь недоступна (нет БД или только env-KEK): режим env — поворот не"
+            " нужен"
+        )
+        return 0
+
+    if action == "status":
+        keys = sorted(vault.keys())
+        keep = int(getattr(cfg, "crypto_keep_generations", 40))
+        rot = int(getattr(cfg, "crypto_rotate_sec", 120))
+        print(
+            f"вершина цепи: v{vault.gen} (база v{vault.base_gen}) · активные ключи: {keys} ·"
+            f" окно grace: {keep} · поворот каждые {rot}с"
+        )
+        print(f"режим: {getattr(cfg, 'crypto_mode', 'auto')}")
+        fronts = ["blobs (медиа/документы/заметки)", "ключи коннекторов", "парсер (тела предметов)"]
+        if str(getattr(cfg, "redis_url", "") or "").strip():
+            fronts.append("Redis (чаты, история, кандидаты)")
+        if str(getattr(cfg, "nats_url", "") or "").strip():
+            fronts.append("NATS (юзербот-мост)")
+        print("под цепью: " + ", ".join(fronts))
+        return 0
+
+    if action == "rotate":
+        outcome = await vault.rotate()
+        print(
+            f"поворот: v{outcome['from']} → v{outcome['to']} · переупаковано"
+            f" {outcome['rewrapped']} записей, сбоев {outcome['failed']}"
+        )
+        return 1 if int(outcome.get("failed", 0)) else 0
+
+    if action == "loop":
+        import asyncio
+        import contextlib
+        from datetime import datetime
+
+        seconds = int(args.every or 0) or int(getattr(cfg, "crypto_rotate_sec", 120)) or 120
+        print(f"круг поворотов каждые {seconds}с (Ctrl-C — выйти)", flush=True)
+        i = 0
+        with contextlib.suppress(KeyboardInterrupt):
+            while args.iterations == 0 or i < args.iterations:
+                i += 1
+                outcome = await vault.rotate()
+                stamp = datetime.now(tz=cfg.tz).strftime("%H:%M:%S")
+                print(
+                    f"[{stamp}] v{outcome['from']}→v{outcome['to']} · переупаковано"
+                    f" {outcome['rewrapped']}",
+                    flush=True,
+                )
+                if args.iterations == 0 or i < args.iterations:
+                    await asyncio.sleep(seconds)
+        return 0
 
     return 2
 
@@ -3216,6 +3664,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_remind(args.remind_action, args))
         if args.command == "watch":
             return asyncio.run(_cmd_watch(args.watch_action, args))
+        if args.command == "feed":
+            return asyncio.run(_cmd_feed(args.feed_action, args))
+        if args.command == "parse":
+            return asyncio.run(_cmd_parse(args))
+        if args.command == "vault":
+            return asyncio.run(_cmd_vault(args.vault_action, args))
         if args.command == "connect":
             return asyncio.run(_cmd_connect(args.connect_action, args))
         if args.command == "term":

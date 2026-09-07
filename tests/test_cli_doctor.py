@@ -206,6 +206,8 @@ async def test_quick_skips_every_live_probe(
     monkeypatch.setattr(cli, "_outbox_report", ok)
     monkeypatch.setattr(cli, "_langfuse_report", ok)
     monkeypatch.setattr(cli, "_turns_report", ok)
+    monkeypatch.setattr(cli, "_feeds_report", ok)
+    monkeypatch.setattr(cli, "_vault_report", ok)
     assert await cli._cmd_doctor(as_json=True, quick=True) == 0
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(report["checks"]) == {
@@ -216,6 +218,8 @@ async def test_quick_skips_every_live_probe(
         "cognition",
         "reminders",
         "notes_index",
+        "feeds",
+        "vault",
         "outbox",
         "turns",
         "langfuse",

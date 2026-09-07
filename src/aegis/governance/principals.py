@@ -120,6 +120,8 @@ _TOOL_DOMAINS = {
     # наблюдатели едут полосой напоминаний: весть — это тоже напоминание, плодить действия незачем
     "watch": ("reminders:read", "reminders:write"),
     "watches": ("reminders:read", "reminders:write"),
+    # кормушки парсера — та же полоса: весть из ленты доставляется как весть наблюдателя
+    "feed": ("reminders:read", "reminders:write"),
     # узлы — только владельцу: гостям и членам нельзя ни видеть чужую машину, ни исполнять на ней
     "node": ("nodes:read", "nodes:run"),
     "nodes": ("nodes:read", "nodes:run"),

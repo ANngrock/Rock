@@ -1063,7 +1063,11 @@ def _cipher_from(cfg: Settings) -> Any:
     if mode == "off":
         return None
     from aegis.platform.crypto import BlobCipher, load_keks  # noqa: PLC0415 — опциональный путь
+    from aegis.platform.vault import get_vault  # noqa: PLC0415 — живой cipher с цепью поколений
 
+    vault = get_vault(cfg)
+    if vault is not None and vault.cipher is not None:
+        return vault.cipher  # общий объект: ротация переставит ключи на месте, без пересозданий
     keks = load_keks(cfg)
     if not keks:
         if mode == "enforce":

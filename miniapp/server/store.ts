@@ -9,14 +9,22 @@ import type { Pool } from "pg";
 // Pool импортируется типом; рантайм-модуль pg подгружается лениво в init(),
 // чтобы юниты чистой логики не тянули драйвер.
 import type { SessionMode } from "./protocol.ts";
+import { sealText, type KekRing } from "./vault.ts";
+
+export interface VaultHandle {
+  keks(): KekRing | null;
+  gen(): number;
+}
 
 export class VisionStore {
   private pool: Pool | null = null;
   broken = false;
   private readonly databaseUrl: string;
+  private readonly vault: VaultHandle | null;
 
-  constructor(databaseUrl: string) {
+  constructor(databaseUrl: string, vault: VaultHandle | null = null) {
     this.databaseUrl = databaseUrl;
+    this.vault = vault;
   }
 
   get active(): boolean {
@@ -55,10 +63,13 @@ export class VisionStore {
     ms: number | null,
   ): Promise<void> {
     if (!sessionId) return;
+    // след камеры — личные слова владельца: в БД они уходят тем же конвертом, что и у бота
+    const sealed =
+      text && this.vault ? sealText(this.vault.keks(), this.vault.gen(), text) : text;
     await this.safe(
       this.pool?.query(
         "INSERT INTO vision.events (session_id, kind, text, ok, ms) VALUES ($1, $2, $3, $4, $5)",
-        [sessionId, kind, text, ok, ms],
+        [sessionId, kind, sealed, ok, ms],
       ),
     );
     if (kind === "frame") {

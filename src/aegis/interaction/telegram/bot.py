@@ -242,6 +242,13 @@ def _viewer_is_owner(app: App, event: Any) -> bool:
     return owner is not None and str(getattr(user, "id", "")) == str(owner)
 
 
+def _feeds_store() -> Any:
+    # импорт на ходу: без БД и парсера меню обязано жить и без этого модуля
+    from aegis.parsing.store import SqlParsingStore
+
+    return SqlParsingStore()
+
+
 def _menu_deps(app: App) -> Any:
     from aegis.cognition.inbox import SqlInboxStore
     from aegis.cognition.lexicon import SqlLexicon
@@ -259,6 +266,7 @@ def _menu_deps(app: App) -> Any:
         stickers=SqlStickers() if app.db_ready else None,
         inbox=SqlInboxStore() if app.db_ready else None,
         cost=app.cost,
+        feeds=_feeds_store() if app.db_ready else None,
     )
 
 
@@ -1045,6 +1053,80 @@ def build_dispatcher(app: App) -> tuple[Bot, Dispatcher]:
     return bot, dp
 
 
+async def _feeds_tick_loop(app: App) -> None:
+    """Тикер парсера: run_feeds каждые PARSER_TICK_SECONDS, цифры владельцу — сообщением.
+
+    Тот же run_feeds, что у ``aegis feed run``: «в боте не работает, в консоли работает»
+    невозможно по конструкции. Send-сбой не помечает источник ошибкой — предметы остаются
+    new и доезжают следующим тиком; сеть наружу — чужая, живёт по своим законам.
+    """
+    if not getattr(app.cfg, "parser_enabled", True):
+        log.info("feeds.loop_skip", reason="отключён (AEGIS_PARSER_ENABLED=false)")
+        return
+    interval = max(15, int(app.cfg.parser_tick_seconds))
+    backoff = float(interval)
+    # None — не пробовали; False — пробовали и не вышло (не совать нос каждый тик)
+    notifier: Any = None
+    while True:
+        await asyncio.sleep(backoff)
+        try:
+            from aegis.parsing.store import SqlParsingStore
+            from aegis.parsing.watcher import run_feeds
+            from aegis.platform.vault import process_cipher
+
+            if notifier is None and app.db_ready:
+                try:
+                    from aegis.interaction.telegram.notify import TelegramNotifier
+
+                    notifier = TelegramNotifier.from_settings(app.cfg)
+                except Exception as exc:  # noqa: BLE001 - нет личного чата: копится без пуша
+                    log.debug("feeds.no_notifier", err=repr(exc)[:160])
+                    notifier = False  # не совать нос каждый тик
+            report = await run_feeds(
+                SqlParsingStore(),
+                owner_id=int(app.cfg.telegram_owner_id or 0),
+                cfg=app.cfg,
+                cipher=process_cipher(app.cfg),
+                send=None if not notifier else notifier.send_text,
+            )
+            if report.new_items or report.errors:
+                log.info("feeds.tick", **report.summary())
+            backoff = float(interval)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - сбой тика не роняет бота: ждём и повторяем
+            log.warning("feeds.tick_down", err=repr(exc)[:200])
+            backoff = min(900.0, max(30.0, backoff * 2))
+
+
+async def _vault_rotate_loop(app: App) -> None:
+    """Повороты динамической цепи: каждые crypto_rotate_sec (по умолчанию — 2 минуты).
+
+    Фронты читают ключи через get_vault — синглтон процесса, значит свежее поколение
+    подхватывается на ходу, без рестарта. Режим off/env — крутить нечего, молча выходим:
+    требование «каждые 2 минуты по всем фронтам» про цепь, а цепь живёт при master-KEK.
+    """
+    from aegis.platform.vault import get_vault
+
+    vault = get_vault(app.cfg)
+    if vault is None:
+        log.info("vault.loop_skip", reason="цепь не заведена (off или только env-ключ)")
+        return
+    interval = max(5, int(app.cfg.crypto_rotate_sec or 120))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            outcome = await vault.rotate()
+            log.info(
+                "vault.rotated",
+                **{k: v for k, v in outcome.items() if isinstance(v, int | bool)},
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 — сбой поворота не останавливает бота: старые ключи в строю
+            log.warning("vault.rotate_failed", err=repr(exc)[:200])
+
+
 async def _metrics_flush_loop(app: App) -> None:
     """Тик сброса метрик: registry процесса → platform.metric_samples.
 
@@ -1215,6 +1297,12 @@ async def main() -> None:
     ub_task: asyncio.Task[None] | None = None
     if app.db_ready and app.cfg.userbot_enabled:
         ub_task = asyncio.create_task(_userbot_gateway_loop(app))
+    feeds_task: asyncio.Task[None] | None = None
+    if app.db_ready:
+        feeds_task = asyncio.create_task(_feeds_tick_loop(app))
+    vault_task: asyncio.Task[None] | None = None
+    if app.db_ready:
+        vault_task = asyncio.create_task(_vault_rotate_loop(app))
     try:
         async with bot:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -1242,6 +1330,12 @@ async def main() -> None:
         if ub_task is not None:
             ub_task.cancel()
             await asyncio.gather(ub_task, return_exceptions=True)
+        if feeds_task is not None:
+            feeds_task.cancel()
+            await asyncio.gather(feeds_task, return_exceptions=True)
+        if vault_task is not None:
+            vault_task.cancel()
+            await asyncio.gather(vault_task, return_exceptions=True)
         await app.aclose()
 
 

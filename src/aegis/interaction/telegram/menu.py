@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 from dataclasses import dataclass, field
@@ -84,6 +85,7 @@ class MenuDeps:
     stickers: Any = None
     inbox: Any = None
     cost: Any = None
+    feeds: Any = None
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -109,6 +111,7 @@ _SECTIONS = (
     ("stickers", "🎭 Стикер-коллекция"),
     ("inbox", "💬 Личные чаты"),
     ("connectors", "🔌 Подключения"),
+    ("feeds", "📡 Парсер"),
 )
 
 
@@ -198,6 +201,8 @@ async def perform_screen(
             return await _screen_inbox(owner_id, deps, can_control)
         if screen == "connectors":
             return await _screen_connectors(owner_id, deps, can_control)
+        if screen == "feeds":
+            return await _screen_feeds(owner_id, deps, can_control)
         if screen == "vision":
             return _screen_vision(deps)
         if screen == "about":
@@ -348,6 +353,50 @@ async def _screen_stickers(owner_id: int, deps: MenuDeps) -> tuple[str, Any]:
     )
 
 
+async def _screen_feeds(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
+    if not getattr(deps.cfg, "parser_enabled", True):
+        return _page(
+            "📡 Парсер",
+            "Выключен (<code>AEGIS_PARSER_ENABLED=false</code>). Включи — и скажи боту «следи"
+            " за каналом @…»: страницы, RSS/Atom/JSON-ленты и публичные t.me под одним движком.",
+            controls=None,
+            screen="feeds",
+        )
+    rows = await _gather(
+        deps.feeds.list_sources(owner_id=owner_id, limit=12) if deps.feeds else None, []
+    )
+    if not rows:
+        return _page(
+            "📡 Парсер · пусто",
+            "Наблюдений нет. Скажи мне «следи за @durov» или за любой страницей/лентой —"
+            " заведу; тела при этом лежат запечатанными (поворот ключа — каждые 2 минуты).",
+            controls=[[_btn("⟳ Проверить созревшие", "m:act:feed-run:")]],
+            screen="feeds",
+        )
+    lines = []
+    controls = []
+    for src in rows:
+        mark = "🟢" if src.enabled else "⏸"
+        err = f"\n     ⚠️ {_esc(src.last_error[:90])}" if src.last_error else ""
+        was = f" · читали {_hhmm(src.last_check)}" if src.last_check else ""
+        lines.append(
+            f"{mark} <b>{_esc(src.label or src.target)}</b> · {src.kind} · каждые"
+            f" {src.interval_sec // 60}м · следующий прогон по графику{was}{err}"
+        )
+        if can_control:
+            verb = "⏸" if src.enabled else "▶"
+            controls.append(
+                [
+                    _btn(
+                        f"{verb} {src.label or src.target}"[:64],
+                        f"m:act:feed-toggle:{b64enc(src.id[:8])}",
+                    )
+                ]
+            )
+    controls.insert(0, [_btn("⟳ Проверить созревшие сейчас", "m:act:feed-run:")])
+    return _page(f"📡 Парсер · {len(rows)}", "\n".join(lines), controls=controls, screen="feeds")
+
+
 async def _screen_inbox(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
     if not getattr(deps.cfg, "userbot_enabled", False):
         return _page(
@@ -477,6 +526,45 @@ async def apply_action(action: str, arg: str, owner_id: int, deps: MenuDeps) -> 
             deps.inbox.mark(owner_id=owner_id, row_id=row.id, status="discarded"), False
         )
         return ("✅ Убрано" if ok else "! уже закрыто", "inbox")
+    if action == "feed-toggle":
+        ref = b64dec(arg)
+        rows = await _gather(
+            deps.feeds.list_sources(owner_id=owner_id, limit=50) if deps.feeds else None, []
+        )
+        src = next((r for r in rows if str(r.id).startswith(ref)), None)
+        if src is None:
+            return ("! источник не найден (обнови экран)", "feeds")
+        outcome = await _gather(
+            deps.feeds.set_enabled(owner_id=owner_id, ref=src.id[:8], enabled=not src.enabled),
+            None,
+        )
+        if outcome is None:
+            return ("! не получилось (база жива?)", "feeds")
+        return ("▶ Запущено" if not src.enabled else "⏸ Приостановлено", "feeds")
+    if action == "feed-run":
+        if deps.feeds is None:
+            return ("! база недоступна", "feeds")
+        try:
+            from aegis.parsing.watcher import run_feeds
+            from aegis.platform.vault import process_cipher
+
+            report = await asyncio.wait_for(
+                run_feeds(
+                    deps.feeds,
+                    owner_id=owner_id,
+                    cfg=deps.cfg,
+                    cipher=process_cipher(deps.cfg),
+                    send=None,
+                ),
+                timeout=90.0,
+            )
+            summ = report.summary()
+            return (
+                f"Проверено {summ['checked']}, нового {summ['new_items']}, сбоев {summ['errors']}",
+                "feeds",
+            )
+        except Exception as exc:  # noqa: BLE001 - экран докладывает, не падает
+            return (f"! тик не вышел: {type(exc).__name__}", "feeds")
     if action == "conn-toggle":
         want, _, ref = b64dec(arg).partition("|")
         rows = await _gather(

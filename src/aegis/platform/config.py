@@ -312,6 +312,28 @@ class Settings(BaseSettings):
     crypto_key_version: int = Field(default=1, ge=1, le=10_000)
     #: размер батча rewrap-прохода: те же аренды, что у напоминаний, и тот же потолок боли
     rewrap_batch: int = Field(default=200, ge=10, le=5000)
+    #: динамическое шифрование: период фонового поворота KEK-цепи; 0 — поворот только руками
+    crypto_rotate_sec: int = Field(default=120, ge=0, le=86_400)
+    #: сколько поколений цепи остаётся «на слуху»: записям старше обязан помочь sweeper
+    crypto_keep_generations: int = Field(default=40, ge=2, le=1000)
+    #: потолок rewrap-работы на один тик поворота (строок), чтобы догон не съел пропуск
+    crypto_rewrap_budget: int = Field(default=2000, ge=10, le=20000)
+    #: запечатывать payload моста личных чатов (NATS), когда есть ключ: off — никогда
+    userbot_seal: Literal["off", "auto"] = "auto"
+
+    # --- парсер-наблюдатель (parsing) ---
+    #: фоновый обход источников: страницы, RSS/Atom/JSON-ленты, публичные t.me-каналы
+    parser_enabled: bool = True
+    parser_tick_seconds: int = Field(default=90, ge=15, le=3600)
+    #: параллельность обхода и жадность одного прохода — «максимум ресурсов» по разрешению
+    parser_concurrency: int = Field(default=6, ge=1, le=32)
+    parser_max_items_per_source: int = Field(default=60, ge=1, le=1000)
+    parser_max_bytes: int = Field(default=20_000_000, ge=100_000, le=100_000_000)
+    parser_timeout_s: float = Field(default=30.0, ge=1.0, le=300.0)
+    #: открытое тело в открытом тексте (crypto off) держать до этого срока, потом — только выжимка
+    parser_keep_days: int = Field(default=180, ge=7, le=3650)
+    #: слать ли новые предметы владельцу в личку ботом (иначе — только в базу и /menu)
+    parser_push: bool = True
 
     # --- политика как код (F5) ---
     #: декларативные правила; пусто/нет файла — встроенный набор (поведение до F5 не меняется)

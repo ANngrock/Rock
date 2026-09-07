@@ -136,6 +136,15 @@ class BlobCipher:
         nonce, sealed = body[2 : 2 + _GCM_NONCE], body[2 + _GCM_NONCE :]
         return AESGCM(kek).decrypt(nonce, sealed, None)
 
+    def rebind(self, keks: Mapping[int, bytes], *, active_version: int) -> None:
+        """Переставить поколения ключей на живом объекте: cipher'ы живут долго (recorder,
+        store), а ротация не имеет права требовать «пересоздай всё». Старые версии,
+        оставшиеся в наборе, продолжают читать прошлые записи."""
+        if not keks:
+            raise ValueError("rebind с пустым набором: это шредер, а не ротация")
+        self._keks = {int(v): bytes(k) for v, k in keks.items()}
+        self.active_version = int(active_version)
+
     # --- content ---
 
     def encrypt(self, plaintext: bytes) -> tuple[bytes, bytes, int]:

@@ -68,6 +68,18 @@ class TelegramNotifier:
             raise
         log.info("reminder.sent", id=reminder.short_id, chat=self.chat_id)
 
+    async def send_text(self, text: str) -> None:
+        """Просто владельцу: сводка парсера и прочие односторонние вести.
+
+        Не бросает наружу: доставщик при тикере — если Telegram лёг, тик обязан пережить
+        паузу и догнать на следующем заходе (неотправленное остаётся статусом new).
+        """
+        await self.start()
+        try:
+            await self._bot.send_message(self.chat_id, text[:_MAX_LEN])
+        except Exception as exc:  # noqa: BLE001 - доставка подождёт, падать некому
+            log.warning("notify.text_failed", err=repr(exc)[:200])
+
     async def send_note(self, text: str, *, image_b64: str | None = None) -> None:
         """Односторочный «бот пишет сам» для узлов: текст и (опционально) картинка из b64.
 

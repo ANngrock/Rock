@@ -1,0 +1,42 @@
+{
+ "master_kek_b64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+ "keep": 4,
+ "cases": [
+  {
+   "gen": 1,
+   "plaintext": "plain ascii frame note",
+   "py_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAAQtVmbQu2CgJU3BqdXZjPz94LgfWMJPDbbf_GRZhU-vvgnSFPNwKStDEijGOH82ghiZUeLkPXMnTuh1M2Q\",\"c\":\"2_kEEHNG6I3CwNMpfk0zQ0qARm1_Ch4FzGvmch_6KUe4_rJTPIwEw3qYpuDA1GTjK88\"}",
+   "ts_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAASoqKioqKioqKioqKns0zI25KpXehTS1GHgBA0ziDD5ssbomxtPwA_eBsNPeus-S6r180WNCk1nirpcylw\",\"c\":\"KioqKioqKioqKioqMhdvbI_Bpr7bLuSns6J9LvzjYRwfpCJp9SKBITu73uQ1_0gwdyU\"}"
+  },
+  {
+   "gen": 1,
+   "plaintext": "зрение: на фото — кот на клавиатуре, 2026-09-07 03:07",
+   "py_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAAQAcnsNAvKxM_e7_pST1l1vbQtQTIhk7hN-4s97bTRk2I9sBoRZA9_QOyLwhMHIrmv4NXd6uGNAXxGJ5Wg\",\"c\":\"FesZS3DkzZ7w5_akoZLz2YSo4un_jxcsHJArv02CXNLm9Lfmoc1vLoWJSvDDDLUFKnFzvLSRSazqmtX_rKER8U35RN7UJqmC4Gv6CXZ5aZyqeDBB_SoYoiMif5icat-1wuEWjeKVjQk4kIjOx9g\"}",
+   "ts_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAASoqKioqKioqKioqKns0zI25KpXehTS1GHgBA0ziDD5ssbomxtPwA_eBsNPeus-S6r180WNCk1nirpcylw\",\"c\":\"KioqKioqKioqKioqkszfhTFUF3Bo_10y7_DM_klzL6LvEQphBBdqH4mZq2li-EzdF06d29gmYFs9uAW3ZRQlwlCawusgHhdgZMJrx7QizL4Rgc1tVnzCOYl7FfISQ_Sog_sb3SBvWKcofSNDbTw\"}"
+  },
+  {
+   "gen": 1,
+   "plaintext": "emoji ✨ и смешанный / mixed text 123",
+   "py_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAAax6B3I5_ILSSQrNDd_qObs_QBgc7BmqJ8uzHhuLcnppHzB1KyHs8z_y4i5TZ-XwWLOT8zi0NPImYppJrw\",\"c\":\"SrPHT7OfAxLbwoa5tLZW2x_r6PXJyOdif6nPw8FzmbzWkAiJZMT-x-iOPJF4h5HMfq4dlBhYKy01gDzvU3-fGYU8VFGlq0wspK0qiQ\"}",
+   "ts_sealed": "aeg1s:{\"v\":1,\"d\":\"YWVnMToAASoqKioqKioqKioqKns0zI25KpXehTS1GHgBA0ziDD5ssbomxtPwA_eBsNPeus-S6r180WNCk1nirpcylw\",\"c\":\"KioqKioqKioqKioqJxZhb4jBJVEQZ10_9QGdkyUTuqLjEQRgOxdp7uDJhmmdYvEKvqnZKxGTqA_NM-c_5k9dt7c6NUkU4FRyb-RJtw\"}"
+  },
+  {
+   "gen": 2,
+   "plaintext": "plain ascii frame note",
+   "py_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAqLrw24_RfhjMA8-hchD3dBDOM0P3rt08ziw460Y9ixadAl4MAvI7o-XuFze1LISVgKCkFJOI2fE10-_Hw\",\"c\":\"awSyOKaDd7C28f7t-ULjNWHtEjJdl4TGZtqk3FqC92zeiDQL-q3D3GAO1GnoMfKRgoU\"}",
+   "ts_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAioqKioqKioqKioqKgrz2G7lHLITrdJ0Hu59GcWeNuQMzpMCUFCH58bnUcnvVkJFKAD4ntWN5a3ZRpAv1A\",\"c\":\"KioqKioqKioqKioqMhdvbI_Bpr7bLuSns6J9LvzjYRwfpCJp9SKBITu73uQ1_0gwdyU\"}"
+  },
+  {
+   "gen": 2,
+   "plaintext": "зрение: на фото — кот на клавиатуре, 2026-09-07 03:07",
+   "py_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAqJLhjgoAtJypenz9Ryo4MgZtdzKKMp_LURyFcL7Y62pNhVBFxp4LcoujEgFP2UMLKR0Z_2Kuwmj9AHZ8A\",\"c\":\"aIzTydIw0t8_7xTgFAHgal2YWm93ZduWXPTMDYO4MK7AfCsjQUNccnzkMfxO9TgotUgruEk7Moi0LMBKXxij02yJyl854okvC2G4v9dMJZIAPQyqvIQmuSrFgJaX_vC6aajM0bYb3wgvoxY0Kps\"}",
+   "ts_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAioqKioqKioqKioqKgrz2G7lHLITrdJ0Hu59GcWeNuQMzpMCUFCH58bnUcnvVkJFKAD4ntWN5a3ZRpAv1A\",\"c\":\"KioqKioqKioqKioqkszfhTFUF3Bo_10y7_DM_klzL6LvEQphBBdqH4mZq2li-EzdF06d29gmYFs9uAW3ZRQlwlCawusgHhdgZMJrx7QizL4Rgc1tVnzCOYl7FfISQ_Sog_sb3SBvWKcofSNDbTw\"}"
+  },
+  {
+   "gen": 2,
+   "plaintext": "emoji ✨ и смешанный / mixed text 123",
+   "py_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAiYxDFnviJ3MN_IkOisbv_MYyGqtKSzkwqf93e055jYbY1s_Kn_Xffx4mbhxOtuBjKnA7tgdVD6UEzVOeg\",\"c\":\"nn4FupTRUz_4PsWaDGTP5mYBiWpLiZuVTUDC4n1I-rKTSZ8rbJHiAReXMgwrPuoXWwTekU_bORsNXEvYbmVYyqK7uv9e8tC7RHZnmw\"}",
+   "ts_sealed": "aeg1s:{\"v\":2,\"d\":\"YWVnMToAAioqKioqKioqKioqKgrz2G7lHLITrdJ0Hu59GcWeNuQMzpMCUFCH58bnUcnvVkJFKAD4ntWN5a3ZRpAv1A\",\"c\":\"KioqKioqKioqKioqJxZhb4jBJVEQZ10_9QGdkyUTuqLjEQRgOxdp7uDJhmmdYvEKvqnZKxGTqA_NM-c_5k9dt7c6NUkU4FRyb-RJtw\"}"
+  }
+ ]
+}

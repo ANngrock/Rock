@@ -17,6 +17,10 @@ export interface MiniappConfig {
   databaseUrl: string;
   pushToOwner: boolean;
   uiDist: string;
+  /** master-KEK цепи (тот же AEGIS_KEK, что у бота); пусто — следы лежат открыто */
+  cryptoKek: string;
+  cryptoKeyVersion: number;
+  cryptoKeep: number;
 }
 
 function intEnv(name: string, dflt: number): number {
@@ -42,6 +46,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MiniappConfig 
     databaseUrl: (env.DATABASE_URL ?? "").replace("+asyncpg", "").trim(),
     pushToOwner: env.VISION_PUSH_TO_OWNER === "1",
     uiDist: (env.MINIAPP_UI_DIST ?? "").trim(),
+    cryptoKek: (env.AEGIS_KEK ?? "").trim(),
+    cryptoKeyVersion: Number.parseInt(env.AEGIS_CRYPTO_KEY_VERSION ?? "1", 10) || 1,
+    cryptoKeep: Number.parseInt(env.AEGIS_CRYPTO_KEEP_GENERATIONS ?? "40", 10) || 40,
   };
 }
 

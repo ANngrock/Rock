@@ -200,6 +200,12 @@ def build_app(
         )
     else:
         own_kv = aioredis.from_url(cfg.redis_url, decode_responses=False)
+        if getattr(cfg, "crypto_mode", "auto") != "off":
+            # «личные» ключи (история, pending) уходят в Redis запечатанными; счётчики — как были
+            from aegis.platform.kv import SealedKV
+            from aegis.platform.vault import process_cipher
+
+            own_kv = SealedKV(own_kv, lambda: process_cipher(cfg))
         # redis-py шире нашего порта (десятки методов); сужаем осознанно — приложение
         # видит только KV, и моки в тестах обязаны тому же
         kv = cast(KV, own_kv)

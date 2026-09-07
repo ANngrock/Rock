@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 from typing import Any
 
 import structlog
@@ -31,6 +30,7 @@ from aegis.cognition.inbox import (
     parse_assessment,
     rules_verdict,
 )
+from aegis.platform.vault import KeyUnavailable, open_payload, process_cipher, seal_payload
 
 __all__ = ["IN_SUBJECT", "UserbotGateway", "dispatch_send", "subj_hb", "subj_res", "subj_cmd"]
 
@@ -132,7 +132,7 @@ class UserbotGateway:
         self._stop.set()
 
     async def _on_in(self, msg: Any) -> None:
-        data = _decode(msg)
+        data = _decode(msg, _payload_cipher(self._cfg))
         chat_id, uid = str(data.get("chat_id") or ""), str(data.get("msg_id") or "")
         if not chat_id or not uid or not data.get("daemon"):
             return
@@ -154,7 +154,7 @@ class UserbotGateway:
         daemon = decode_daemon_from_subject(msg.subject)
         if daemon is None:
             return
-        data = _decode(msg)
+        data = _decode(msg, _payload_cipher(self._cfg))
         owner = int(self._cfg.telegram_owner_id or 1)
         with contextlib.suppress(Exception):
             await self.daemons.touch(daemon, owner, dict(data.get("caps") or {}))
@@ -284,7 +284,7 @@ async def dispatch_send(
     sub = None
 
     async def _on_res(msg: Any) -> None:
-        data = _decode(msg)
+        data = _decode(msg, pc)
         if str(data.get("id") or "") == row_id and not fut.done():
             if data.get("ok"):
                 fut.set_result(True)
@@ -295,12 +295,13 @@ async def dispatch_send(
         nc = await nats.connect(
             servers=[str(getattr(cfg, "nats_url", "") or "").strip()], connect_timeout=3.0
         )
+        pc = _payload_cipher(cfg)
         sub = await nc.subscribe(subj_res(daemon), cb=_on_res)
         await nc.publish(
             subj_cmd(daemon),
-            json.dumps(
-                {"id": row_id, "cmd": "send", "chat_id": chat_id, "text": text[:4000]}
-            ).encode("utf-8"),
+            seal_payload(
+                pc, {"id": row_id, "cmd": "send", "chat_id": chat_id, "text": text[:4000]}
+            ),
         )
         done = await asyncio.wait_for(fut, timeout=12.0)
         return (True, "") if done else (False, "демон отказал (см. его лог)")
@@ -317,9 +318,20 @@ async def dispatch_send(
                 await nc.close()
 
 
-def _decode(msg: Any) -> dict[str, Any]:
+def _payload_cipher(cfg: Any) -> Any:
+    """Cipher процесса для запечатывания моста; off/нет ключа — None (открытый режим, как было)."""
+    if str(getattr(cfg, "userbot_seal", "auto")) == "off":
+        return None
+    return process_cipher(cfg)
+
+
+def _decode(msg: Any, cipher: Any = None) -> dict[str, Any]:
     try:
-        data = json.loads(bytes(msg.data).decode("utf-8"))
-        return data if isinstance(data, dict) else {}
+        data = open_payload(cipher, bytes(msg.data))
+    except KeyUnavailable as exc:
+        # не «сломанный демон», а «у бота нет ключа к его CRYPTO_KEK» — лечится env, не рестартом
+        log.warning("userbridge.sealed_unreadable", err=str(exc)[:120])
+        return {}
     except (ValueError, UnicodeDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
