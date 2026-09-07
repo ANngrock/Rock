@@ -1067,12 +1067,22 @@ async def _feeds_tick_loop(app: App) -> None:
     backoff = float(interval)
     # None — не пробовали; False — пробовали и не вышло (не совать нос каждый тик)
     notifier: Any = None
+    last_prune = 0.0
     while True:
         await asyncio.sleep(backoff)
         try:
+            import time as _t
+
             from aegis.parsing.store import SqlParsingStore
             from aegis.parsing.watcher import run_feeds
             from aegis.platform.vault import process_cipher
+
+            store = SqlParsingStore()
+            if _t.monotonic() - last_prune > 86_400:  # noqa: PLR2004 — сутки на вычищение тел
+                last_prune = _t.monotonic()
+                gone = await store.prune(keep_days=int(app.cfg.parser_keep_days))
+                if gone:
+                    log.info("feeds.pruned", bodies_blank=gone)
 
             if notifier is None and app.db_ready:
                 try:
@@ -1083,7 +1093,7 @@ async def _feeds_tick_loop(app: App) -> None:
                     log.debug("feeds.no_notifier", err=repr(exc)[:160])
                     notifier = False  # не совать нос каждый тик
             report = await run_feeds(
-                SqlParsingStore(),
+                store,
                 owner_id=int(app.cfg.telegram_owner_id or 0),
                 cfg=app.cfg,
                 cipher=process_cipher(app.cfg),

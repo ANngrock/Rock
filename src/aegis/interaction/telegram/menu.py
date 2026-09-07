@@ -365,6 +365,7 @@ async def _screen_feeds(owner_id: int, deps: MenuDeps, can_control: bool) -> tup
     rows = await _gather(
         deps.feeds.list_sources(owner_id=owner_id, limit=12) if deps.feeds else None, []
     )
+    unread = await _gather(deps.feeds.unread(owner_id=owner_id) if deps.feeds else None, 0)
     if not rows:
         return _page(
             "📡 Парсер · пусто",
@@ -393,8 +394,13 @@ async def _screen_feeds(owner_id: int, deps: MenuDeps, can_control: bool) -> tup
                     )
                 ]
             )
+    if can_control:
+        controls.insert(0, [_btn("✔️ Отметить прочитанным", "m:act:feed-readall:")])
     controls.insert(0, [_btn("⟳ Проверить созревшие сейчас", "m:act:feed-run:")])
-    return _page(f"📡 Парсер · {len(rows)}", "\n".join(lines), controls=controls, screen="feeds")
+    fresh = f" · ✉️ {unread}" if unread else ""
+    return _page(
+        f"📡 Парсер · {len(rows)}{fresh}", "\n".join(lines), controls=controls, screen="feeds"
+    )
 
 
 async def _screen_inbox(owner_id: int, deps: MenuDeps, can_control: bool) -> tuple[str, Any]:
@@ -565,6 +571,9 @@ async def apply_action(action: str, arg: str, owner_id: int, deps: MenuDeps) -> 
             )
         except Exception as exc:  # noqa: BLE001 - экран докладывает, не падает
             return (f"! тик не вышел: {type(exc).__name__}", "feeds")
+    if action == "feed-readall":
+        n = await _gather(deps.feeds.mark_read(owner_id=owner_id) if deps.feeds else None, 0)
+        return (f"✔️ Прочитано: {n}" if n else "И так всё прочитано", "feeds")
     if action == "conn-toggle":
         want, _, ref = b64dec(arg).partition("|")
         rows = await _gather(

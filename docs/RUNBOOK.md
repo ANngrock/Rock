@@ -1271,7 +1271,7 @@ UNIQUE покрывает и «перезапуск тика посередин�
   `aegis parse <url|@channel> [--json]` — тот же движок, той же командой, что крутится
   в боте: «в консоли работает, в боте нет» невозможно по конструкции.
 - Настройки: `PARSER_ENABLED` (вкл), `PARSER_TICK_SECONDS`, `PARSER_CONCURRENCY`,
-  `PARSER_MAX_ITEMS_PER_SOURCE`, `PARSER_KEEP_DAYS` (тела старше — в выжимку),
+  `PARSER_MAX_ITEMS_PER_SOURCE`, `PARSER_KEEP_DAYS` (тела старше — в выжимку, свип раз в сутки живёт в тикере), «✔️ Отметить прочитанным» — на экране «📡 Парсер»,
   `FETCH_MAX_CHARS`. Doctor: проверка `feeds` (схема + сводка), честно `null` без БД.
 
 Совместимость виджета — тестами на фикстурах живых классов (`tests/test_parsing_units.py`);
